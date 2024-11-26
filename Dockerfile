@@ -58,7 +58,8 @@ WORKDIR /dataengine
 
 COPY engine /dataengine/engine
 COPY setup.py /dataengine/setup.py
-RUN python3 setup.py develop
+
+RUN pip3 install -e .
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
