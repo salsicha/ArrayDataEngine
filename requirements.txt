@@ -1,47 +1,28 @@
 --extra-index-url https://rospypi.github.io/simple/
 
-pandas==2.0.3
 pyarrow
 pyyaml
-sqlalchemy==1.4.47
-psycopg2
-prefect==2.13.2
-pydantic==1.10.10
-azure-storage-blob
-azure-identity
+pydantic
 adlfs
-rospy
-# cvbridge3
 navpy
 typeguard
-pytest==7.4.0
+pytest
 cvxopt
 tk
-rosbags==0.9.16
-rosbags-dataframe==0.9.0
-rosbags-image==0.9.1
-image_geometry
-tqdm==4.66.1
-scipy==1.11.2
-matplotlib==3.7.0
-numpy==1.26.4
-opencv-python==4.8.0.76
-metar
-# symforce
-utm==0.7.0
-pytz==2021.1
-pillow==10.2.0
-# open3d==0.18.0
-pycocotools==2.0.7
-ultralytics==8.0.203
+rosbags
+rosbags-dataframe
+rosbags-image
+pycocotools
+ultralytics
 wandb
-cryptography==42.0.0
-pyopenssl==24.0.0
-# ros2-numpy==0.0.4
-tiledb==0.26.0
-tiledb-ml==0.9.6
-scikit-image==0.22.0
-scikit-learn==1.4.0
-torch==2.2.1
-torchvision==0.17.1
-rasterio==1.3.9
+cryptography
+pyopenssl
+torch
+torchvision
+rasterio
+tiledb
+tiledb-ml
+rosdep
+colcon-common-extensions
+lark
+empy==3.3.4

@@ -25,42 +25,43 @@ RUN apt update && apt install -q -y --no-install-recommends \
     ros-$ROS2_DISTRO-foxglove-bridge ros-$ROS2_DISTRO-foxglove-compressed-video-transport ros-$ROS2_DISTRO-foxglove-msgs \
     ros-$ROS2_DISTRO-ros-core ros-$ROS2_DISTRO-sensor-msgs-py libeigen3-dev \
     ros-$ROS2_DISTRO-ros2bag ros-$ROS2_DISTRO-rclpy ros-$ROS2_DISTRO-rosbag2-storage-default-plugins \
-    python3-rosdep python3-colcon-ros linuxptp python3-colcon-common-extensions \
+    python3-rosdep python3-colcon-ros python3-colcon-common-extensions \
     ros-$ROS2_DISTRO-rosbridge-suite ros-$ROS2_DISTRO-rosbag2 ros-$ROS2_DISTRO-gps-msgs \
     ros-$ROS2_DISTRO-tf2-msgs software-properties-common build-essential gcc \
-    x11-apps libpq-dev build-essential python3-tk \
-    ros-$ROS2_DISTRO-cv-bridge \
-    libgl1 libgomp1 libegl1 \
-    xorg-dev libxcb-shm0 libglu1-mesa-dev python3-dev clang \
-    libc++-dev libc++abi-dev libsdl2-dev ninja-build libxi-dev \
-    libtbb-dev libosmesa6-dev libudev-dev autoconf libtool && \
+    x11-apps libpq-dev build-essential python3-tk python3-pandas unzip python3-opencv \
+    ros-$ROS2_DISTRO-cv-bridge python3-numpy vim python3-sklearn python3-skimage \
+    python3-scipy python3-tqdm wget python3-dev ninja-build clang && \
     rm -rf /var/lib/apt/lists/* && \
     ln -s /usr/bin/python3 /usr/bin/python
 
 RUN python3 -m venv /venv
+
+RUN curl https://bootstrap.pypa.io/get-pip.py | python
+RUN python -m ensurepip --upgrade
+RUN python -m pip install --upgrade setuptools
+
 # EM is preventing msgs from building...
 RUN pip3 uninstall em
-RUN pip3 install rosdep colcon-common-extensions lark empy==3.3.4
-
-RUN python3 -m ensurepip --upgrade
-RUN python3 -m pip install --upgrade setuptools
 
 RUN mkdir /dataengine
 
 COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
 
-
-# TODO: install 
-# https://github.com/salsicha/ros2_numpy
-
-
-COPY engine /dataengine/engine
-COPY setup.py /dataengine/setup.py
+## ROS2_numpy
+RUN . /opt/ros/$ROS2_DISTRO/setup.bash && \
+    wget https://github.com/Box-Robotics/ros2_numpy/archive/refs/tags/v2.0.12-jazzy.zip && \
+    unzip v2.0.12-jazzy.zip && rm v2.0.12-jazzy.zip && \
+    cd ros2_numpy-2.0.12-jazzy && mkdir build && cd build && cmake .. && make install
 
 WORKDIR /dataengine
 
+COPY engine /dataengine/engine
+COPY setup.py /dataengine/setup.py
 RUN python3 setup.py develop
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 
 #####################################################################
