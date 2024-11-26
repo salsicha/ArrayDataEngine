@@ -28,11 +28,7 @@ RUN apt update && apt install -q -y --no-install-recommends \
     python3-rosdep python3-colcon-ros linuxptp python3-colcon-common-extensions \
     ros-$ROS2_DISTRO-rosbridge-suite ros-$ROS2_DISTRO-rosbag2 ros-$ROS2_DISTRO-gps-msgs \
     ros-$ROS2_DISTRO-tf2-msgs software-properties-common build-essential gcc \
-    # pyROS packages
-    python3-image-geometry x11-apps \
-    # psycopg2 dependencies
-    libpq-dev build-essential \
-    python3-tk mlocate \
+    x11-apps libpq-dev build-essential python3-tk \
     ros-$ROS2_DISTRO-cv-bridge \
     libgl1 libgomp1 libegl1 \
     xorg-dev libxcb-shm0 libglu1-mesa-dev python3-dev clang \
@@ -51,14 +47,12 @@ RUN mkdir /dataengine
 COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
 
-# Clean up
-RUN apt remove -y --auto-remove build-essential gcc && \
-    rm -rf /root/.cache
-
 COPY engine /dataengine/engine
 COPY setup.py /dataengine/setup.py
 
-# TODO: build package
+WORKDIR /dataengine
+
+RUN python3 setup.py develop
 
 
 #####################################################################
@@ -69,3 +63,6 @@ COPY --from=build / /
 WORKDIR /dataengine/
 
 ENTRYPOINT ["/entrypoint.sh"]
+CMD ["jupyter-lab", "--ip", "0.0.0.0", "--no-browser", \
+    "--allow-root", "--ServerApp.token=docker_jupyter", \
+    "--NotebookApp.allow_password_change=False"]

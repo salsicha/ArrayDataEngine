@@ -1,0 +1,1 @@
+docker build . --force-rm -t amoran/dataengine:latest

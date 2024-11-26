@@ -1,0 +1,24 @@
+services:
+  jupyter:
+    network_mode: "host"
+    image: amoran/jupyter
+    volumes:
+      - ./notebooks:/notebooks
+      - "/tmp/.X11-unix:/tmp/.X11-unix"
+      - engine:/dataengine/engine
+    environment:
+      - "DISPLAY=${DISPLAY}"
+      - XAUTHORITY
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - EGL_PLATFORM=surfaceless
+    user: "1000:1000"
+    command: >
+      bash -c "jupyter-lab --no-browser --LabApp.token=''"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
