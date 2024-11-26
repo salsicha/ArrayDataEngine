@@ -24,20 +24,20 @@ image_geometry
 tqdm==4.66.1
 scipy==1.11.2
 matplotlib==3.7.0
-numpy==1.24.2
+numpy==1.26.4
 opencv-python==4.8.0.76
 metar
-symforce==0.9.0
+# symforce
 utm==0.7.0
 pytz==2021.1
 pillow==10.2.0
-open3d==0.18.0
+# open3d==0.18.0
 pycocotools==2.0.7
 ultralytics==8.0.203
 wandb
 cryptography==42.0.0
 pyopenssl==24.0.0
-ros2-numpy==0.0.4
+# ros2-numpy==0.0.4
 tiledb==0.26.0
 tiledb-ml==0.9.6
 scikit-image==0.22.0

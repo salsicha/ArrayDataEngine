@@ -40,12 +40,20 @@ RUN apt update && apt install -q -y --no-install-recommends \
 RUN python3 -m venv /venv
 # EM is preventing msgs from building...
 RUN pip3 uninstall em
-RUN pip3 install rosdep colcon-common-extensions pytest-rerunfailures numpy lark empy==3.3.4
+RUN pip3 install rosdep colcon-common-extensions lark empy==3.3.4
+
+RUN python3 -m ensurepip --upgrade
+RUN python3 -m pip install --upgrade setuptools
 
 RUN mkdir /dataengine
 
 COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
+
+
+# TODO: install 
+# https://github.com/salsicha/ros2_numpy
+
 
 COPY engine /dataengine/engine
 COPY setup.py /dataengine/setup.py
@@ -60,7 +68,7 @@ FROM scratch
 
 COPY --from=build / /
 
-WORKDIR /dataengine/
+WORKDIR /notebooks/
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["jupyter-lab", "--ip", "0.0.0.0", "--no-browser", \
