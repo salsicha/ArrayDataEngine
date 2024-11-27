@@ -1,6 +1,7 @@
 --extra-index-url https://rospypi.github.io/simple/
 
 transforms3d
+tensorboard
 jupyterlab
 pyarrow
 pyyaml
