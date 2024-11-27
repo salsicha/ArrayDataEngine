@@ -1,11 +1,12 @@
 services:
   jupyter:
     network_mode: "host"
-    image: amoran/jupyter
+    image: arraydataengine
     volumes:
       - ./notebooks:/notebooks
       - "/tmp/.X11-unix:/tmp/.X11-unix"
-      - engine:/dataengine/engine
+      - ./ade:/dataengine/ade
+      - /data:/data
     environment:
       - "DISPLAY=${DISPLAY}"
       - XAUTHORITY

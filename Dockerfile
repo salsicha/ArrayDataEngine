@@ -25,7 +25,7 @@ RUN apt update && apt install -q -y --no-install-recommends \
     ros-$ROS2_DISTRO-foxglove-bridge ros-$ROS2_DISTRO-foxglove-compressed-video-transport ros-$ROS2_DISTRO-foxglove-msgs \
     ros-$ROS2_DISTRO-ros-core ros-$ROS2_DISTRO-sensor-msgs-py libeigen3-dev \
     ros-$ROS2_DISTRO-ros2bag ros-$ROS2_DISTRO-rclpy ros-$ROS2_DISTRO-rosbag2-storage-default-plugins \
-    python3-rosdep python3-colcon-ros python3-colcon-common-extensions \
+    python3-rosdep python3-colcon-ros python3-colcon-common-extensions ros-$ROS2_DISTRO-tf-transformations \
     ros-$ROS2_DISTRO-rosbridge-suite ros-$ROS2_DISTRO-rosbag2 ros-$ROS2_DISTRO-gps-msgs \
     ros-$ROS2_DISTRO-tf2-msgs software-properties-common build-essential gcc \
     x11-apps libpq-dev build-essential python3-tk python3-pandas unzip python3-opencv \
@@ -49,17 +49,17 @@ COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
 
 ## ROS2_numpy
-RUN . /opt/ros/$ROS2_DISTRO/setup.bash && \
+RUN . /opt/ros/$ROS2_DISTRO/setup.bash && . /venv/bin/activate && \
     wget https://github.com/Box-Robotics/ros2_numpy/archive/refs/tags/v2.0.12-jazzy.zip && \
     unzip v2.0.12-jazzy.zip && rm v2.0.12-jazzy.zip && \
     cd ros2_numpy-2.0.12-jazzy && mkdir build && cd build && cmake .. && make install
 
 WORKDIR /dataengine
 
-COPY engine /dataengine/engine
+COPY ade /dataengine/ade
 COPY setup.py /dataengine/setup.py
 
-RUN pip3 install -e .
+RUN . /venv/bin/activate && pip3 install -e .
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

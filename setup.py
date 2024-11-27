@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="dataengine",
+    name="ade",
     version="1.0",
     description="Python package",
-    author="cyberphysics",
+    author="alex moran",
     packages=find_packages(),
 )
