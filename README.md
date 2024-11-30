@@ -31,3 +31,6 @@ See notebooks for examples
 ## Why?
 
 Developing intelligent systems often designing algorithms that depend on correlations between heterogeneous and over long context windows. This project is an attempt to address that with a convenient interface.
+
+## TODO:
+Mkdocs
