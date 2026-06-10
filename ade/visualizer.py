@@ -6,7 +6,7 @@ import numpy as np
 import open3d as o3d
 
 from .visualizers.point_cloud import VisTool as PCVisTool
-from .visualizers.video_segment import VisGenerator as ImgVisTool
+from .visualizers.video_segment import VisTool as ImgVisTool
 
 
 class Visualizer:

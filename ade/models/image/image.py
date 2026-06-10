@@ -4,6 +4,7 @@ import scipy
 import cv2
 
 import scipy
+import scipy.fftpack
 from scipy import ndimage
 from scipy.stats import poisson
 from scipy.stats import multivariate_normal
@@ -67,86 +68,73 @@ def dense_optical_flow(img0, img1):
 
 
 def fft_filter(data):
-    # (32, 40)
     x_size = data.shape[1]
     y_size = data.shape[2]
 
-    output_img = np.zeros((x_size, y_size), dtype=int)
-
-    for y in range(y_size):
-        for x in range(x_size):
-
-            sig = data[-10:, x, y]
-            
-            freqs = scipy.fftpack.rfftfreq(sig.size, d=0.1)
-            rfft = scipy.fftpack.rfft(sig)
-            amps = 2/20 * rfft
-
-            rfft[0] = 0
-            res = scipy.fftpack.irfft(rfft)
+    sig = data[-10:, :, :]
     
-            # filter
-            k = 0.5
-            shift = sig_mean - res_mean
-            amp = amps[1:].max()
-            thresh = np.abs((shift - amp) * k)
-            res[res <= thresh] = 0
+    rfft = scipy.fftpack.rfft(sig, axis=0)
+    amps = 2.0 / 20.0 * rfft
 
-            res[res <= 0] = 0
-            
-            output_img[x, y] = res.max()
-
+    rfft[0, :, :] = 0
+    res = scipy.fftpack.irfft(rfft, axis=0)
+    
+    k = 0.5
+    sig_mean = sig.mean(axis=0)
+    res_mean = res.mean(axis=0)
+    shift = sig_mean - res_mean
+    
+    amp = amps[1:, :, :].max(axis=0)
+    thresh = np.abs((shift - amp) * k)
+    
+    res[res <= thresh[np.newaxis, :, :]] = 0
+    res[res <= 0] = 0
+    
+    output_img = res.max(axis=0).astype(int)
     return output_img
 
 
 def fft_filter_id(data, stage):
-    # (32, 40)
     x_size = data.shape[1]
     y_size = data.shape[2]
 
-
-    output_img = np.zeros((x_size, y_size), dtype=int)
-    freq_img = np.zeros((x_size, y_size), dtype=int)
-
-    for y in range(y_size):
-        for x in range(x_size):
-
-            sig = data[-10:, x, y]
-            
-            freqs = scipy.fftpack.rfftfreq(sig.size, d=0.1)
-            rfft = scipy.fftpack.rfft(sig)
-            amps = 2/20 * rfft
-            
-            rfft[0] = 0
-            # rfft[-1] = 0
-            res = scipy.fftpack.irfft(rfft)
+    sig = data[-10:, :, :]
     
-            ### Filter
-            k = 0.5
-            shift = sig_mean - res_mean
-            amp = amps[1:].max()
-            thresh = np.abs((shift - amp) * k)
-            res[res <= thresh] = 0
-            res[res <= 0] = 0
-
-            max_freq = np.argmax(np.abs(rfft))
-            max_f = freqs[max_freq]
-            
-            output_img[x, y] = res.max()
-            freq_img[x, y] = int(max_f)
-
+    freqs = scipy.fftpack.rfftfreq(sig.shape[0], d=0.1)
+    
+    rfft = scipy.fftpack.rfft(sig, axis=0)
+    amps = 2.0 / 20.0 * rfft
+    
+    rfft[0, :, :] = 0
+    res = scipy.fftpack.irfft(rfft, axis=0)
+    
+    k = 0.5
+    sig_mean = sig.mean(axis=0)
+    res_mean = res.mean(axis=0)
+    shift = sig_mean - res_mean
+    
+    amp = amps[1:, :, :].max(axis=0)
+    thresh = np.abs((shift - amp) * k)
+    
+    res[res <= thresh[np.newaxis, :, :]] = 0
+    res[res <= 0] = 0
+    
+    max_freq = np.argmax(np.abs(rfft), axis=0)
+    max_f = freqs[max_freq]
+    
+    output_img = res.max(axis=0).astype(int)
+    freq_img = max_f.astype(int)
     
     return output_img, freq_img
 
 
 def create_synth_image_moving():
-
+    images = []
     times = np.arange(0, 5, 0.1)
     length = times.shape[0]
         
     poses = []
     for t in times:
-        # create pose
         pose = {"x": t, "y": 0.0, "z": 0.0}
         poses.append(pose)
 
@@ -161,7 +149,6 @@ def create_synth_image_moving():
     x_off = 256
     y_off = 120
     side = 30
-
 
     for i, pose in enumerate(poses):
         synth_img = make_background()
@@ -181,12 +168,11 @@ def create_synth_image_moving():
     
                 synth_img[x_0:x_1, y_0:y_1] = make_beacon()
     
-        ### reduce resolution from (512, 640) to (64, 80)
         images.append(synth_img)
         img = cv2.resize(synth_img, (y_size, x_size))
 
         yield {"data": img,
-               "timestamp": 0,
+               "timestamp": i * 0.1,
                "topic": "images",
                "name": "synth_ir"}
 
@@ -265,12 +251,8 @@ def make_background():
 
 
 def make_beacon():
-    std_beacon = 41.72827445376682
     mean_dark = 15.5375
-    std_dark = 2.143087613521848
-    window_shape = (512, 640)
     beacon_max = 200
-    mean_dark = 15.5375
     bound_x = 15
     bound_y = 15
     step = 1
@@ -278,13 +260,13 @@ def make_beacon():
     pos = np.dstack((x, y))
     mean_x = 0
     mean_y = 0
-    std_beacon = np.std(beacon) # 41.72827445376682
+    std_beacon = 41.72827445376682
     std_x = std_beacon
     std_y = std_beacon
     rv = multivariate_normal([mean_x, mean_y], [[std_x, 0], [0, std_y]])
     z = rv.pdf(pos)
-    diff_beacon_background = beacon.max() - np.mean(dark)
-    fake_beacon = ((z - z.min()) / z.max()) * diff_beacon_background + np.mean(dark)
+    diff_beacon_background = beacon_max - mean_dark
+    fake_beacon = ((z - z.min()) / z.max()) * diff_beacon_background + mean_dark
     return fake_beacon
 
 

@@ -9,6 +9,8 @@ from ..sensors.pointcloud2_sensor import PointCloudSensor
 from ..sensors.image_sensor import ImageSensor
 
 
+import os
+
 class BagSource(BaseSource):
     """Data Sources Class
     Attributes:
@@ -24,6 +26,19 @@ class BagSource(BaseSource):
         super().__init__(data_path)
 
         self.data_path = data_path
+
+
+    def data_exists(self) -> bool:
+        return os.path.isfile(self.data_path)
+
+
+    def get_count(self, axis: str) -> int:
+        count = 0
+        with AnyReader([Path(self.data_path)]) as reader:
+            for connection in reader.connections:
+                if connection.topic == axis:
+                    count += connection.msgcount
+        return count
 
 
     def messages(self, source):

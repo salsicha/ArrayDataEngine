@@ -35,8 +35,8 @@ class BaseSource:
 
 
     def get_duration(self):
-        any_reader = AnyReader([Path(self.data_path)])
-        bag_duration = (any_reader.end_time - any_reader.start_time) * 1e-9
+        with AnyReader([Path(self.data_path)]) as reader:
+            bag_duration = (reader.end_time - reader.start_time) * 1e-9
         return bag_duration
 
 

@@ -97,7 +97,7 @@ class VisTool:
 
     def _add_pose_arrow_embedded(self, curr_se3):
         origin = curr_se3[:3, -1]
-        end = np.matmul(np.array([10, 0, 0]), curr_se3[:3, :3])
+        end = np.matmul(curr_se3[:3, :3], np.array([10, 0, 0])) + origin
         scale = 1 / np.sqrt(3)
         arrow = self.get_arrow(end, origin, scale)
         self.shapes.append(arrow)
@@ -105,7 +105,7 @@ class VisTool:
 
     def _add_pose_arrow_native(self, curr_se3):
         origin = curr_se3[:3, -1]
-        end = np.matmul(np.array([10, 0, 0]), curr_se3[:3, :3])
+        end = np.matmul(curr_se3[:3, :3], np.array([10, 0, 0])) + origin
         scale = 1 / np.sqrt(3)
         arrow = self.get_arrow(end, origin, scale)
         self.vis.add_geometry(arrow)
@@ -123,14 +123,16 @@ class VisTool:
 
 
     def get_colors(self, data):
-        # TODO: proper color map
-
         channel = 2
-        colors = np.zeros((data.shape[0], data.shape[1]), dtype=int)
-        min = int(data[:, -1].min())
-        colors[:, channel] = data[:, -1].astype(int) - min
-        max = colors.max()
-        colors[:, channel] = (colors[:, channel] / max) * 254
+        colors = np.zeros((data.shape[0], 3), dtype=np.float64)
+        z_vals = data[:, -1]
+        z_min = z_vals.min()
+        z_max = z_vals.max()
+        z_range = z_max - z_min
+        if z_range > 0:
+            colors[:, channel] = (z_vals - z_min) / z_range
+        else:
+            colors[:, channel] = 0.5
         return colors
 
 
