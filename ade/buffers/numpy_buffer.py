@@ -38,6 +38,13 @@ class NumpyBuffer:
     def _ordered_topic(self, topic: str) -> np.ndarray:
         return self._data_buffer[topic][self._logical_indices(topic)]
 
+    def _valid_ordered_topic(self, topic: str) -> np.ndarray:
+        count = self._counts.get(topic, 0)
+        ordered = self._ordered_topic(topic)
+        if count == 0:
+            return ordered[:0]
+        return ordered[-count:]
+
     def roll_buffer(self, axis: str) -> None:
         self._axis = axis
         while True:
@@ -63,6 +70,27 @@ class NumpyBuffer:
 
     def get_buffer(self) -> dict:
         return {topic: self._ordered_topic(topic).copy() for topic in self._data_buffer}
+
+    def get_time_range(self, axis: str, start: float, end: float) -> dict:
+        topic = self._valid_ordered_topic(axis)
+        mask = (topic['ts'] >= start) & (topic['ts'] <= end)
+        selected = topic[mask]
+        return {
+            "id": axis,
+            "ts": selected['ts'].copy(),
+            "data": selected['data'].copy(),
+        }
+
+    def get_last_seconds(self, axis: str, seconds: float) -> dict:
+        topic = self._valid_ordered_topic(axis)
+        if topic.size == 0:
+            return {
+                "id": axis,
+                "ts": np.array([], dtype=np.float64),
+                "data": topic['data'].copy(),
+            }
+        end = topic['ts'][-1]
+        return self.get_time_range(axis, end - seconds, end)
 
     def __getitem__(self, subscript):
         ordered_data = self._ordered_topic(self._axis)['data']

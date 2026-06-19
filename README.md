@@ -120,6 +120,18 @@ Use `preload=True` to fill the entire window during construction, or `preload=0`
 buffer = DataBuffer(source, buffer_depth=10, axis="images", preload=True)
 ```
 
+Slice buffered data by timestamp:
+
+```python
+time_range = buffer.get_time_range(axis, start=12.0, end=12.5)
+recent = buffer.get_last_seconds(axis, seconds=0.5)
+
+images = time_range["data"]
+timestamps = time_range["ts"]
+```
+
+Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for both in-memory and TileDB-backed buffers.
+
 ## TileDB Persistence
 
 Set `use_db=True` to persist messages to a TileDB group. This is intended for full-source ingest and larger-than-memory datasets.

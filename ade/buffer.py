@@ -196,6 +196,20 @@ class DataBuffer:
     def get_buffer(self) -> dict:
         return self.buffer_impl.get_buffer()
 
+    def get_time_range(self, axis: str, start: float, end: float) -> dict:
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        if start > end:
+            raise ValueError("start must be less than or equal to end")
+        return self.buffer_impl.get_time_range(axis, start, end)
+
+    def get_last_seconds(self, axis: str, seconds: float) -> dict:
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        if seconds < 0:
+            raise ValueError("seconds must be non-negative")
+        return self.buffer_impl.get_last_seconds(axis, seconds)
+
     def __getitem__(self, subscript: slice | int) -> np.ndarray | float | int:
         return self.buffer_impl[subscript]
 

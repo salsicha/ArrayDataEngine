@@ -148,6 +148,33 @@ class TileDBBuffer:
                 buffer[topic]['data'] = A[0:count]["features"]
         return buffer
 
+    def get_time_range(self, axis: str, start: float, end: float) -> dict:
+        if axis not in self.counters:
+            return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
+
+        self.close_topic(axis)
+        timestamps = np.asarray(self.timestamps.get(axis, []), dtype=np.float64)
+        mask = (timestamps >= start) & (timestamps <= end)
+        indices = np.flatnonzero(mask)
+        uri = self._get_array_uri(axis)
+
+        with tiledb.DenseArray(uri) as A:
+            if indices.size == 0:
+                data = A[0:0]["features"]
+            else:
+                first = int(indices[0])
+                last = int(indices[-1]) + 1
+                data = A[first:last]["features"][mask[first:last]]
+
+        return {"id": axis, "ts": timestamps[mask], "data": data}
+
+    def get_last_seconds(self, axis: str, seconds: float) -> dict:
+        if axis not in self.counters or len(self.timestamps.get(axis, [])) == 0:
+            return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
+
+        end = self.timestamps[axis][-1]
+        return self.get_time_range(axis, end - seconds, end)
+
     def __getitem__(self, subscript):
         topic = self._axis
         uri = self._get_array_uri(topic)

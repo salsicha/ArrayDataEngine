@@ -54,6 +54,28 @@ def test_numpy_buffer():
     assert np.allclose(buf[-1], np.array([10.0, 20.0]))
 
 
+def test_numpy_buffer_time_ranges():
+    source = MockDataSource()
+    buf = DataBuffer(
+        data_source=source,
+        buffer_depth=5,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=False
+    )
+
+    for _ in range(4):
+        buf.roll_buffer("sensor_topic")
+
+    time_range = buf.get_time_range("sensor_topic", 100.05, 100.25)
+    assert np.allclose(time_range["ts"], np.array([100.1, 100.2]))
+    assert np.allclose(time_range["data"], np.array([[1.0, 2.0], [2.0, 4.0]]))
+
+    last_window = buf.get_last_seconds("sensor_topic", 0.15)
+    assert np.allclose(last_window["ts"], np.array([100.3, 100.4]))
+    assert np.allclose(last_window["data"], np.array([[3.0, 6.0], [4.0, 8.0]]))
+
+
 def test_tiledb_buffer():
     temp_dir = tempfile.mkdtemp()
     group_uri = os.path.join(temp_dir, "tiledb_test_group/")
@@ -89,6 +111,39 @@ def test_tiledb_buffer():
         assert np.allclose(val, np.array([0.0, 0.0]))
 
         # Cleanup internal writers
+        buf.buffer_impl.close()
+
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+def test_tiledb_buffer_time_ranges():
+    temp_dir = tempfile.mkdtemp()
+    group_uri = os.path.join(temp_dir, "tiledb_time_range_group/")
+
+    try:
+        source = MockDataSource()
+        buf = DataBuffer(
+            data_source=source,
+            buffer_depth=5,
+            data_uri=group_uri,
+            topics=["sensor_topic"],
+            axis="sensor_topic",
+            use_db=True
+        )
+
+        for _ in range(4):
+            buf.roll_buffer("sensor_topic")
+
+        time_range = buf.get_time_range("sensor_topic", 100.05, 100.25)
+        assert np.allclose(time_range["ts"], np.array([100.1, 100.2]))
+        assert np.allclose(time_range["data"], np.array([[1.0, 2.0], [2.0, 4.0]]))
+
+        last_window = buf.get_last_seconds("sensor_topic", 0.15)
+        assert np.allclose(last_window["ts"], np.array([100.3, 100.4]))
+        assert np.allclose(last_window["data"], np.array([[3.0, 6.0], [4.0, 8.0]]))
+
         buf.buffer_impl.close()
 
     finally:
