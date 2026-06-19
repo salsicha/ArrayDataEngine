@@ -57,7 +57,7 @@ RUN . /opt/ros/$ROS2_DISTRO/setup.bash && . /venv/bin/activate && \
 WORKDIR /dataengine
 
 COPY ade /dataengine/ade
-COPY setup.py /dataengine/setup.py
+COPY pyproject.toml README.md /dataengine/
 
 RUN . /venv/bin/activate && pip3 install -e .
 

@@ -1,17 +1,6 @@
-
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import Any
-
 import os
-
-from .sources.bag_source import BagSource
-from .sources.db3_source import DB3Source
-from .sources.img_source import ImgSource
-from .sources.dem_source import DEMSource
 
 
 class DataSources:
@@ -22,31 +11,40 @@ class DataSources:
     """
 
 
-    def __init__(self, data_path, period=0.1, bounds=[[0, 0], [0, 0]]):
+    def __init__(self, data_path, period=0.1, bounds=None):
         """Constructor
 
         """
 
         # db3/bag file extension
         self.file_type = os.path.splitext(data_path)[-1]
+        bounds = [[0, 0], [0, 0]] if bounds is None else bounds
 
         img_types = [".png", ".jpg", ".jpeg", ".tiff"]
 
         # Check file extension in [".bag", ".db3", ".png"]
         if self.file_type == ".bag":
+            from .sources.bag_source import BagSource
+
             self.source = BagSource(data_path)
         elif self.file_type == ".db3":
+            from .sources.db3_source import DB3Source
+
             # AnyReader needs just the path to the folder for db3 files
             self.source = DB3Source(data_path)
         elif self.file_type in img_types:
+            from .sources.img_source import ImgSource
+
             self.source = ImgSource(data_path, period, self.file_type)
         elif data_path == "DEM":
+            from .sources.dem_source import DEMSource
+
             self.source = DEMSource(bounds[0], bounds[1])
         else:
-            raise Exception(f"{self.file_type} is not supported file type: [.bag, .db3, .png, .jpg, .jpeg]")
+            raise ValueError(f"{self.file_type} is not supported file type: [.bag, .db3, .png, .jpg, .jpeg, .tiff]")
 
         if not self.source.data_exists():
-            raise Exception(f"No data found!")
+            raise FileNotFoundError(f"No data found for {data_path}")
 
 
     def get_topics(self):
@@ -58,9 +56,4 @@ class DataSources:
 
 
     def get_message(self):
-        for result in self.source.messages(self.source):
-            try:
-                yield result
-            except StopIteration:
-                print("End of source")
-                return
+        yield from self.source.messages()

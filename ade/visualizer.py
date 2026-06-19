@@ -36,7 +36,7 @@ class Visualizer:
         elif vis_type == "image":
             self.vis_tool = ImgVisTool(embed, **kwargs)
         else:
-            raise Exception(f"Visualization type not supported: ['image', 'pointcloud']")
+            raise ValueError(f"Visualization type not supported: ['image', 'pointcloud']")
 
         # self.init()
 
@@ -51,5 +51,4 @@ class Visualizer:
 
     # def show_ego(self, *args, **kwargs):
     #     self.vis_tool.show(*args, **kwargs) # this calls destroy
-
 

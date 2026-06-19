@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-from rosbags.highlevel import AnyReader
-
 from pathlib import Path
 
-from ..sensors.base_sensor import BaseSensor
-from ..sensors.pointcloud2_sensor import PointCloudSensor
-from ..sensors.image_sensor import ImageSensor
-
+AnyReader = None
 
 
 class BaseSource:
@@ -25,17 +20,24 @@ class BaseSource:
         self.data_path = data_path
         self._debug = debug
 
+    def reader(self):
+        global AnyReader
+        if AnyReader is None:
+            from rosbags.highlevel import AnyReader as Reader
+
+            AnyReader = Reader
+        return AnyReader([Path(self.data_path)])
 
     def get_topics(self):
         topics = []
-        with AnyReader([Path(self.data_path)]) as reader:
+        with self.reader() as reader:
             for conn in reader.connections:
                 topics.append(conn.topic)
         return topics
 
 
     def get_duration(self):
-        with AnyReader([Path(self.data_path)]) as reader:
+        with self.reader() as reader:
             bag_duration = (reader.end_time - reader.start_time) * 1e-9
         return bag_duration
 

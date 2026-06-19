@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from rosbags.highlevel import AnyReader
-from pathlib import Path
+import logging
 import os
 from .base_source import BaseSource
 from ..sensors.pointcloud2_sensor import PointCloudSensor
@@ -9,6 +8,9 @@ from ..sensors.image_sensor import ImageSensor
 from ..sensors.imu_sensor import IMUSensor
 from ..sensors.odom_sensor import OdomSensor
 from ..sensors.nav_sensor import NavSensor
+
+
+_logger = logging.getLogger(__name__)
 
 
 class DB3Source(BaseSource):
@@ -29,21 +31,19 @@ class DB3Source(BaseSource):
 
 
     def data_exists(self) -> bool:
-        if os.path.isdir(self.data_path):
-            return True
-        return False
+        return os.path.isdir(self.data_path)
 
 
     def get_count(self, axis: str) -> int:
         count = 0
-        with AnyReader([Path(self.data_path)]) as reader:
+        with self.reader() as reader:
             for connection in reader.connections:
                 if connection.topic == axis:
                     count = count + connection.msgcount
         return count
 
 
-    def messages(self, source) -> dict | None:
+    def messages(self):
         '''Messages from data source
         Yields dictionary:
         - "data": numpy array
@@ -52,7 +52,7 @@ class DB3Source(BaseSource):
         - "name"
         '''
 
-        with AnyReader([Path(source.get_data_path())]) as reader:
+        with self.reader() as reader:
             for connection, timestamp, rawdata in reader.messages():
 
                 type_name = connection.msgtype.rsplit('/', 1)[1]
@@ -84,18 +84,13 @@ class DB3Source(BaseSource):
                     # sensor = Vec3Sensor(rawdata, connection.msgtype)
                 else:
                     if self._debug:
-                        print(f"Message type not supported: {type_name}")
+                        _logger.debug("Message type not supported: %s", type_name)
                     continue
 
                 npified, class_name, ts = sensor.numpyify()
 
-                try:
-                    # Yield: numpy array of data, timestamp, msg topic, class name
-                    yield {"data": npified, \
-                            "timestamp": ts, \
-                            "topic": connection.topic, \
-                            "name": class_name}
-                except StopIteration:
-                    print("End of source")
-                    return
-
+                # Yield: numpy array of data, timestamp, msg topic, class name
+                yield {"data": npified, \
+                        "timestamp": ts, \
+                        "topic": connection.topic, \
+                        "name": class_name}

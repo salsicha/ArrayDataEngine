@@ -1,5 +1,7 @@
 --extra-index-url https://rospypi.github.io/simple/
 
+# Full Docker/notebook environment. Installable package metadata and optional
+# dependency groups live in pyproject.toml.
 transforms3d
 tensorboard
 jupyterlab

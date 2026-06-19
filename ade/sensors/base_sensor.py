@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import numpy as np
-import ros2_numpy as rnp
 
 import importlib
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Any
 
-from rosbags.serde import deserialize_cdr
+try:
+    from rosbags.serde import deserialize_cdr as _deserialize_cdr
+except ImportError:
+    _deserialize_cdr = None
+
+
+@lru_cache(maxsize=1)
+def _get_typestore():
+    from rosbags.typesys import Stores, get_typestore
+
+    store = Stores.ROS2_JAZZY if hasattr(Stores, "ROS2_JAZZY") else Stores.LATEST
+    return get_typestore(store)
 
 
 class BaseSensor:
@@ -33,11 +44,16 @@ class BaseSensor:
 
 
     def deserialize(self):
-        msg = deserialize_cdr(self.rawdata, self.msgtype)
+        if _deserialize_cdr is not None:
+            msg = _deserialize_cdr(self.rawdata, self.msgtype)
+        else:
+            msg = _get_typestore().deserialize_cdr(self.rawdata, self.msgtype)
         return msg
 
 
     def numpyify(self) -> tuple:
+        import ros2_numpy as rnp
+
         msg = self.deserialize()
         msg = self.rosbags_to_native(msg)
         npified = rnp.numpify(msg)

@@ -1,17 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "ArrayDataEngine"
+name = "arraydataengine"
 version = "0.0.1"
 authors = [
   { name="Alex Moran", email="salsicha@gmail.com" },
 ]
-description = "Array data engine"
+description = "Array data engine for heterogeneous sensor and array data"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 
+[project.optional-dependencies]
+dem = [
+    "rasterio",
+    "requests",
+]
+dev = [
+    "pytest",
+]
+image = [
+    "opencv-python",
+    "scikit-image",
+    "scipy",
+]
+ml = [
+    "pycocotools",
+    "tensorboard",
+    "torch",
+    "torchvision",
+    "ultralytics",
+    "wandb",
+]
+notebook = [
+    "jupyterlab",
+]
+ros = [
+    "navpy",
+    "rosbags",
+    "rosbags-dataframe",
+    "rosbags-image",
+    "transforms3d",
+]
+tiledb = [
+    "tiledb",
+    "tiledb-ml",
+]
+visualization = [
+    "ipython",
+    "matplotlib",
+    "open3d",
+    "Pillow",
+]
+
 [project.urls]
 Homepage = "https://github.com/salsicha/arraydataengine"
+
+[tool.setuptools.packages.find]
+include = ["ade*"]

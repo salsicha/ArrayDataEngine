@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from rosbags.highlevel import AnyReader
-
-from pathlib import Path
-
 from .base_source import BaseSource
 
 from glob import glob
 
 import cv2
-import fnmatch
 import os
 
 
@@ -32,15 +27,14 @@ class ImgSource(BaseSource):
         self.data_path = data_path
         self.file_type = file_type
 
-        images = glob(f"{data_path}")
+        images = glob(data_path)
         images.sort()
 
         self.images = images 
 
 
     def get_count(self, axis="Images"):
-        img_count = len(fnmatch.filter(os.listdir(os.path.dirname(self.data_path)), '*'+self.file_type))
-        return img_count
+        return len(self.images)
 
 
     def get_duration(self):
@@ -48,9 +42,7 @@ class ImgSource(BaseSource):
         
         """
 
-        img_count = len(fnmatch.filter(os.listdir(os.path.dirname(self.data_path)), '*'+self.file_type))
-        duration = img_count * self.period
-        return duration
+        return self.get_count() * self.period
 
 
     def get_topics(self):
@@ -59,9 +51,7 @@ class ImgSource(BaseSource):
 
 
     def data_exists(self):
-        if len(self.images) > 0:
-            return True
-        return False
+        return len(self.images) > 0
 
 
     def messages(self, source=None):
@@ -77,7 +67,11 @@ class ImgSource(BaseSource):
             # Yield: numpy array of data, timestamp, msg topic, filename
             # "images" topic is fake, but is needed in the buffer
 
-            yield {"data": cv2.imread(img, cv2.IMREAD_UNCHANGED), \
+            data = cv2.imread(img, cv2.IMREAD_UNCHANGED)
+            if data is None:
+                raise ValueError(f"Unable to read image: {img}")
+
+            yield {"data": data, \
                     "timestamp": count * self.period, \
                     "topic": "images", \
                     "name": os.path.basename(img)}

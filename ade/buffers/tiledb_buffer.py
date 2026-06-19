@@ -1,67 +1,90 @@
 from __future__ import annotations
+import logging
 import os
 import shutil
+from contextlib import suppress
 import numpy as np
 import tiledb
 
+_logger = logging.getLogger(__name__)
+
 class TileDBBuffer:
-    def __init__(self, data_source, init_source, group_uri, axis="", topics=[]):
+    def __init__(self, data_source, init_source, group_uri, axis="", topics=None):
         self.data_source = data_source
         self.init_source = init_source
         self.group_uri = group_uri
         self._axis = axis
-        self.topics = topics
+        self.topics = [] if topics is None else list(topics)
         self.counters = {}
         self.timestamps = {}
         self.msg_len = {}
+        self.names = {}
         self._open_arrays = {}
 
-    def close(self):
-        for topic, arr in list(self._open_arrays.items()):
+    def _write_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
+        if topic not in self.counters:
+            return
+
+        tiledb_array.meta["timestamp"] = np.asarray(self.timestamps.get(topic, []), dtype=np.float64)
+        tiledb_array.meta["name"] = self.names.get(topic, "")
+        tiledb_array.meta["topic"] = topic
+        tiledb_array.meta["count"] = self.counters[topic]
+        if closed is not None:
+            tiledb_array.meta["closed"] = closed
+
+    def close_topic(self, topic: str, closed: bool | None = None) -> None:
+        arr = self._open_arrays.pop(topic, None)
+        if arr is not None:
             try:
+                self._write_metadata(topic, arr, closed)
+            finally:
                 arr.close()
-            except Exception:
-                pass
-        self._open_arrays.clear()
+            return
+
+        uri = self._get_array_uri(topic)
+        if os.path.exists(uri) and topic in self.counters:
+            with tiledb.open(uri, "w") as tiledb_array:
+                self._write_metadata(topic, tiledb_array, closed)
+
+    def close(self, closed: bool | None = None):
+        for topic in list(self._open_arrays):
+            self.close_topic(topic, closed)
 
     def __del__(self):
-        self.close()
+        with suppress(Exception):
+            self.close()
 
     def reset(self) -> None:
         self.close()
         self.counters = {}
         self.timestamps = {}
         self.msg_len = {}
+        self.names = {}
 
     def _get_array_uri(self, topic: str) -> str:
         return self.group_uri + topic.replace("/", "_")
 
     def _init_tdb(self, msg: dict) -> None:
-        data_len = self.msg_len[msg['topic']]
+        data_len = max(self.msg_len[msg['topic']], 1)
         uri = self._get_array_uri(msg['topic'])
 
         if os.path.exists(uri):
             # If open, close it first
-            if msg['topic'] in self._open_arrays:
-                try:
-                    self._open_arrays[msg['topic']].close()
-                except Exception:
-                    pass
-                del self._open_arrays[msg['topic']]
+            arr = self._open_arrays.pop(msg['topic'], None)
+            if arr is not None:
+                with suppress(Exception):
+                    arr.close()
 
             with tiledb.open(uri, "r") as tiledb_array:
-                try:
-                    if tiledb_array.meta["closed"]:
-                        print(f"Full data set exists! {uri}")
-                        return
-                except Exception:
-                    print("Closed tag not present.")
+                if tiledb_array.meta.get("closed", False):
+                    _logger.info("Full data set exists: %s", uri)
+                    return
             shutil.rmtree(uri)
 
         dims = [
             tiledb.Dim(
                 name="images" if dim == 0 else "dim_" + str(dim - 1),
-                domain=(0, data_len if dim == 0 else (msg['data'].shape[dim - 1] - 1)),
+                domain=(0, data_len - 1 if dim == 0 else (msg['data'].shape[dim - 1] - 1)),
                 tile=1 if dim == 0 else msg['data'].shape[dim - 1],
                 dtype=np.int32,
             )
@@ -107,94 +130,60 @@ class TileDBBuffer:
 
         tiledb_array = self._open_arrays[topic]
         self.timestamps[topic].append(msg['timestamp'])
-        tiledb_array[self.counters[topic], :] = msg['data']
-        self.counters[topic] += 1
+        self.names[topic] = msg["name"]
 
-        tiledb_array.meta["timestamp"] = np.array(self.timestamps[topic])
-        tiledb_array.meta["name"] = msg["name"]
-        tiledb_array.meta["topic"] = msg["topic"]
-        tiledb_array.meta["count"] = self.counters[topic]
+        key = (self.counters[topic],) + tuple(slice(None) for _ in msg['data'].shape)
+        tiledb_array[key] = msg['data']
+        self.counters[topic] += 1
 
     def get_buffer(self) -> dict:
         buffer = {}
-        with tiledb.Group(self.group_uri) as g:
-            for a in g:
-                # Flush the open array to disk so reader can read the latest data
-                if a.name in self._open_arrays:
-                    try:
-                        self._open_arrays[a.name].close()
-                        del self._open_arrays[a.name]
-                    except Exception:
-                        pass
-                
-                with tiledb.DenseArray(a.uri) as A:
-                    if A.meta.get("topic") and A.meta.get("topic") in self.counters:
-                        topic = A.meta.get("topic")
-                        buffer[topic] = {}
-                        buffer[topic]['id'] = topic
-                        buffer[topic]['ts'] = A.meta.get("timestamp")
-                        buffer[topic]['data'] = A[0:self.counters[topic]]["features"]
+        for topic, count in self.counters.items():
+            self.close_topic(topic)
+            uri = self._get_array_uri(topic)
+            with tiledb.DenseArray(uri) as A:
+                buffer[topic] = {}
+                buffer[topic]['id'] = topic
+                buffer[topic]['ts'] = np.asarray(self.timestamps.get(topic, A.meta.get("timestamp", [])))
+                buffer[topic]['data'] = A[0:count]["features"]
         return buffer
 
     def __getitem__(self, subscript):
+        topic = self._axis
+        uri = self._get_array_uri(topic)
+        if not os.path.exists(uri):
+            return None
+
+        self.close_topic(topic)
+
         if isinstance(subscript, slice):
-            with tiledb.Group(self.group_uri) as g:
-                for a in g:
-                    if a.name == self._axis:
-                        # Flush open writer first
-                        if a.name in self._open_arrays:
-                            try:
-                                self._open_arrays[a.name].close()
-                                del self._open_arrays[a.name]
-                            except Exception:
-                                pass
-                        with tiledb.DenseArray(a.uri) as A:
-                            return A[subscript.start:subscript.stop]["features"]
+            with tiledb.DenseArray(uri) as A:
+                return A[subscript]["features"]
 
         elif isinstance(subscript, int):
             if subscript < 0:
                 subscript = self.counters[self._axis] + subscript
 
-            with tiledb.Group(self.group_uri) as g:
-                for a in g:
-                    if a.name == self._axis:
-                        # Flush open writer first
-                        if a.name in self._open_arrays:
-                            try:
-                                self._open_arrays[a.name].close()
-                                del self._open_arrays[a.name]
-                            except Exception:
-                                pass
-                        with tiledb.DenseArray(a.uri) as A:
-                            return A[subscript]["features"]
+            with tiledb.DenseArray(uri) as A:
+                return A[subscript]["features"]
 
     def __setitem__(self, subscript, newval) -> bool | None:
+        topic = self._axis
+        uri = self._get_array_uri(topic)
+        if not os.path.exists(uri):
+            return None
+
+        self.close_topic(topic)
+
         if isinstance(subscript, slice):
-            with tiledb.Group(self.group_uri) as g:
-                for a in g:
-                    if a.name == self._axis:
-                        # Close open writer before opening in standard write mode
-                        if a.name in self._open_arrays:
-                            try:
-                                self._open_arrays[a.name].close()
-                                del self._open_arrays[a.name]
-                            except Exception:
-                                pass
-                        with tiledb.open(a.uri, "w") as A:
-                            A[subscript.start:subscript.stop] = newval
-                            return True
+            with tiledb.open(uri, "w") as A:
+                A[subscript] = newval
+                return True
 
         elif isinstance(subscript, int):
-            with tiledb.Group(self.group_uri) as g:
-                for a in g:
-                    if a.name == self._axis:
-                        # Close open writer before opening in standard write mode
-                        if a.name in self._open_arrays:
-                            try:
-                                self._open_arrays[a.name].close()
-                                del self._open_arrays[a.name]
-                            except Exception:
-                                pass
-                        with tiledb.open(a.uri, "w") as A:
-                            A[subscript] = newval
-                            return True
+            if subscript < 0:
+                subscript = self.counters[self._axis] + subscript
+
+            with tiledb.open(uri, "w") as A:
+                A[subscript] = newval
+                return True

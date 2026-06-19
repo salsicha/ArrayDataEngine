@@ -10,11 +10,6 @@ from scipy.stats import poisson
 from scipy.stats import multivariate_normal
 from scipy import signal
 
-from skimage.color import rgb2gray
-from skimage.transform import warp
-from skimage.registration import optical_flow_tvl1, optical_flow_ilk
-
-
 x_size = 32
 y_size = 40
 rate = 10
@@ -61,6 +56,18 @@ def align_images(images):
 
 
 def dense_optical_flow(img0, img1):
+    try:
+        from skimage.registration import optical_flow_ilk
+    except ModuleNotFoundError:
+        prev = img0.astype(np.float32)
+        nxt = img1.astype(np.float32)
+        if prev.ndim == 3:
+            prev = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+        if nxt.ndim == 3:
+            nxt = cv2.cvtColor(nxt, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        return np.mean(flow[..., 0]), np.mean(flow[..., 1])
+
     radius = 50
     v, u = optical_flow_ilk(img0, img1, radius=radius)
 
@@ -222,8 +229,6 @@ def create_synth_image(t, pose):
         period = x[3]
         ts = t * 10
         remainder = np.rint(ts % period)
-        if period == 2.5:
-            print("ts: ", ts, " period: ", period, " remainder... ", remainder)
         if remainder == 0:
             x_ind = int(x[0] * scale + x_off)
             y_ind = int(x[1] * scale + y_off)
@@ -268,5 +273,3 @@ def make_beacon():
     diff_beacon_background = beacon_max - mean_dark
     fake_beacon = ((z - z.min()) / z.max()) * diff_beacon_background + mean_dark
     return fake_beacon
-
-

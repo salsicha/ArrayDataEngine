@@ -129,7 +129,7 @@ class VisTool:
             color = self.colors[entity_id % self.num_colors]
             class_name = self.class_names[labels[i] - 1]
             text_width = len(class_name) * 20
-            x1, y1, x2, y2 = (np.round(bbox[i, :])).astype(np.int)
+            x1, y1, x2, y2 = (np.round(bbox[i, :])).astype(int)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=3)
             cv2.putText(frame, str(entity_id), (x1 + 5, y1 + 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, thickness=3)
@@ -138,4 +138,3 @@ class VisTool:
             cv2.putText(frame, '{}'.format(class_name), (x1 + 5, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), thickness=2)
         return frame
-    
