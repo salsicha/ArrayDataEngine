@@ -42,10 +42,10 @@ Results below were measured on 2026-06-19 with Python 3.14.5 on arm64. Each resu
 
 | Source | Workload | Messages | Elapsed | Throughput | Latency |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.008201s | 24,388 msg/s | 41.0 us/msg |
-| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000150s | 1,333,334 msg/s | 0.7 us/msg |
-| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000148s | 1,347,555 msg/s | 0.7 us/msg |
-| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000062s | 64,603 msg/s | 15.5 us/msg |
+| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.010868s | 18,402 msg/s | 54.3 us/msg |
+| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000205s | 973,828 msg/s | 1.0 us/msg |
+| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000191s | 1,046,435 msg/s | 1.0 us/msg |
+| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000082s | 48,780 msg/s | 20.5 us/msg |
 
 ## Documentation and Examples
 
