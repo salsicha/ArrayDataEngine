@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -575,6 +575,197 @@ class TopicWindowPipeline:
         return windows
 
 
+class DatasetQuery:
+    """Lazy selection interface over multiple topic pipelines."""
+
+    def __init__(self, topics: Mapping[str, TopicPipeline | dict | np.ndarray | TopicView]):
+        self._pipelines = {
+            topic: pipeline if isinstance(pipeline, TopicPipeline) else topic_pipeline(pipeline, topic=topic)
+            for topic, pipeline in topics.items()
+        }
+
+    @property
+    def topics(self) -> tuple[str, ...]:
+        return tuple(self._pipelines)
+
+    def select_topics(self, *topics: str | Iterable[str]) -> "DatasetQuery":
+        names = _normalize_topic_selection(topics)
+        missing = [topic for topic in names if topic not in self._pipelines]
+        if missing:
+            raise ValueError(f"topics not found: {missing}")
+        return DatasetQuery({topic: self._pipelines[topic] for topic in names})
+
+    def select_topic(self, topic: str) -> "DatasetQuery":
+        return self.select_topics(topic)
+
+    def time_range(self, start: float, end: float, inclusive: bool = True) -> "DatasetQuery":
+        if start > end:
+            raise ValueError("start must be less than or equal to end")
+        return self._map_pipelines(lambda pipeline: pipeline.time_range(start, end, inclusive=inclusive))
+
+    def select_time_range(self, start: float, end: float, inclusive: bool = True) -> "DatasetQuery":
+        return self.time_range(start, end, inclusive=inclusive)
+
+    def index_range(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "DatasetQuery":
+        return self._map_pipelines(lambda pipeline: pipeline.index_range(start, stop, step))
+
+    def select_indices(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "DatasetQuery":
+        return self.index_range(start, stop, step)
+
+    def frame_id(self, *frame_ids: str | Iterable[str]) -> "DatasetQuery":
+        targets = _normalize_text_selection(frame_ids, "frame_id")
+        selected = {}
+        for topic, pipeline in self._pipelines.items():
+            metadata_frame_id = pipeline.metadata.frame_id
+            if metadata_frame_id is not None:
+                if _decode_text(metadata_frame_id) in targets:
+                    selected[topic] = pipeline
+                continue
+
+            selected[topic] = pipeline.filter(
+                lambda data, ts, name, targets=targets: _row_frame_id(data, name) in targets,
+                copy=False,
+            )
+        return DatasetQuery(selected)
+
+    def geographic_bounds(
+        self,
+        min_lat: float,
+        min_lon: float,
+        max_lat: float,
+        max_lon: float,
+        columns: tuple[int, int] = (0, 1),
+    ) -> "DatasetQuery":
+        if min_lat > max_lat:
+            raise ValueError("min_lat must be less than or equal to max_lat")
+        if min_lon > max_lon:
+            raise ValueError("min_lon must be less than or equal to max_lon")
+        return self.filter(
+            lambda data, ts, name: _geographic_value_in_bounds(
+                data,
+                min_lat=min_lat,
+                min_lon=min_lon,
+                max_lat=max_lat,
+                max_lon=max_lon,
+                columns=columns,
+            ),
+            copy=False,
+        )
+
+    def geo_bounds(
+        self,
+        min_lat: float,
+        min_lon: float,
+        max_lat: float,
+        max_lon: float,
+        columns: tuple[int, int] = (0, 1),
+    ) -> "DatasetQuery":
+        return self.geographic_bounds(min_lat, min_lon, max_lat, max_lon, columns=columns)
+
+    def spatial_bounds(
+        self,
+        min_bound,
+        max_bound,
+        columns: tuple[int, ...] | None = None,
+    ) -> "DatasetQuery":
+        min_array = np.asarray(min_bound, dtype=np.float64)
+        max_array = np.asarray(max_bound, dtype=np.float64)
+        if min_array.ndim != 1 or max_array.ndim != 1 or min_array.shape != max_array.shape:
+            raise ValueError("min_bound and max_bound must be one-dimensional arrays with the same shape")
+        if np.any(min_array > max_array):
+            raise ValueError("min_bound must be less than or equal to max_bound")
+        if columns is None:
+            columns = tuple(range(min_array.size))
+        if len(columns) != min_array.size:
+            raise ValueError("columns length must match bound dimensionality")
+
+        return self.filter(
+            lambda data, ts, name: _spatial_value_in_bounds(
+                data,
+                min_bound=min_array,
+                max_bound=max_array,
+                columns=columns,
+            ),
+            copy=False,
+        )
+
+    def map(self, fn: Callable, copy: bool = True) -> "DatasetQuery":
+        return self._map_pipelines(lambda pipeline: pipeline.map(fn, copy=copy))
+
+    def filter(self, predicate: Callable, copy: bool = True) -> "DatasetQuery":
+        return self._map_pipelines(lambda pipeline: pipeline.filter(predicate, copy=copy))
+
+    def iter_topics(self) -> Iterable[tuple[str, TopicPipeline]]:
+        yield from self._pipelines.items()
+
+    def iter_chunks(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[tuple[str, TopicView]]:
+        for topic, pipeline in self._pipelines.items():
+            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy):
+                yield topic, chunk
+
+    def iter_rows(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[dict]:
+        for topic, pipeline in self._pipelines.items():
+            for row in pipeline.iter_rows(chunk_size=chunk_size, copy=copy):
+                row["topic"] = topic
+                yield row
+
+    def collect(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = True,
+        max_rows: int | None = None,
+        max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
+        allow_large: bool = False,
+    ) -> dict[str, dict]:
+        chunk_size = _validated_chunk_size(chunk_size)
+        collected = {}
+        total_rows = 0
+        total_bytes = 0
+
+        for topic, pipeline in self._pipelines.items():
+            ids_parts = []
+            ts_parts = []
+            data_parts = []
+            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy):
+                total_rows += len(chunk)
+                total_bytes += _topic_view_nbytes(chunk)
+                _check_collect_limits(total_rows, total_bytes, max_rows, max_bytes, allow_large)
+
+                if chunk.ids is not None:
+                    ids_parts.append(chunk.ids.copy() if copy else chunk.ids)
+                ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
+                data_parts.append(chunk.data.copy() if copy else chunk.data)
+
+            ids = np.concatenate(ids_parts) if ids_parts else None
+            timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
+            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
+            collected[topic] = TopicView(ids, timestamps, data, metadata=pipeline.metadata).as_dict(copy=False)
+
+        return collected
+
+    def as_pipelines(self) -> dict[str, TopicPipeline]:
+        return dict(self._pipelines)
+
+    def _map_pipelines(self, fn: Callable[[TopicPipeline], TopicPipeline]) -> "DatasetQuery":
+        return DatasetQuery({topic: fn(pipeline) for topic, pipeline in self._pipelines.items()})
+
+
+def dataset_query(topics: Mapping[str, TopicPipeline | dict | np.ndarray | TopicView]) -> DatasetQuery:
+    """Return a lazy dataset-level query over one or more topics."""
+
+    return DatasetQuery(topics)
+
+
 def topic_view(
     topic_data: dict | np.ndarray | TopicView,
     topic: str | None = None,
@@ -710,6 +901,141 @@ def _decode_scalar(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _decode_text(value: Any) -> str | None:
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            return None
+        value = value.item()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _normalize_topic_selection(topics: tuple[str | Iterable[str], ...]) -> tuple[str, ...]:
+    if len(topics) == 1 and not isinstance(topics[0], (str, bytes)):
+        topics = tuple(topics[0])
+    if not topics:
+        raise ValueError("at least one topic must be selected")
+    return tuple(str(topic) for topic in topics)
+
+
+def _normalize_text_selection(values: tuple[str | Iterable[str], ...], name: str) -> frozenset[str]:
+    if len(values) == 1 and not isinstance(values[0], (str, bytes)):
+        values = tuple(values[0])
+    normalized = frozenset(decoded for value in values if (decoded := _decode_text(value)) is not None)
+    if not normalized:
+        raise ValueError(f"at least one {name} must be selected")
+    return normalized
+
+
+def _field_value(value: Any, names: tuple[str, ...]) -> Any:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+
+    for name in names:
+        if hasattr(value, name):
+            candidate = getattr(value, name)
+            if _decode_text(candidate) is not None or not callable(candidate):
+                return candidate
+
+    array = np.asarray(value)
+    if array.dtype.fields:
+        for name in names:
+            if name in array.dtype.fields:
+                field = array[name]
+                return field.item() if isinstance(field, np.ndarray) and field.ndim == 0 else field
+
+    if array.dtype == object and array.ndim == 0:
+        item = array.item()
+        if item is not value:
+            return _field_value(item, names)
+
+    return None
+
+
+def _row_frame_id(data: Any, message_id: Any = None) -> str | None:
+    frame_id = _decode_text(_field_value(data, ("frame_id", "frame", "frameid")))
+    if frame_id is not None:
+        return frame_id
+    return _decode_text(_field_value(message_id, ("frame_id", "frame", "frameid")))
+
+
+def _geographic_value_in_bounds(
+    value: Any,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+    columns: tuple[int, int],
+) -> bool:
+    coordinates = _coordinate_array(
+        value,
+        field_groups=(("lat", "latitude"), ("lon", "longitude")),
+        columns=columns,
+    )
+    return _coordinates_in_bounds(
+        coordinates,
+        np.array([min_lat, min_lon], dtype=np.float64),
+        np.array([max_lat, max_lon], dtype=np.float64),
+    )
+
+
+def _spatial_value_in_bounds(
+    value: Any,
+    min_bound: np.ndarray,
+    max_bound: np.ndarray,
+    columns: tuple[int, ...],
+) -> bool:
+    field_groups = tuple((name,) for name in ("x", "y", "z", "w")[: min_bound.size])
+    coordinates = _coordinate_array(value, field_groups=field_groups, columns=columns)
+    return _coordinates_in_bounds(coordinates, min_bound, max_bound)
+
+
+def _coordinate_array(
+    value: Any,
+    field_groups: tuple[tuple[str, ...], ...],
+    columns: tuple[int, ...],
+) -> np.ndarray | None:
+    fields = [_field_value(value, names) for names in field_groups]
+    if all(field is not None for field in fields):
+        try:
+            return np.stack([np.asarray(field, dtype=np.float64) for field in fields], axis=-1)
+        except (TypeError, ValueError):
+            return None
+
+    array = np.asarray(value)
+    if array.dtype == object and array.ndim == 0:
+        item = array.item()
+        if item is not value:
+            return _coordinate_array(item, field_groups=field_groups, columns=columns)
+
+    if array.size == 0 or array.ndim == 0:
+        return None
+    if max(columns) >= array.shape[-1]:
+        return None
+
+    try:
+        return np.take(array.astype(np.float64, copy=False), columns, axis=-1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coordinates_in_bounds(coordinates: np.ndarray | None, min_bound: np.ndarray, max_bound: np.ndarray) -> bool:
+    if coordinates is None:
+        return False
+    coords = np.asarray(coordinates, dtype=np.float64)
+    if coords.size == 0 or coords.shape[-1] != min_bound.size:
+        return False
+    mask = np.logical_and(coords >= min_bound, coords <= max_bound).all(axis=-1)
+    return bool(np.any(mask))
 
 
 def _normalize_ids(ids: Any, count: int) -> np.ndarray | None:

@@ -43,6 +43,7 @@ class IMUSensor(BaseSensor):
         """
 
         msg = self.deserialize()
+        self._capture_header_metadata(msg)
 
         sec = msg.header.stamp.sec
         nanosec = msg.header.stamp.nanosec

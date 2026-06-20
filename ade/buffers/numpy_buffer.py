@@ -1,6 +1,21 @@
 from __future__ import annotations
 import numpy as np
 
+
+def _decode_frame_id(value) -> str | None:
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            return None
+        value = value.item()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, str):
+        return value
+    return None
+
+
 class NumpyBuffer:
     def __init__(self, data_source, buffer_depth=1, axis="", topics=None):
         self.buffer_depth = buffer_depth
@@ -9,12 +24,14 @@ class NumpyBuffer:
         self._data_buffer = {}
         self._write_indices = {}
         self._counts = {}
+        self.frame_ids = {}
         self.data_source = data_source
 
     def reset(self) -> None:
         self._data_buffer = {}
         self._write_indices = {}
         self._counts = {}
+        self.frame_ids = {}
 
     def _init_topic(self, msg: dict) -> None:
         topic = msg['topic']
@@ -68,6 +85,7 @@ class NumpyBuffer:
         if topic not in self._data_buffer:
             self._init_topic(msg)
 
+        self._record_frame_id(msg)
         write_index = self._write_indices[topic]
         self._data_buffer[topic]['data'][write_index] = msg['data']
         self._data_buffer[topic]['ts'][write_index] = msg['timestamp']
@@ -92,6 +110,7 @@ class NumpyBuffer:
                 "ts": selected["ts"].copy() if copy else selected["ts"],
                 "data": selected["data"].copy() if copy else selected["data"],
                 "topic": axis,
+                **self._metadata_for_topic(axis),
             }
 
     def get_index_range(self, axis: str, start: int | None = None, stop: int | None = None, step: int | None = None) -> dict:
@@ -103,6 +122,7 @@ class NumpyBuffer:
             "ts": selected['ts'].copy(),
             "data": selected['data'].copy(),
             "topic": axis,
+            **self._metadata_for_topic(axis),
         }
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
@@ -115,6 +135,7 @@ class NumpyBuffer:
             "ts": selected['ts'].copy(),
             "data": selected['data'].copy(),
             "topic": axis,
+            **self._metadata_for_topic(axis),
         }
 
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
@@ -126,9 +147,27 @@ class NumpyBuffer:
                 "ts": np.array([], dtype=np.float64),
                 "data": topic['data'].copy(),
                 "topic": axis,
+                **self._metadata_for_topic(axis),
             }
         end = topic['ts'][-1]
         return self.get_time_range(axis, end - seconds, end)
+
+    def _record_frame_id(self, msg: dict) -> None:
+        if "frame_id" not in msg or msg["frame_id"] is None:
+            return
+
+        topic = msg["topic"]
+        frame_id = _decode_frame_id(msg["frame_id"])
+        if frame_id is None:
+            return
+        if topic not in self.frame_ids:
+            self.frame_ids[topic] = frame_id
+        elif self.frame_ids[topic] != frame_id:
+            self.frame_ids[topic] = None
+
+    def _metadata_for_topic(self, topic: str) -> dict:
+        frame_id = self.frame_ids.get(topic)
+        return {} if frame_id is None else {"frame_id": frame_id}
 
     def _apply_operations(self, topic: np.ndarray, operations) -> np.ndarray:
         selected = topic

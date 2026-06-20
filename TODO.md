@@ -12,7 +12,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
   - [x] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
 - [ ] Add dataset-level selection and indexing:
-  - [ ] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
+  - [x] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
   - [x] Add timestamp range and message index range selection helpers.
   - [x] Add nearest-time lookup and bounded nearest alignment helpers.
   - [x] Add generic numeric time-series interpolation helpers.

@@ -31,9 +31,13 @@ class RosSource(BaseSource):
                     continue
 
                 npified, class_name, ts = sensor.numpyify()
-                yield {
+                message = {
                     "data": npified,
                     "timestamp": ts,
                     "topic": connection.topic,
                     "name": class_name,
                 }
+                frame_id = getattr(sensor, "frame_id", None)
+                if frame_id is not None:
+                    message["frame_id"] = frame_id
+                yield message

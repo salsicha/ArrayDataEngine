@@ -15,6 +15,20 @@ def _encode_name(name) -> bytes:
     return str(name).encode()[:256]
 
 
+def _decode_frame_id(value) -> str | None:
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            return None
+        value = value.item()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:
     start = 0 if start is None else start
     step = 1 if step is None else step
@@ -30,7 +44,7 @@ def _concat_topic_parts(parts: list[dict]) -> dict:
         return parts[0]
 
     first = parts[0]
-    return {
+    result = {
         "id": np.concatenate([part["id"] for part in parts]),
         "name": np.concatenate([part["name"] for part in parts]),
         "ts": np.concatenate([part["ts"] for part in parts]),
@@ -38,6 +52,9 @@ def _concat_topic_parts(parts: list[dict]) -> dict:
         "topic": first["topic"],
         "source_uri": first["source_uri"],
     }
+    if "frame_id" in first:
+        result["frame_id"] = first["frame_id"]
+    return result
 
 
 class TileDBBuffer:
@@ -50,6 +67,7 @@ class TileDBBuffer:
         self.counters = {}
         self.msg_len = {}
         self.names = {}
+        self.frame_ids = {}
         self.closed_topics = {}
         self._resume_seen = {}
         self._open_arrays = {}
@@ -65,6 +83,12 @@ class TileDBBuffer:
         tiledb_array.meta["name"] = self.names.get(topic, "")
         tiledb_array.meta["topic"] = topic
         tiledb_array.meta["count"] = self.counters[topic]
+        frame_id = self.frame_ids.get(topic)
+        if frame_id is not None:
+            tiledb_array.meta["frame_id"] = frame_id
+        else:
+            with suppress(Exception):
+                del tiledb_array.meta["frame_id"]
         if closed is not None:
             tiledb_array.meta["closed"] = closed
 
@@ -118,6 +142,7 @@ class TileDBBuffer:
         self.counters = {}
         self.msg_len = {}
         self.names = {}
+        self.frame_ids = {}
         self.closed_topics = {}
         self._resume_seen = {}
         self.timestamps = {}
@@ -166,6 +191,9 @@ class TileDBBuffer:
             self.counters[topic] = count
             self.msg_len[topic] = int(domain[1]) + 1
             self.names[topic] = tiledb_array.meta.get("name", "")
+            frame_id = _decode_frame_id(tiledb_array.meta.get("frame_id"))
+            if frame_id is not None:
+                self.frame_ids[topic] = frame_id
             if topic not in self.topics:
                 self.topics.append(topic)
 
@@ -275,6 +303,7 @@ class TileDBBuffer:
         if counter >= self.msg_len[topic]:
             raise ValueError(f"topic {topic} is already full at {counter} messages")
         self.names[topic] = msg["name"]
+        self._record_frame_id(msg)
 
         key = (counter,) + tuple(slice(None) for _ in msg['data'].shape)
         tiledb_array[key] = msg['data']
@@ -283,6 +312,23 @@ class TileDBBuffer:
             "name": np.array(_encode_name(msg.get("name", topic)), dtype="S256"),
         }
         self.counters[topic] = counter + 1
+
+    def _record_frame_id(self, msg: dict) -> None:
+        if "frame_id" not in msg or msg["frame_id"] is None:
+            return
+
+        topic = msg["topic"]
+        frame_id = _decode_frame_id(msg["frame_id"])
+        if frame_id is None:
+            return
+        if topic not in self.frame_ids:
+            self.frame_ids[topic] = frame_id
+        elif self.frame_ids[topic] != frame_id:
+            self.frame_ids[topic] = None
+
+    def _metadata_for_topic(self, topic: str) -> dict:
+        frame_id = self.frame_ids.get(topic)
+        return {} if frame_id is None else {"frame_id": frame_id}
 
     def _get_timestamps(self, topic: str, count: int, start: int = 0, stop: int | None = None) -> np.ndarray:
         if count == 0:
@@ -439,7 +485,7 @@ class TileDBBuffer:
         data = self._read_data_attr(data_array, indices)
         timestamps = self._read_index_attr(index_array, "timestamp", indices)
         names = self._read_index_attr(index_array, "name", indices, fallback=axis)
-        return {
+        result = {
             "id": names.copy() if copy else names,
             "name": names.copy() if copy else names,
             "ts": timestamps.copy() if copy else timestamps,
@@ -447,6 +493,9 @@ class TileDBBuffer:
             "topic": axis,
             "source_uri": uri,
         }
+        if self.frame_ids.get(axis) is not None:
+            result["frame_id"] = self.frame_ids[axis]
+        return result
 
     def get_buffer(self, copy: bool = True) -> dict:
         buffer = {}
@@ -484,6 +533,7 @@ class TileDBBuffer:
                 "data": np.array([]),
                 "topic": axis,
                 "source_uri": self._get_array_uri(axis),
+                **self._metadata_for_topic(axis),
             }
 
         self.close_topic(axis)
@@ -505,6 +555,7 @@ class TileDBBuffer:
                     "data": empty_data.copy() if copy else empty_data,
                     "topic": axis,
                     "source_uri": uri,
+                    **self._metadata_for_topic(axis),
                 }
 
         return _concat_topic_parts(parts)
@@ -518,6 +569,7 @@ class TileDBBuffer:
                 "data": np.array([]),
                 "topic": axis,
                 "source_uri": self._get_array_uri(axis),
+                **self._metadata_for_topic(axis),
             }
 
         self.close_topic(axis)
@@ -535,6 +587,7 @@ class TileDBBuffer:
                 "data": np.array([]),
                 "topic": axis,
                 "source_uri": self._get_array_uri(axis),
+                **self._metadata_for_topic(axis),
             }
 
         self.close_topic(axis)

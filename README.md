@@ -16,6 +16,7 @@ The project is aimed at robotics and perception workflows where algorithms need 
 - Cached ROS topic metadata, so repeated topic and count lookups do not reopen the same bag.
 - Rolling in-memory buffers for recent context windows.
 - Optional TileDB-backed storage for datasets larger than memory, with timestamps stored in queryable sidecar arrays.
+- Lazy dataset-level selection by topic, time, message index, frame id, geographic bounds, and spatial bounds.
 - Lazy optional imports so lightweight workflows do not need the full ROS, DEM, or visualization stack.
 - Notebook examples for demos, iterators, terrain, INS, MOT, and TileDB workflows.
 
@@ -178,6 +179,37 @@ small_result = pipeline.collect(chunk_size=32, max_rows=1_000)
 ```
 
 `collect()` is intentionally guarded. By default it refuses results above 512 MiB; pass `max_rows`, `max_bytes`, `out=`, or `allow_large=True` when materializing a large bounded result is intentional.
+
+Use `DataBuffer.dataset()` when the query spans multiple topics. Topic, timestamp, and message-index constraints are applied before later row filters. On TileDB-backed buffers, leading timestamp and index ranges are pushed down before payload arrays are read.
+
+```python
+selection = (
+    buffer.dataset()
+    .select_topics("/camera/image", "/points", "/gps")
+    .time_range(12.0, 20.0)
+    .index_range(0, 10_000)
+    .frame_id("map")
+)
+
+for topic, chunk in selection.iter_chunks(chunk_size=64):
+    process(topic, chunk.data, chunk.timestamps)
+```
+
+Geographic bounds expect latitude/longitude values by default in columns `(0, 1)`, matching NavSat arrays shaped like `[latitude, longitude, altitude]`. Spatial bounds work with XYZ vectors or point arrays and keep a message when any point falls inside the bounds.
+
+```python
+gps_samples = (
+    buffer.dataset(["/gps"])
+    .geographic_bounds(36.9, -122.3, 37.8, -121.7)
+    .collect(max_rows=50_000)
+)
+
+point_chunks = (
+    buffer.dataset(["/points"])
+    .spatial_bounds(min_bound=[-20, -20, -2], max_bound=[20, 20, 5])
+    .iter_chunks(chunk_size=16)
+)
+```
 
 `TopicView` is still available when the data is already in memory and you want eager, metadata-aware operations. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
 

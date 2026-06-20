@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .core import (
     align_nearest,
+    dataset_query,
     filter_topic,
     iter_chunks,
     map_topic,
@@ -9,6 +10,7 @@ from .core import (
     reduce_topic,
     select_indices,
     select_time_range,
+    DatasetQuery,
     TopicMetadata,
     TopicPipeline,
     TopicView,
@@ -47,6 +49,8 @@ __all__ = [
     "crop_bounds",
     "crop_raster",
     "depth_to_points",
+    "dataset_query",
+    "DatasetQuery",
     "enu_to_navsat",
     "estimate_normals",
     "filter_topic",

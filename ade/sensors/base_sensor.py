@@ -38,6 +38,7 @@ class BaseSensor:
 
         self.rawdata = rawdata
         self.msgtype = msgtype
+        self.frame_id: str | None = None
 
         # ROSbags to native ROS class converter 
         self.NATIVE_CLASSES: dict[str, Any] = {}
@@ -55,12 +56,30 @@ class BaseSensor:
         import ros2_numpy as rnp
 
         msg = self.deserialize()
+        self._capture_header_metadata(msg)
         msg = self.rosbags_to_native(msg)
         npified = rnp.numpify(msg)
         sec = msg.header.stamp.sec
         nanosec = msg.header.stamp.nanosec
         ts = sec + nanosec * 1e-9
         return npified, msg.__class__.__name__, ts
+
+    def _capture_header_metadata(self, msg: Any) -> None:  # noqa: ANN401
+        header = getattr(msg, "header", None)
+        self.frame_id = self._decode_optional_text(getattr(header, "frame_id", None))
+
+    def _decode_optional_text(self, value: Any) -> str | None:  # noqa: ANN401
+        if isinstance(value, np.ndarray):
+            if value.ndim != 0:
+                return None
+            value = value.item()
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, bytes):
+            return value.decode(errors="replace")
+        if isinstance(value, str):
+            return value
+        return None
 
 
     def rosbags_to_native(self, msg: Any) -> Any:  # noqa: ANN401

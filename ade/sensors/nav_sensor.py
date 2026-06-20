@@ -27,6 +27,7 @@ class NavSensor(BaseSensor):
 
     def numpyify(self) -> tuple:
         msg = self.deserialize()
+        self._capture_header_metadata(msg)
 
         sec = msg.header.stamp.sec
         nanosec = msg.header.stamp.nanosec
@@ -37,4 +38,3 @@ class NavSensor(BaseSensor):
         npified = np.array([msg.latitude, msg.longitude, msg.altitude])
 
         return npified, msg.__class__.__name__, ts
-    

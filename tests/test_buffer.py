@@ -24,7 +24,8 @@ class MockDataSource:
                 "topic": "sensor_topic",
                 "timestamp": 100.0 + i * 0.1,
                 "name": b"sensor_frame",
-                "data": np.array([float(i), float(i) * 2.0], dtype=np.float64)
+                "data": np.array([float(i), float(i) * 2.0], dtype=np.float64),
+                "frame_id": "map",
             }
 
 
@@ -314,6 +315,7 @@ def test_tiledb_buffer_reopens_without_original_source(tmp_path):
     try:
         assert reopened.get_topics() == ["sensor_topic"]
         assert reopened.get_size() == 5
+        assert reopened.topic("sensor_topic").metadata.frame_id == "map"
 
         time_range = reopened.get_time_range("sensor_topic", 100.1, 100.3)
         assert np.allclose(time_range["ts"], np.array([100.1, 100.2, 100.3]))

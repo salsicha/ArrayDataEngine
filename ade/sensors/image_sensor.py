@@ -34,6 +34,7 @@ class ImageSensor(BaseSensor):
 
     def numpyify(self) -> tuple:
         msg = self.deserialize()
+        self._capture_header_metadata(msg)
         sec = msg.header.stamp.sec
         nanosec = msg.header.stamp.nanosec
         ts = sec + nanosec * 1e-9

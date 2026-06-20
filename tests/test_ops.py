@@ -7,7 +7,9 @@ from ade.ops import (
     cluster_dbscan,
     crop_bounds,
     crop_raster,
+    dataset_query,
     depth_to_points,
+    DatasetQuery,
     enu_to_navsat,
     estimate_normals,
     filter_topic,
@@ -178,6 +180,63 @@ def test_topic_pipeline_executes_lazily_and_collects_explicitly():
     assert [window.ids.tolist() for window in windows] == [["a"], ["a", "b"], ["b", "c"]]
 
 
+def test_dataset_query_selects_topics_time_index_frame_and_bounds():
+    nav = {
+        "id": np.array(["n0", "n1", "n2"], dtype=object),
+        "ts": np.array([0.0, 1.0, 2.0]),
+        "data": np.array([
+            [37.0, -122.0, 10.0],
+            [38.0, -123.0, 11.0],
+            [37.1, -122.1, 12.0],
+        ]),
+        "topic": "/navsat",
+        "frame_id": "earth",
+    }
+    points = {
+        "id": np.array(["p0", "p1", "p2"], dtype=object),
+        "ts": np.array([0.0, 1.0, 2.0]),
+        "data": np.array([
+            [[0.0, 0.0, 0.0], [10.0, 10.0, 10.0]],
+            [[2.0, 2.0, 2.0], [8.0, 8.0, 8.0]],
+            [[5.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+        ]),
+        "topic": "/points",
+        "frame_id": "map",
+    }
+    camera = {
+        "id": np.array(["c0", "c1"], dtype=object),
+        "ts": np.array([0.0, 1.0]),
+        "data": np.array([[0.0], [1.0]]),
+        "topic": "/camera",
+        "frame_id": "camera",
+    }
+
+    query = dataset_query({
+        "/navsat": nav,
+        "/points": points,
+        "/camera": camera,
+    })
+    assert isinstance(query, DatasetQuery)
+
+    selected = query.select_topics("/navsat", "/points").time_range(0.5, 2.0).index_range(0, 2).collect(chunk_size=1)
+    assert list(selected) == ["/navsat", "/points"]
+    assert selected["/navsat"]["id"].tolist() == ["n1", "n2"]
+    assert selected["/points"]["id"].tolist() == ["p1", "p2"]
+
+    earth = query.frame_id("earth").collect()
+    assert list(earth) == ["/navsat"]
+    assert earth["/navsat"]["metadata"].frame_id == "earth"
+
+    geo = query.select_topic("/navsat").geographic_bounds(36.9, -122.2, 37.2, -121.9).collect()
+    assert geo["/navsat"]["id"].tolist() == ["n0", "n2"]
+
+    spatial = query.select_topic("/points").spatial_bounds([1.0, 1.0, 1.0], [3.0, 3.0, 3.0]).collect()
+    assert spatial["/points"]["id"].tolist() == ["p1"]
+
+    rows = list(query.select_topics(["/camera"]).iter_rows(chunk_size=1))
+    assert [row["topic"] for row in rows] == ["/camera", "/camera"]
+
+
 class _SmallSource:
     def get_topics(self):
         return ["axis"]
@@ -192,6 +251,7 @@ class _SmallSource:
                 "timestamp": float(i),
                 "name": f"frame_{i}",
                 "data": np.array([float(i)]),
+                "frame_id": "map",
             }
 
 
@@ -200,6 +260,7 @@ def test_data_buffer_operation_wrappers():
 
     view = buffer.topic_view("axis")
     assert view.metadata.topic == "axis"
+    assert view.metadata.frame_id == "map"
     assert view.metadata.count == 3
     assert view.metadata.names.tolist() == [b"frame_0", b"frame_1", b"frame_2"]
 
@@ -229,6 +290,10 @@ def test_data_buffer_operation_wrappers():
 
     windows = list(buffer.window_topic("axis", size=2))
     assert [window["ts"].tolist() for window in windows] == [[0.0], [0.0, 1.0], [1.0, 2.0]]
+
+    dataset = buffer.dataset().frame_id("map").time_range(1.0, 2.0).collect(chunk_size=1)
+    assert list(dataset) == ["axis"]
+    assert np.allclose(dataset["axis"]["ts"], np.array([1.0, 2.0]))
 
 
 def test_data_buffer_topic_pipeline_streams_without_get_buffer():

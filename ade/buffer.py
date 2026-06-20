@@ -262,6 +262,9 @@ class DataBuffer:
                 return data_path
         return None
 
+    def _topic_frame_id(self, axis: str) -> str | None:
+        return getattr(self.buffer_impl, "frame_ids", {}).get(axis)
+
     def topic_view(self, axis: str, copy: bool = True, metadata=None):
         from .ops import topic_view
 
@@ -270,6 +273,7 @@ class DataBuffer:
             self.get_buffer(copy=copy)[axis],
             topic=axis,
             source_uri=self._source_uri(),
+            frame_id=self._topic_frame_id(axis),
             metadata=metadata,
             copy=False,
         )
@@ -287,10 +291,28 @@ class DataBuffer:
             ),
             topic=axis,
             source_uri=self._source_uri(),
+            frame_id=self._topic_frame_id(axis),
         )
 
     def query_topic(self, axis: str):
         return self.topic(axis)
+
+    def dataset(self, topics=None):
+        from .ops import DatasetQuery
+
+        if topics is None:
+            selected_topics = list(self.topics)
+        elif isinstance(topics, (str, bytes)):
+            selected_topics = [topics]
+        else:
+            selected_topics = list(topics)
+
+        for topic in selected_topics:
+            self._validate_topic_axis(topic)
+        return DatasetQuery({topic: self.topic(topic) for topic in selected_topics})
+
+    def query(self, topics=None):
+        return self.dataset(topics=topics)
 
     def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False, operations=()):
         from .ops import topic_view

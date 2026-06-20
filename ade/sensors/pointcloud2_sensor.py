@@ -33,6 +33,7 @@ class PointCloudSensor(BaseSensor):
         import ros2_numpy as rnp
 
         msg = self.deserialize()
+        self._capture_header_metadata(msg)
         pc_2_np = rnp.point_cloud2.point_cloud2_to_array(msg)["xyz"]
         if pc_2_np.shape[0] > self.max_points:
             raise ValueError(
