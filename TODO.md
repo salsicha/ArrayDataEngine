@@ -7,45 +7,61 @@ Open3D is a useful model for this project: keep the API small, composable, NumPy
 Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/release/tutorial/geometry/pointcloud.html), [Open3D PointCloud API](https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html), and [Open3D ICP registration tutorial](https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html).
 
 - [ ] Define a common operation interface for buffered topics:
-  - [ ] Add `map(topic, fn)`, `filter(topic, predicate)`, `reduce(topic, fn)`, and `window(topic, size|seconds)` helpers.
+  - [x] Add `map(topic, fn)`, `filter(topic, predicate)`, `reduce(topic, fn)`, and `window(topic, size|seconds)` helpers.
   - [ ] Support eager NumPy output and lazy/chunked iteration for larger-than-memory arrays.
   - [ ] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
   - [ ] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
 - [ ] Add dataset-level selection and indexing:
   - [ ] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
-  - [ ] Add nearest-time lookup and interpolation helpers for synchronizing camera, point cloud, IMU, odometry, navsat, and DEM topics.
+  - [x] Add timestamp range and message index range selection helpers.
+  - [x] Add nearest-time lookup and bounded nearest alignment helpers.
+  - [x] Add generic numeric time-series interpolation helpers.
   - [ ] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
   - [ ] Add persistent secondary indexes for TileDB-backed timestamp, frame id, and spatial bounds queries.
 - [ ] Add geometry and coordinate-frame operations:
   - [ ] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
+  - [x] Add SE(3) transform helpers for XYZ point arrays.
   - [ ] Convert IMU, odometry, and navsat streams into common pose/trajectory arrays.
   - [ ] Add frame graph support for static and time-varying transforms.
   - [ ] Add projection helpers between point clouds, depth images, RGB images, DEM tiles, and camera frames.
   - [ ] Add crop/select helpers for axis-aligned bounds, oriented bounds, masks, and geographic bounding boxes.
+  - [x] Add axis-aligned XYZ bounds cropping with mask output.
 - [ ] Add point cloud operations:
   - [ ] Downsample by voxel grid, uniform sampling, random sampling, and farthest-point sampling.
+  - [x] Add voxel-grid downsampling.
   - [ ] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
-  - [ ] Remove outliers with statistical and radius-based filters.
+  - [x] Add normal estimation.
+  - [x] Remove outliers with statistical and radius-based filters.
   - [ ] Cluster and segment with DBSCAN, plane fitting, connected components, and ground/non-ground separation.
+  - [x] Add DBSCAN clustering and RANSAC-style plane fitting.
   - [ ] Add nearest-neighbor search with KNN, radius search, and hybrid search.
+  - [x] Add KNN and radius search.
   - [ ] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
   - [ ] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
 - [ ] Add image and depth operations:
   - [ ] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
+  - [x] Add resize-nearest, pad, normalize, and RGB-to-gray helpers.
   - [ ] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
   - [ ] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
+  - [x] Add valid-depth masks and depth backprojection to point clouds.
   - [ ] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
   - [ ] Add camera model utilities for intrinsics, distortion, rectification, and projection.
 - [ ] Add IMU, odometry, and navsat operations:
   - [ ] Resample and interpolate orientation, angular velocity, linear acceleration, position, velocity, and covariance.
+  - [x] Add generic numeric time-series interpolation.
   - [ ] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
+  - [x] Add quaternion normalization and SLERP.
   - [ ] Convert WGS84 navsat samples to local ENU/NED frames and back.
+  - [x] Add approximate WGS84 to local ENU conversion and inverse conversion.
   - [ ] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
   - [ ] Add covariance propagation and quality/status masks for navigation streams.
 - [ ] Add DEM and raster operations:
   - [ ] Mosaic, crop, reproject, resample, and cache DEM tiles.
+  - [x] Add mosaic, crop, bilinear sampling, and nearest sampling helpers.
   - [ ] Compute slope, aspect, hillshade, normals, gradients, roughness, and traversability maps.
+  - [x] Add slope, aspect, and hillshade helpers.
   - [ ] Sample elevation at navsat/trajectory points and generate local terrain patches around a vehicle pose.
+  - [x] Add raster grid sampling helper.
   - [ ] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
 - [ ] Add large-array execution features:
   - [ ] Add chunked operation execution for arrays that do not fit in memory.

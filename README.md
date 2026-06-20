@@ -141,6 +141,30 @@ timestamps = time_range["ts"]
 
 Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for both in-memory and TileDB-backed buffers.
 
+## Array Operations
+
+The `ade.ops` package provides NumPy-first helpers for common robotics data operations. They work on topic arrays returned by `DataBuffer.get_buffer()`, `get_time_range()`, and `get_last_seconds()`.
+
+```python
+from ade.ops import map_topic, select_time_range, voxel_downsample
+
+window = buffer.get_buffer()
+images = select_time_range(window["images"], start=12.0, end=12.5)
+normalized = map_topic(images, lambda frame: frame.astype("float32") / 255.0)
+
+points = window["/points"]["data"][-1]
+reduced_points = voxel_downsample(points, voxel_size=0.25)
+```
+
+`DataBuffer` also exposes convenience wrappers for buffered topics:
+
+```python
+normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 255.0)
+recent_windows = list(buffer.window_topic("images", size=5))
+```
+
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+
 ## TileDB Persistence
 
 Set `use_db=True` to persist messages to a TileDB group. This is intended for full-source ingest and larger-than-memory datasets.

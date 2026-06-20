@@ -223,6 +223,34 @@ class DataBuffer:
             raise ValueError("seconds must be non-negative")
         return self.buffer_impl.get_last_seconds(axis, seconds)
 
+    def map_topic(self, axis: str, fn, copy: bool = True) -> dict:
+        from .ops import map_topic
+
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        return map_topic(self.get_buffer(copy=copy)[axis], fn, copy=copy)
+
+    def filter_topic(self, axis: str, predicate) -> dict:
+        from .ops import filter_topic
+
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        return filter_topic(self.get_buffer()[axis], predicate)
+
+    def reduce_topic(self, axis: str, fn, initial=None):
+        from .ops import reduce_topic
+
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        return reduce_topic(self.get_buffer(copy=False)[axis], fn, initial=initial)
+
+    def window_topic(self, axis: str, size: int | None = None, seconds: float | None = None):
+        from .ops import window_topic
+
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        yield from window_topic(self.get_buffer()[axis], size=size, seconds=seconds)
+
     def __getitem__(self, subscript: slice | int) -> np.ndarray | float | int:
         return self.buffer_impl[subscript]
 
