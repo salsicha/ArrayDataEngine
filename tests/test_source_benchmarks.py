@@ -93,7 +93,7 @@ def test_benchmark_img_source_messages(tmp_path):
 
 def test_benchmark_bag_source_messages(monkeypatch):
     _patch_reader(monkeypatch)
-    monkeypatch.setattr("ade.sources.bag_source.ImageSensor", _FakeSensor)
+    monkeypatch.setitem(BagSource.SENSOR_TYPES, "image", _FakeSensor)
 
     source = BagSource("fake_bag_file.bag")
 
@@ -107,7 +107,7 @@ def test_benchmark_bag_source_messages(monkeypatch):
 
 def test_benchmark_db3_source_messages(monkeypatch, tmp_path):
     _patch_reader(monkeypatch)
-    monkeypatch.setattr("ade.sources.db3_source.ImageSensor", _FakeSensor)
+    monkeypatch.setitem(DB3Source.SENSOR_TYPES, "image", _FakeSensor)
 
     db3_path = tmp_path / "fake_db3_file.db3"
     db3_path.write_text("dummy")
@@ -151,10 +151,10 @@ class _FakeSession:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def request(self, method, url):
+    def request(self, method, url, **kwargs):
         return _FakeResponse(url, self.content)
 
-    def get(self, url, auth=None):
+    def get(self, url, auth=None, **kwargs):
         return _FakeResponse(url, self.content)
 
 

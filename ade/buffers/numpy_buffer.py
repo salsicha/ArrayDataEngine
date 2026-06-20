@@ -30,13 +30,21 @@ class NumpyBuffer:
         count = self._counts.get(topic, 0)
         write_index = self._write_indices.get(topic, 0)
 
+        if count == 0:
+            return np.arange(depth)
+
         if count < depth:
             return np.concatenate((np.arange(count, depth), np.arange(0, count)))
 
         return np.concatenate((np.arange(write_index, depth), np.arange(0, write_index)))
 
-    def _ordered_topic(self, topic: str) -> np.ndarray:
-        return self._data_buffer[topic][self._logical_indices(topic)]
+    def _ordered_topic(self, topic: str, copy: bool = False) -> np.ndarray:
+        logical_indices = self._logical_indices(topic)
+        if logical_indices.size == self.buffer_depth and np.array_equal(logical_indices, np.arange(self.buffer_depth)):
+            ordered = self._data_buffer[topic]
+        else:
+            ordered = self._data_buffer[topic][logical_indices]
+        return ordered.copy() if copy else ordered
 
     def _valid_ordered_topic(self, topic: str) -> np.ndarray:
         count = self._counts.get(topic, 0)
@@ -68,8 +76,8 @@ class NumpyBuffer:
         self._write_indices[topic] = (write_index + 1) % self.buffer_depth
         self._counts[topic] = min(self._counts[topic] + 1, self.buffer_depth)
 
-    def get_buffer(self) -> dict:
-        return {topic: self._ordered_topic(topic).copy() for topic in self._data_buffer}
+    def get_buffer(self, copy: bool = True) -> dict:
+        return {topic: self._ordered_topic(topic, copy=copy) for topic in self._data_buffer}
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         topic = self._valid_ordered_topic(axis)

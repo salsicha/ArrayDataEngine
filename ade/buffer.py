@@ -118,6 +118,7 @@ class DataBuffer:
         return max(0, min(int(preload), self.buffer_depth))
 
     def reset(self, preload=None) -> None:
+        self.close()
         self.data_source = self._get_data_source()
 
         if not self.use_db:
@@ -134,6 +135,18 @@ class DataBuffer:
 
         for i in range(self._get_preload_count(preload)):
             self.roll_buffer(self._axis)
+
+    def close(self, closed: bool | None = None) -> None:
+        buffer_impl = getattr(self, "buffer_impl", None)
+        if buffer_impl is not None and hasattr(buffer_impl, "close"):
+            buffer_impl.close(closed)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close(closed=exc_type is None)
+        return False
 
     def reset_buffer(self):
         self.reset(preload=0)
@@ -193,8 +206,8 @@ class DataBuffer:
     def append_buffer(self, msg: dict) -> None:
         self.buffer_impl.append_buffer(msg)
 
-    def get_buffer(self) -> dict:
-        return self.buffer_impl.get_buffer()
+    def get_buffer(self, copy: bool = True) -> dict:
+        return self.buffer_impl.get_buffer(copy=copy)
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         if axis not in self.topics:

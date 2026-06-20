@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import logging
 import os
-from .base_source import BaseSource
+from .ros_source import RosSource
 from ..sensors.pointcloud2_sensor import PointCloudSensor
 from ..sensors.image_sensor import ImageSensor
 from ..sensors.imu_sensor import IMUSensor
@@ -10,15 +9,20 @@ from ..sensors.odom_sensor import OdomSensor
 from ..sensors.nav_sensor import NavSensor
 
 
-_logger = logging.getLogger(__name__)
-
-
-class DB3Source(BaseSource):
+class DB3Source(RosSource):
     """Data Sources Class
     Attributes:
     Args:
     Returns:
     """
+
+    SENSOR_TYPES = {
+        "pointcloud2": PointCloudSensor,
+        "image": ImageSensor,
+        "imu": IMUSensor,
+        "odometry": OdomSensor,
+        "navsatfix": NavSensor,
+    }
 
 
     def __init__(self, data_path: str):
@@ -27,70 +31,17 @@ class DB3Source(BaseSource):
         """
         super().__init__(data_path)
 
-        self.data_path = os.path.dirname(data_path)
+        if os.path.isdir(data_path):
+            self.data_path = data_path
+        else:
+            self.data_path = os.path.dirname(data_path) or "."
 
 
     def data_exists(self) -> bool:
-        return os.path.isdir(self.data_path)
+        if not os.path.isdir(self.data_path):
+            return False
 
+        if os.path.exists(os.path.join(self.data_path, "metadata.yaml")):
+            return True
 
-    def get_count(self, axis: str) -> int:
-        count = 0
-        with self.reader() as reader:
-            for connection in reader.connections:
-                if connection.topic == axis:
-                    count = count + connection.msgcount
-        return count
-
-
-    def messages(self):
-        '''Messages from data source
-        Yields dictionary:
-        - "data": numpy array
-        - "timestamp"
-        - "topic"
-        - "name"
-        '''
-
-        with self.reader() as reader:
-            for connection, timestamp, rawdata in reader.messages():
-
-                type_name = connection.msgtype.rsplit('/', 1)[1]
-
-                ### TODO:
-                # type_name: imuptp
-                # type: novatel_oem7_msgs/msg/ImuPTP
-                # topic: /novatel/oem7/imu/data_raw
-                # ...
-                # type_name: a429rxparray
-                # type: altadt_msgs/msg/A429RXPArray
-                # topic: /altadt/raw_data
-                # ...
-                ### plus many other INS topics...
-
-                # PointCloud2 msgs don't need to be converted to native ROS format
-                if type_name.lower() == "pointcloud2":
-                    sensor = PointCloudSensor(rawdata, connection.msgtype)
-                elif type_name.lower() == "image":
-                    sensor = ImageSensor(rawdata, connection.msgtype)
-                elif type_name.lower() == "imu":
-                    sensor = IMUSensor(rawdata, connection.msgtype)
-                elif type_name.lower() == "odometry":
-                    sensor = OdomSensor(rawdata, connection.msgtype)
-                elif type_name.lower() == "navsatfix":
-                    sensor = NavSensor(rawdata, connection.msgtype)
-                elif type_name.lower() == "vector3stamped":
-                    continue
-                    # sensor = Vec3Sensor(rawdata, connection.msgtype)
-                else:
-                    if self._debug:
-                        _logger.debug("Message type not supported: %s", type_name)
-                    continue
-
-                npified, class_name, ts = sensor.numpyify()
-
-                # Yield: numpy array of data, timestamp, msg topic, class name
-                yield {"data": npified, \
-                        "timestamp": ts, \
-                        "topic": connection.topic, \
-                        "name": class_name}
+        return any(name.lower().endswith(".db3") for name in os.listdir(self.data_path))

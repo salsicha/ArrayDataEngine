@@ -149,3 +149,40 @@ def test_tiledb_buffer_time_ranges():
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
+
+def test_tiledb_buffer_context_manager_and_timestamp_sidecar():
+    temp_dir = tempfile.mkdtemp()
+    group_uri = os.path.join(temp_dir, "tiledb_sidecar_group/")
+
+    try:
+        source = MockDataSource()
+        with DataBuffer(
+            data_source=source,
+            buffer_depth=5,
+            data_uri=group_uri,
+            topics=["sensor_topic"],
+            axis="sensor_topic",
+            use_db=True
+        ) as buf:
+            for _ in range(4):
+                buf.roll_buffer("sensor_topic")
+
+            data_dict = buf.get_buffer()
+            assert np.allclose(data_dict["sensor_topic"]["ts"], np.array([100.0, 100.1, 100.2, 100.3, 100.4]))
+
+        array_uri = group_uri + "sensor_topic"
+        timestamp_uri = group_uri + "sensor_topic__timestamps"
+        assert os.path.exists(timestamp_uri)
+
+        with tiledb.open(array_uri, "r") as array:
+            assert "timestamp" not in array.meta
+            assert bool(array.meta["closed"]) is True
+
+        with tiledb.open(timestamp_uri, "r") as array:
+            assert bool(array.meta["closed"]) is True
+            assert np.allclose(array[0:5]["timestamp"], np.array([100.0, 100.1, 100.2, 100.3, 100.4]))
+
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)

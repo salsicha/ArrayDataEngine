@@ -1,7 +1,6 @@
-
-import open3d as o3d
-
 def o3d_icp(last_message, prev_message, icp_initial):
+    import open3d as o3d
+
     source = o3d.geometry.PointCloud()
     source.points = o3d.utility.Vector3dVector(last_message)
     target = o3d.geometry.PointCloud()

@@ -5,16 +5,17 @@
 
 # Array Data Engine
 
-Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings, and DEM tiles, then keep recent context in memory or persist complete streams to TileDB.
+Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to TileDB.
 
 The project is aimed at robotics and perception workflows where algorithms need synchronized windows of image, point cloud, navigation, odometry, IMU, and terrain-like array data.
 
 ## Features
 
 - NumPy-oriented message dictionaries with `data`, `timestamp`, `topic`, and `name` fields.
-- Source adapters for image folders, `.bag`, `.db3`, and DEM data.
+- Source adapters for image folders, `.bag`, `.db3`, split rosbag2 directories, and DEM data.
+- Cached ROS topic metadata, so repeated topic and count lookups do not reopen the same bag.
 - Rolling in-memory buffers for recent context windows.
-- Optional TileDB-backed storage for datasets larger than memory.
+- Optional TileDB-backed storage for datasets larger than memory, with timestamps stored in queryable sidecar arrays.
 - Lazy optional imports so lightweight workflows do not need the full ROS, DEM, or visualization stack.
 - Notebook examples for demos, iterators, terrain, INS, MOT, and TileDB workflows.
 
@@ -43,7 +44,7 @@ The full Docker/notebook environment still uses `requirements.txt`, which includ
 | --- | --- | --- | --- |
 | `*.png`, `*.jpg`, `*.jpeg`, `*.tiff` | `ImgSource` | `images` | Reads sorted image paths from a glob. |
 | `.bag` | `BagSource` | Bag topics | Supports image and point cloud messages today. |
-| `.db3` | `DB3Source` | Bag topics | Supports image, point cloud, IMU, odometry, and navsat messages. |
+| `.db3` file or rosbag2 directory | `DB3Source` | Bag topics | Supports single and split ROS 2 bags with image, point cloud, IMU, odometry, and navsat messages. |
 | `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles using Earthdata credentials. |
 
 Each yielded message has this shape:
@@ -75,17 +76,19 @@ for message in source.get_message():
     print(timestamp, image.shape)
 ```
 
-Read a ROS bag or ROS 2 database:
+Read a ROS bag, ROS 2 database, or split rosbag2 directory:
 
 ```python
 from ade.source import DataSources
 
 bag_source = DataSources("/data/recording.bag")
-db3_source = DataSources("/data/rosbag2/recording_0.db3")
+ros2_source = DataSources("/data/rosbag2/split_recording/")
 
-for topic in db3_source.get_topics():
-    print(topic, db3_source.get_count(topic))
+for topic in ros2_source.get_topics():
+    print(topic, ros2_source.get_count(topic))
 ```
+
+For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the chunk files. Passing one `.db3` chunk still works; the reader uses the containing directory.
 
 ## Rolling Buffers
 
@@ -112,6 +115,12 @@ latest_image = buffer[-1]
 window = buffer.get_buffer()
 image_window = window[axis]["data"]
 timestamps = window[axis]["ts"]
+```
+
+Use `copy=False` when you want to avoid extra in-memory copies during read-only inspection:
+
+```python
+window = buffer.get_buffer(copy=False)
 ```
 
 Use `preload=True` to fill the entire window during construction, or `preload=0` to create the buffer without reading from the source.
@@ -141,18 +150,19 @@ from ade.buffer import DataBuffer
 from ade.source import DataSources
 
 axis = "/camera/image"
-source = DataSources("/data/rosbag2/recording_0.db3")
+source = DataSources("/data/rosbag2/split_recording/")
 
-buffer = DataBuffer(
+with DataBuffer(
     data_source=source,
     data_uri="/tmp/tiledb/my_dataset/",
     axis=axis,
     use_db=True,
-)
-
-buffer.load_data_db(axis)
-print(buffer.get_group_uri())
+) as buffer:
+    buffer.load_data_db(axis)
+    print(buffer.get_group_uri())
 ```
+
+Using `DataBuffer` as a context manager closes TileDB arrays cleanly and marks completed topic arrays as closed.
 
 ## DEM Tiles
 
@@ -185,14 +195,14 @@ Run the source adapter benchmarks with:
 python -m pytest tests/test_source_benchmarks.py -q -s
 ```
 
-Results below were measured on 2026-06-19 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so the benchmarks measure adapter overhead without requiring ROS bag files or Earthdata access.
+Results below were measured on 2026-06-20 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so the benchmarks measure adapter overhead without requiring ROS bag files or Earthdata access.
 
 | Source | Workload | Messages | Elapsed | Throughput | Latency |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.010868s | 18,402 msg/s | 54.3 us/msg |
-| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000205s | 973,828 msg/s | 1.0 us/msg |
-| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000191s | 1,046,435 msg/s | 1.0 us/msg |
-| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000082s | 48,780 msg/s | 20.5 us/msg |
+| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.006808s | 29,375 msg/s | 34.0 us/msg |
+| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000124s | 1,611,278 msg/s | 0.6 us/msg |
+| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000123s | 1,630,990 msg/s | 0.6 us/msg |
+| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000054s | 74,360 msg/s | 13.4 us/msg |
 
 ## Development
 

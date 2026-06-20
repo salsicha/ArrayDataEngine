@@ -3,6 +3,19 @@ from __future__ import annotations
 import numpy as np
 from .base_sensor import BaseSensor
 
+_ENCODINGS = {
+    "mono16": (np.uint16, 1),
+    "16uc1": (np.uint16, 1),
+    "rgb8": (np.uint8, 3),
+    "bgr8": (np.uint8, 3),
+    "rgb": (np.uint8, 3),
+    "bgr": (np.uint8, 3),
+    "rgba8": (np.uint8, 4),
+    "bgra8": (np.uint8, 4),
+    "mono8": (np.uint8, 1),
+    "8uc1": (np.uint8, 1),
+}
+
 
 class ImageSensor(BaseSensor):
     """Image Sensor Class
@@ -25,25 +38,42 @@ class ImageSensor(BaseSensor):
         nanosec = msg.header.stamp.nanosec
         ts = sec + nanosec * 1e-9
 
-        encoding = msg.encoding
-        
-        # In rosbags, msg.data might be bytes, memoryview, or numpy array.
-        # np.frombuffer handles any buffer-like object efficiently.
-        if encoding in ('mono16', '16UC1'):
-            data = np.frombuffer(msg.data, dtype=np.uint16)
-            npified = data.reshape((msg.height, msg.width))
-        elif encoding in ('rgb8', 'bgr8', 'rgb', 'bgr'):
+        dtype_channels = _ENCODINGS.get(msg.encoding.lower())
+        if dtype_channels is None:
             data = np.frombuffer(msg.data, dtype=np.uint8)
-            npified = data.reshape((msg.height, msg.width, 3))
-        elif encoding in ('rgba8', 'bgra8'):
-            data = np.frombuffer(msg.data, dtype=np.uint8)
-            npified = data.reshape((msg.height, msg.width, 4))
-        elif encoding in ('mono8', '8UC1'):
-            data = np.frombuffer(msg.data, dtype=np.uint8)
+            return data, msg.__class__.__name__, ts
+
+        base_dtype, channels = dtype_channels
+        dtype = np.dtype(base_dtype)
+        if dtype.itemsize > 1:
+            is_bigendian = getattr(msg, "is_bigendian", False)
+            if not isinstance(is_bigendian, bool):
+                is_bigendian = False
+            dtype = dtype.newbyteorder(">" if is_bigendian else "<")
+
+        bytes_per_pixel = dtype.itemsize * channels
+        image_row_bytes = msg.width * bytes_per_pixel
+        row_bytes = getattr(msg, "step", image_row_bytes)
+        if not isinstance(row_bytes, (int, np.integer)):
+            row_bytes = image_row_bytes
+        if row_bytes < image_row_bytes:
+            raise ValueError(
+                f"Image step {row_bytes} is too small for {msg.width} pixels with encoding {msg.encoding}"
+            )
+
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        expected_bytes = msg.height * row_bytes
+        if raw.size < expected_bytes:
+            raise ValueError(f"Image data has {raw.size} bytes, expected at least {expected_bytes}")
+
+        rows = raw[:expected_bytes].reshape((msg.height, row_bytes))[:, :image_row_bytes]
+        data = np.ascontiguousarray(rows).view(dtype)
+        if dtype != np.dtype(base_dtype):
+            data = data.astype(base_dtype)
+
+        if channels == 1:
             npified = data.reshape((msg.height, msg.width))
         else:
-            # Fallback
-            data = np.frombuffer(msg.data, dtype=np.uint8)
-            npified = data
+            npified = data.reshape((msg.height, msg.width, channels))
 
         return npified, msg.__class__.__name__, ts

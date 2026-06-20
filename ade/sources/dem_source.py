@@ -17,7 +17,7 @@ class DEMSource(BaseSource):
     """
 
 
-    def __init__(self, north: list[int], west: list[int]):
+    def __init__(self, north: list[int], west: list[int], timeout: float = 30.0):
         """Constructor
 
         """
@@ -25,6 +25,7 @@ class DEMSource(BaseSource):
 
         self.north = north
         self.west = west
+        self.timeout = timeout
 
 
     def get_count(self, axis="Images"):
@@ -68,21 +69,22 @@ class DEMSource(BaseSource):
         if not username or not password:
             raise RuntimeError("earthdata_username and earthdata_password must be set for DEM downloads")
 
-        for n in range(self.north[0], self.north[-1]):
-            
-            for w in range(self.west[0], self.west[-1]):
+        with requests.Session() as session:
+            session.auth = (username, password)
 
-                url = f"https://e4ftl01.cr.usgs.gov//DP109/SRTM/SRTMGL1.003/2000.02.11/N{n}W{w}.SRTMGL1.hgt.zip"
+            for n in range(self.north[0], self.north[-1]):
 
-                with requests.Session() as session:
-                    session.auth = (username, password)
-                    r1 = session.request('get', url)
-                    r = session.get(r1.url, auth=(username, password))
+                for w in range(self.west[0], self.west[-1]):
+
+                    url = f"https://e4ftl01.cr.usgs.gov//DP109/SRTM/SRTMGL1.003/2000.02.11/N{n}W{w}.SRTMGL1.hgt.zip"
+
+                    r1 = session.request('get', url, timeout=self.timeout)
+                    r = session.get(r1.url, auth=(username, password), timeout=self.timeout)
                     r.raise_for_status()
                     bytes_data = BytesIO(r.content)
-                    zip_file = zipfile.ZipFile(bytes_data)
+                    with zipfile.ZipFile(bytes_data) as zip_file:
+                        hgt_content = zip_file.read(f"N{n}W{w}.hgt")
 
-                    hgt_content = zip_file.read(f"N{n}W{w}.hgt")
                     side = int(np.sqrt(len(hgt_content) / 2))
 
                     dem = np.frombuffer(hgt_content, dtype='>i2').reshape((side, side))

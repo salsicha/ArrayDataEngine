@@ -27,10 +27,9 @@ class DataSources:
             from .sources.bag_source import BagSource
 
             self.source = BagSource(data_path)
-        elif self.file_type == ".db3":
+        elif self.file_type == ".db3" or self._is_rosbag2_dir(data_path):
             from .sources.db3_source import DB3Source
 
-            # AnyReader needs just the path to the folder for db3 files
             self.source = DB3Source(data_path)
         elif self.file_type in img_types:
             from .sources.img_source import ImgSource
@@ -41,10 +40,23 @@ class DataSources:
 
             self.source = DEMSource(bounds[0], bounds[1])
         else:
-            raise ValueError(f"{self.file_type} is not supported file type: [.bag, .db3, .png, .jpg, .jpeg, .tiff]")
+            raise ValueError(
+                f"{self.file_type} is not supported file type: [.bag, .db3, rosbag2 directory, .png, .jpg, .jpeg, .tiff]"
+            )
 
         if not self.source.data_exists():
             raise FileNotFoundError(f"No data found for {data_path}")
+
+
+    @staticmethod
+    def _is_rosbag2_dir(data_path):
+        if not os.path.isdir(data_path):
+            return False
+
+        if os.path.exists(os.path.join(data_path, "metadata.yaml")):
+            return True
+
+        return any(name.lower().endswith(".db3") for name in os.listdir(data_path))
 
 
     def get_topics(self):

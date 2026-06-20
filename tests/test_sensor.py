@@ -32,6 +32,28 @@ def test_image_sensor_numpyify():
         assert npified[3, 3, 2] == 47
 
 
+def test_image_sensor_numpyify_with_padded_rows():
+    mock_msg = MagicMock()
+    mock_msg.header.stamp.sec = 1
+    mock_msg.header.stamp.nanosec = 500000000
+    mock_msg.__class__.__name__ = "Image"
+    mock_msg.encoding = "mono8"
+    mock_msg.height = 2
+    mock_msg.width = 2
+    mock_msg.step = 4
+    mock_msg.is_bigendian = False
+    mock_msg.data = bytes([1, 2, 99, 99, 3, 4, 99, 99])
+
+    sensor = ImageSensor(rawdata=b"", msgtype="sensor_msgs/msg/Image")
+
+    with patch.object(ImageSensor, "deserialize", return_value=mock_msg):
+        npified, name, ts = sensor.numpyify()
+
+        assert name == "Image"
+        assert ts == 1.5
+        assert np.array_equal(npified, np.array([[1, 2], [3, 4]], dtype=np.uint8))
+
+
 def test_imu_sensor_numpyify():
     mock_msg = MagicMock()
     mock_msg.header.stamp.sec = 1620000000

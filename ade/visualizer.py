@@ -2,13 +2,6 @@
 ## Visualization class
 
 
-import numpy as np
-import open3d as o3d
-
-from .visualizers.point_cloud import VisTool as PCVisTool
-from .visualizers.video_segment import VisTool as ImgVisTool
-
-
 class Visualizer:
     """Visualizer Class
     
@@ -32,8 +25,12 @@ class Visualizer:
         self.embed = embed
 
         if vis_type == "pointcloud":
+            from .visualizers.point_cloud import VisTool as PCVisTool
+
             self.vis_tool = PCVisTool(embed, **kwargs)
         elif vis_type == "image":
+            from .visualizers.video_segment import VisTool as ImgVisTool
+
             self.vis_tool = ImgVisTool(embed, **kwargs)
         else:
             raise ValueError(f"Visualization type not supported: ['image', 'pointcloud']")
@@ -51,4 +48,3 @@ class Visualizer:
 
     # def show_ego(self, *args, **kwargs):
     #     self.vis_tool.show(*args, **kwargs) # this calls destroy
-

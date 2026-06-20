@@ -20,13 +20,22 @@ class TileDBBuffer:
         self.msg_len = {}
         self.names = {}
         self._open_arrays = {}
+        self._open_timestamp_arrays = {}
 
     def _write_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
         if topic not in self.counters:
             return
 
-        tiledb_array.meta["timestamp"] = np.asarray(self.timestamps.get(topic, []), dtype=np.float64)
         tiledb_array.meta["name"] = self.names.get(topic, "")
+        tiledb_array.meta["topic"] = topic
+        tiledb_array.meta["count"] = self.counters[topic]
+        if closed is not None:
+            tiledb_array.meta["closed"] = closed
+
+    def _write_timestamp_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
+        if topic not in self.counters:
+            return
+
         tiledb_array.meta["topic"] = topic
         tiledb_array.meta["count"] = self.counters[topic]
         if closed is not None:
@@ -39,15 +48,27 @@ class TileDBBuffer:
                 self._write_metadata(topic, arr, closed)
             finally:
                 arr.close()
-            return
+        else:
+            uri = self._get_array_uri(topic)
+            if os.path.exists(uri) and topic in self.counters:
+                with tiledb.open(uri, "w") as tiledb_array:
+                    self._write_metadata(topic, tiledb_array, closed)
 
-        uri = self._get_array_uri(topic)
-        if os.path.exists(uri) and topic in self.counters:
-            with tiledb.open(uri, "w") as tiledb_array:
-                self._write_metadata(topic, tiledb_array, closed)
+        timestamp_arr = self._open_timestamp_arrays.pop(topic, None)
+        if timestamp_arr is not None:
+            try:
+                self._write_timestamp_metadata(topic, timestamp_arr, closed)
+            finally:
+                timestamp_arr.close()
+        else:
+            timestamp_uri = self._get_timestamp_array_uri(topic)
+            if os.path.exists(timestamp_uri) and topic in self.counters:
+                with tiledb.open(timestamp_uri, "w") as tiledb_array:
+                    self._write_timestamp_metadata(topic, tiledb_array, closed)
 
     def close(self, closed: bool | None = None):
-        for topic in list(self._open_arrays):
+        topics = set(self.counters) | set(self._open_arrays) | set(self._open_timestamp_arrays)
+        for topic in topics:
             self.close_topic(topic, closed)
 
     def __del__(self):
@@ -64,9 +85,18 @@ class TileDBBuffer:
     def _get_array_uri(self, topic: str) -> str:
         return self.group_uri + topic.replace("/", "_")
 
+    def _get_timestamp_array_uri(self, topic: str) -> str:
+        return self._get_array_uri(topic) + "__timestamps"
+
+    def _add_group_member(self, uri: str, name: str) -> None:
+        with tiledb.Group(self.group_uri, "w") as group:
+            with suppress(Exception):
+                group.add(uri, name)
+
     def _init_tdb(self, msg: dict) -> None:
         data_len = max(self.msg_len[msg['topic']], 1)
         uri = self._get_array_uri(msg['topic'])
+        timestamp_uri = self._get_timestamp_array_uri(msg['topic'])
 
         if os.path.exists(uri):
             # If open, close it first
@@ -74,12 +104,18 @@ class TileDBBuffer:
             if arr is not None:
                 with suppress(Exception):
                     arr.close()
+            timestamp_arr = self._open_timestamp_arrays.pop(msg['topic'], None)
+            if timestamp_arr is not None:
+                with suppress(Exception):
+                    timestamp_arr.close()
 
             with tiledb.open(uri, "r") as tiledb_array:
                 if tiledb_array.meta.get("closed", False):
                     _logger.info("Full data set exists: %s", uri)
                     return
             shutil.rmtree(uri)
+            if os.path.exists(timestamp_uri):
+                shutil.rmtree(timestamp_uri)
 
         dims = [
             tiledb.Dim(
@@ -98,9 +134,18 @@ class TileDBBuffer:
         )
         os.makedirs(uri, exist_ok=True)
         tiledb.Array.create(uri, schema)
-    
-        with tiledb.Group(self.group_uri, "w") as g:
-            g.add(uri, msg['topic'])
+        self._add_group_member(uri, msg['topic'])
+
+        timestamp_schema = tiledb.ArraySchema(
+            domain=tiledb.Domain(
+                tiledb.Dim(name="message", domain=(0, data_len - 1), tile=min(data_len, 1024), dtype=np.int32)
+            ),
+            sparse=False,
+            attrs=[tiledb.Attr(name="timestamp", dtype=np.float64)],
+        )
+        os.makedirs(timestamp_uri, exist_ok=True)
+        tiledb.Array.create(timestamp_uri, timestamp_schema)
+        self._add_group_member(timestamp_uri, msg['topic'] + "__timestamps")
 
     def roll_buffer(self, axis: str) -> None:
         self._axis = axis
@@ -108,9 +153,9 @@ class TileDBBuffer:
             msg = next(self.data_source)
             
             if not msg['topic'] in self.timestamps:
-                self.timestamps[msg['topic']] = []
                 self.counters[msg['topic']] = 0
                 self.msg_len[msg['topic']] = self.init_source.get_count(msg['topic'])
+                self.timestamps[msg['topic']] = np.empty(max(self.msg_len[msg['topic']], 1), dtype=np.float64)
                 self._init_tdb(msg)
 
             self.append_buffer(msg)
@@ -127,16 +172,36 @@ class TileDBBuffer:
 
         if topic not in self._open_arrays:
             self._open_arrays[topic] = tiledb.open(array_uri, "w")
+        if topic not in self._open_timestamp_arrays:
+            self._open_timestamp_arrays[topic] = tiledb.open(self._get_timestamp_array_uri(topic), "w")
 
         tiledb_array = self._open_arrays[topic]
-        self.timestamps[topic].append(msg['timestamp'])
+        timestamp_array = self._open_timestamp_arrays[topic]
+        counter = self.counters[topic]
+        self.timestamps[topic][counter] = msg['timestamp']
         self.names[topic] = msg["name"]
 
-        key = (self.counters[topic],) + tuple(slice(None) for _ in msg['data'].shape)
+        key = (counter,) + tuple(slice(None) for _ in msg['data'].shape)
         tiledb_array[key] = msg['data']
-        self.counters[topic] += 1
+        timestamp_array[counter] = msg['timestamp']
+        self.counters[topic] = counter + 1
 
-    def get_buffer(self) -> dict:
+    def _get_timestamps(self, topic: str, count: int) -> np.ndarray:
+        if count == 0:
+            return np.array([], dtype=np.float64)
+
+        timestamps = self.timestamps.get(topic)
+        if timestamps is not None:
+            return np.asarray(timestamps[:count], dtype=np.float64).copy()
+
+        timestamp_uri = self._get_timestamp_array_uri(topic)
+        if not os.path.exists(timestamp_uri):
+            return np.array([], dtype=np.float64)
+
+        with tiledb.DenseArray(timestamp_uri) as tiledb_array:
+            return np.asarray(tiledb_array[0:count]["timestamp"], dtype=np.float64)
+
+    def get_buffer(self, copy: bool = True) -> dict:
         buffer = {}
         for topic, count in self.counters.items():
             self.close_topic(topic)
@@ -144,8 +209,9 @@ class TileDBBuffer:
             with tiledb.DenseArray(uri) as A:
                 buffer[topic] = {}
                 buffer[topic]['id'] = topic
-                buffer[topic]['ts'] = np.asarray(self.timestamps.get(topic, A.meta.get("timestamp", [])))
-                buffer[topic]['data'] = A[0:count]["features"]
+                buffer[topic]['ts'] = self._get_timestamps(topic, count)
+                data = A[0:count]["features"]
+                buffer[topic]['data'] = data.copy() if copy else data
         return buffer
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
@@ -153,7 +219,7 @@ class TileDBBuffer:
             return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
 
         self.close_topic(axis)
-        timestamps = np.asarray(self.timestamps.get(axis, []), dtype=np.float64)
+        timestamps = self._get_timestamps(axis, self.counters[axis])
         mask = (timestamps >= start) & (timestamps <= end)
         indices = np.flatnonzero(mask)
         uri = self._get_array_uri(axis)
@@ -169,10 +235,11 @@ class TileDBBuffer:
         return {"id": axis, "ts": timestamps[mask], "data": data}
 
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
-        if axis not in self.counters or len(self.timestamps.get(axis, [])) == 0:
+        if axis not in self.counters or self.counters[axis] == 0:
             return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
 
-        end = self.timestamps[axis][-1]
+        timestamps = self._get_timestamps(axis, self.counters[axis])
+        end = timestamps[-1]
         return self.get_time_range(axis, end - seconds, end)
 
     def __getitem__(self, subscript):

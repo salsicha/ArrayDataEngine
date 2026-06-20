@@ -47,16 +47,16 @@ def test_bag_source_mocked(mock_any_reader):
     mock_reader_instance = MagicMock()
     mock_reader_instance.end_time = 2000000000
     mock_reader_instance.start_time = 1000000000
-    
+
     mock_conn = MagicMock()
     mock_conn.topic = "/camera/image"
     mock_conn.msgcount = 10
     mock_reader_instance.connections = [mock_conn]
-    
+
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
 
     source = BagSource("fake_bag_file.bag")
-    
+
     # Test get_duration
     duration = source.get_duration()
     assert duration == 1.0  # (2e9 - 1e9) * 1e-9 = 1.0
@@ -64,6 +64,27 @@ def test_bag_source_mocked(mock_any_reader):
     # Test get_count
     count = source.get_count("/camera/image")
     assert count == 10
+
+
+@patch("ade.sources.base_source.AnyReader")
+def test_bag_source_caches_metadata(mock_any_reader):
+    mock_reader_instance = MagicMock()
+    mock_reader_instance.end_time = 2000000000
+    mock_reader_instance.start_time = 1000000000
+
+    mock_conn = MagicMock()
+    mock_conn.topic = "/camera/image"
+    mock_conn.msgcount = 10
+    mock_reader_instance.connections = [mock_conn]
+
+    mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
+
+    source = BagSource("fake_bag_file.bag")
+
+    assert source.get_topics() == ["/camera/image"]
+    assert source.get_count("/camera/image") == 10
+    assert source.get_duration() == 1.0
+    assert mock_any_reader.call_count == 1
 
 
 @patch("ade.sources.base_source.AnyReader")
@@ -83,6 +104,55 @@ def test_db3_source_mocked(mock_any_reader):
         source = DB3Source(db3_path)
         assert source.data_exists() is True
         assert source.get_count("/camera/image") == 5
+
+    finally:
+        shutil.rmtree(temp_dir)
+
+
+@patch("ade.sources.base_source.AnyReader")
+def test_db3_source_split_directory_mocked(mock_any_reader):
+    mock_reader_instance = MagicMock()
+    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]
+    mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        with open(os.path.join(temp_dir, "metadata.yaml"), "w") as f:
+            f.write("rosbag2_bagfile_information: {}\n")
+        with open(os.path.join(temp_dir, "recording_0.db3"), "w") as f:
+            f.write("dummy")
+        with open(os.path.join(temp_dir, "recording_1.db3"), "w") as f:
+            f.write("dummy")
+
+        source = DB3Source(temp_dir)
+        assert source.data_path == temp_dir
+        assert source.data_exists() is True
+        assert source.get_count("/camera/image") == 8
+
+    finally:
+        shutil.rmtree(temp_dir)
+
+
+@patch("ade.sources.base_source.AnyReader")
+def test_data_sources_accepts_split_db3_directory(mock_any_reader):
+    mock_reader_instance = MagicMock()
+    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]
+    mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        with open(os.path.join(temp_dir, "metadata.yaml"), "w") as f:
+            f.write("rosbag2_bagfile_information: {}\n")
+        with open(os.path.join(temp_dir, "recording_0.db3"), "w") as f:
+            f.write("dummy")
+        with open(os.path.join(temp_dir, "recording_1.db3"), "w") as f:
+            f.write("dummy")
+
+        source = DataSources(temp_dir)
+        assert isinstance(source.source, DB3Source)
+        assert source.get_count("/camera/image") == 8
 
     finally:
         shutil.rmtree(temp_dir)

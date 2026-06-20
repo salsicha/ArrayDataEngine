@@ -1,14 +1,4 @@
-
 import numpy as np
-import scipy
-import cv2
-
-import scipy
-import scipy.fftpack
-from scipy import ndimage
-from scipy.stats import poisson
-from scipy.stats import multivariate_normal
-from scipy import signal
 
 x_size = 32
 y_size = 40
@@ -16,6 +6,7 @@ rate = 10
 duration = 2.0
 
 def align_images(images):
+    import cv2
 
     # TODO: alignment should shrink the final image, instead of padding with noise
 
@@ -59,6 +50,8 @@ def dense_optical_flow(img0, img1):
     try:
         from skimage.registration import optical_flow_ilk
     except ModuleNotFoundError:
+        import cv2
+
         prev = img0.astype(np.float32)
         nxt = img1.astype(np.float32)
         if prev.ndim == 3:
@@ -75,6 +68,8 @@ def dense_optical_flow(img0, img1):
 
 
 def fft_filter(data):
+    import scipy.fftpack
+
     x_size = data.shape[1]
     y_size = data.shape[2]
 
@@ -102,6 +97,8 @@ def fft_filter(data):
 
 
 def fft_filter_id(data, stage):
+    import scipy.fftpack
+
     x_size = data.shape[1]
     y_size = data.shape[2]
 
@@ -136,6 +133,8 @@ def fft_filter_id(data, stage):
 
 
 def create_synth_image_moving():
+    import cv2
+
     images = []
     times = np.arange(0, 5, 0.1)
     length = times.shape[0]
@@ -187,6 +186,7 @@ def create_synth_image_moving():
 
 
 def binarization(img, min=0, max=255):
+    import cv2
     
     ret, im = cv2.threshold(img.astype(np.uint8), min, max, cv2.THRESH_BINARY)
     
@@ -215,6 +215,8 @@ def binarization(img, min=0, max=255):
 
 
 def create_synth_image(t, pose):
+    import cv2
+
     # [x, y, z, period*10]
     beacon_arr = [[1.0, 1.0, 0.0, 5.0], [1.0, -1.0, 0.0, 4.0], [-1.0, -1.0, 0.0, 5.0], [-1.0, 1.0, 0.0, 4.0], 
                   [1.0, 0.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0], [-1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]
@@ -256,6 +258,8 @@ def make_background():
 
 
 def make_beacon():
+    from scipy.stats import multivariate_normal
+
     mean_dark = 15.5375
     beacon_max = 200
     bound_x = 15
