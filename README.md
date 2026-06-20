@@ -212,6 +212,8 @@ Run the test suite:
 python -m pytest -q
 ```
 
+Release packaging and Python registry publishing steps are tracked in [TODO.md](TODO.md).
+
 Build and run the notebook container:
 
 ```bash
