@@ -264,20 +264,22 @@ for tile in source.get_message():
 
 ## Benchmarks
 
-Run the source adapter benchmarks with:
+Run the source adapter and lazy pipeline benchmarks with:
 
 ```bash
 python -m pytest tests/test_source_benchmarks.py -q -s
 ```
 
-Results below were measured on 2026-06-20 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so the benchmarks measure adapter overhead without requiring ROS bag files or Earthdata access.
+Results below were measured on 2026-06-20 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so those rows measure adapter overhead without requiring ROS bag files or Earthdata access.
 
 | Source | Workload | Messages | Elapsed | Throughput | Latency |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.006808s | 29,375 msg/s | 34.0 us/msg |
-| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000124s | 1,611,278 msg/s | 0.6 us/msg |
-| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000123s | 1,630,990 msg/s | 0.6 us/msg |
-| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000054s | 74,360 msg/s | 13.4 us/msg |
+| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.008944s | 22,362 msg/s | 44.7 us/msg |
+| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000160s | 1,253,596 msg/s | 0.8 us/msg |
+| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000160s | 1,249,024 msg/s | 0.8 us/msg |
+| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000073s | 54,795 msg/s | 18.2 us/msg |
+| `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.019936s | 501,609 msg/s | 2.0 us/msg |
+| `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.130066s | 769 msg/s | 1300.7 us/msg |
 
 ## Development
 

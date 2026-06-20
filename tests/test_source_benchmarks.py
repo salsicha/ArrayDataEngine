@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
+from ade.buffer import DataBuffer
+from ade.ops import topic_pipeline
 from ade.sources import base_source
 from ade.sources.bag_source import BagSource
 from ade.sources.db3_source import DB3Source
@@ -17,6 +19,9 @@ from ade.sources.img_source import ImgSource
 MESSAGE_COUNT = 200
 IMAGE_SHAPE = (64, 64, 3)
 DEM_SIDE = 32
+PIPELINE_MESSAGE_COUNT = 50_000
+TILEDB_PIPELINE_MESSAGE_COUNT = 200
+PIPELINE_CHUNK_SIZE = 256
 REPEATS = 3
 
 
@@ -45,6 +50,26 @@ class _FakeSensor:
 
     def numpyify(self):
         return np.zeros(IMAGE_SHAPE, dtype=np.uint8), "Image", 1.0
+
+
+class _PipelineSource:
+    def __init__(self, count):
+        self.count = count
+
+    def get_topics(self):
+        return ["sensor_topic"]
+
+    def get_count(self, topic):
+        return self.count
+
+    def get_message(self):
+        for i in range(self.count):
+            yield {
+                "topic": "sensor_topic",
+                "timestamp": float(i) * 0.01,
+                "name": f"frame_{i}",
+                "data": np.array([float(i), float(i) * 2.0, 1.0, -1.0], dtype=np.float64),
+            }
 
 
 class _FakeReader:
@@ -172,3 +197,51 @@ def test_benchmark_dem_source_messages(monkeypatch):
     elapsed, count = _time_best(read_all)
     assert count == 4
     _print_benchmark("DEMSource.messages", count, elapsed)
+
+
+def test_benchmark_topic_pipeline_iter_chunks():
+    topic = {
+        "id": np.arange(PIPELINE_MESSAGE_COUNT, dtype=np.int64),
+        "ts": np.arange(PIPELINE_MESSAGE_COUNT, dtype=np.float64) * 0.01,
+        "data": np.arange(PIPELINE_MESSAGE_COUNT * 4, dtype=np.float64).reshape(PIPELINE_MESSAGE_COUNT, 4),
+    }
+    pipeline = (
+        topic_pipeline(topic, topic="sensor_topic")
+        .time_range(50.0, 450.0)
+        .index_range(0, 20_000, 2)
+        .map(lambda data: data * 0.5)
+    )
+
+    def process_all():
+        return sum(len(chunk) for chunk in pipeline.iter_chunks(chunk_size=PIPELINE_CHUNK_SIZE))
+
+    elapsed, count = _time_best(process_all)
+    assert count == 10_000
+    _print_benchmark("TopicPipeline.iter_chunks", count, elapsed)
+
+
+def test_benchmark_tiledb_topic_pipeline_time_range(tmp_path):
+    group_uri = str(tmp_path / "pipeline_benchmark_group")
+    with DataBuffer(
+        data_source=_PipelineSource(TILEDB_PIPELINE_MESSAGE_COUNT),
+        buffer_depth=TILEDB_PIPELINE_MESSAGE_COUNT,
+        data_uri=group_uri,
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    ) as buffer:
+        buffer.load_data_db("sensor_topic")
+
+        pipeline = (
+            buffer.topic("sensor_topic")
+            .time_range(0.5, 1.49)
+            .map(lambda data: data + 1.0)
+        )
+
+        def process_all():
+            return sum(len(chunk) for chunk in pipeline.iter_chunks(chunk_size=32))
+
+        elapsed, count = _time_best(process_all)
+
+    assert count == 100
+    _print_benchmark("TileDB.TopicPipeline.time_range", count, elapsed)
