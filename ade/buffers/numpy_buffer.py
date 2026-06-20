@@ -20,7 +20,7 @@ class NumpyBuffer:
         topic = msg['topic']
         self._data_buffer[topic] = np.zeros(
             self.buffer_depth,
-            dtype=[('ts', '<f8'), ('id', 'S'), ('data', msg['data'].dtype, msg['data'].shape)]
+            dtype=[('ts', '<f8'), ('id', 'S256'), ('data', msg['data'].dtype, msg['data'].shape)]
         )
         self._write_indices[topic] = 0
         self._counts[topic] = 0
