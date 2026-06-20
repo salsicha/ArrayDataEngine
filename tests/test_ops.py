@@ -146,6 +146,28 @@ def test_topic_pipeline_executes_lazily_and_collects_explicitly():
     assert np.allclose(collected["data"], np.array([[3.0, 3.0], [4.5, 4.5]]))
     assert calls == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
 
+    try:
+        topic_pipeline(_topic()).collect(max_rows=2)
+    except MemoryError as exc:
+        assert "max_rows=2" in str(exc)
+    else:
+        raise AssertionError("collect() should enforce max_rows")
+
+    try:
+        topic_pipeline(_topic()).collect(max_bytes=8)
+    except MemoryError as exc:
+        assert "max_bytes=8" in str(exc)
+    else:
+        raise AssertionError("collect() should enforce max_bytes")
+
+    out = np.empty((4, 2), dtype=np.float64)
+    with_out = topic_pipeline(_topic()).collect(out=out, max_bytes=64)
+    assert with_out["data"] is out
+    assert np.allclose(out, _topic()["data"])
+
+    large_allowed = topic_pipeline(_topic()).collect(max_rows=2, max_bytes=8, allow_large=True)
+    assert large_allowed["data"].shape == (4, 2)
+
     rows = list(topic_pipeline(_topic()).index_range(1, 4, 2).iter_rows(chunk_size=2))
     assert [row["id"] for row in rows] == ["b", "d"]
 

@@ -50,9 +50,13 @@ class TileDBBuffer:
         self.counters = {}
         self.msg_len = {}
         self.names = {}
+        self.closed_topics = {}
+        self._resume_seen = {}
         self._open_arrays = {}
         self._open_timestamp_arrays = {}
         self.timestamps = {}
+        self.read_only = data_source is None
+        self._hydrate_existing_topics()
 
     def _write_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
         if topic not in self.counters:
@@ -77,10 +81,11 @@ class TileDBBuffer:
         arr = self._open_arrays.pop(topic, None)
         if arr is not None:
             try:
-                self._write_metadata(topic, arr, closed)
+                if not self.read_only:
+                    self._write_metadata(topic, arr, closed)
             finally:
                 arr.close()
-        else:
+        elif not self.read_only:
             uri = self._get_array_uri(topic)
             if os.path.exists(uri) and topic in self.counters:
                 with tiledb.open(uri, "w") as tiledb_array:
@@ -89,10 +94,11 @@ class TileDBBuffer:
         timestamp_arr = self._open_timestamp_arrays.pop(topic, None)
         if timestamp_arr is not None:
             try:
-                self._write_timestamp_metadata(topic, timestamp_arr, closed)
+                if not self.read_only:
+                    self._write_timestamp_metadata(topic, timestamp_arr, closed)
             finally:
                 timestamp_arr.close()
-        else:
+        elif not self.read_only:
             timestamp_uri = self._get_timestamp_array_uri(topic)
             if os.path.exists(timestamp_uri) and topic in self.counters:
                 with tiledb.open(timestamp_uri, "w") as tiledb_array:
@@ -112,10 +118,13 @@ class TileDBBuffer:
         self.counters = {}
         self.msg_len = {}
         self.names = {}
+        self.closed_topics = {}
+        self._resume_seen = {}
         self.timestamps = {}
+        self._hydrate_existing_topics()
 
     def _get_array_uri(self, topic: str) -> str:
-        return self.group_uri + topic.replace("/", "_")
+        return os.path.join(self.group_uri, topic.replace("/", "_"))
 
     def _get_timestamp_array_uri(self, topic: str) -> str:
         return self._get_array_uri(topic) + "__timestamps"
@@ -125,13 +134,47 @@ class TileDBBuffer:
             with suppress(Exception):
                 group.add(uri, name)
 
+    def _hydrate_existing_topics(self) -> None:
+        if not os.path.isdir(self.group_uri):
+            return
+
+        for entry in os.listdir(self.group_uri):
+            if entry.endswith("__timestamps"):
+                continue
+            uri = os.path.join(self.group_uri, entry)
+            if not os.path.isdir(uri):
+                continue
+            with suppress(Exception):
+                self._hydrate_topic(uri, fallback_topic=entry)
+
+    def _hydrate_topic(self, uri: str, fallback_topic: str | None = None) -> None:
+        with tiledb.open(uri, "r") as tiledb_array:
+            topic = tiledb_array.meta.get("topic", fallback_topic)
+            if topic is None:
+                return
+
+            count = int(tiledb_array.meta.get("count", 0))
+            timestamp_uri = self._get_timestamp_array_uri(topic)
+            if os.path.exists(timestamp_uri):
+                with tiledb.open(timestamp_uri, "r") as timestamp_array:
+                    count = int(timestamp_array.meta.get("count", count))
+                    self.closed_topics[topic] = bool(timestamp_array.meta.get("closed", tiledb_array.meta.get("closed", False)))
+            else:
+                self.closed_topics[topic] = bool(tiledb_array.meta.get("closed", False))
+
+            domain = tiledb_array.schema.domain.dim(0).domain
+            self.counters[topic] = count
+            self.msg_len[topic] = int(domain[1]) + 1
+            self.names[topic] = tiledb_array.meta.get("name", "")
+            if topic not in self.topics:
+                self.topics.append(topic)
+
     def _init_tdb(self, msg: dict) -> None:
         data_len = max(self.msg_len[msg['topic']], 1)
         uri = self._get_array_uri(msg['topic'])
         timestamp_uri = self._get_timestamp_array_uri(msg['topic'])
 
         if os.path.exists(uri):
-            # If open, close it first
             arr = self._open_arrays.pop(msg['topic'], None)
             if arr is not None:
                 with suppress(Exception):
@@ -141,13 +184,11 @@ class TileDBBuffer:
                 with suppress(Exception):
                     timestamp_arr.close()
 
-            with tiledb.open(uri, "r") as tiledb_array:
-                if tiledb_array.meta.get("closed", False):
-                    _logger.info("Full data set exists: %s", uri)
-                    return
-            shutil.rmtree(uri)
             if os.path.exists(timestamp_uri):
-                shutil.rmtree(timestamp_uri)
+                self._hydrate_topic(uri, fallback_topic=msg['topic'])
+                return
+
+            shutil.rmtree(uri)
 
         dims = [
             tiledb.Dim(
@@ -192,10 +233,29 @@ class TileDBBuffer:
                 self.msg_len[msg['topic']] = self.init_source.get_count(msg['topic'])
                 self._init_tdb(msg)
 
+            if self._should_skip_replayed_message(msg['topic']):
+                if msg['topic'] == self._axis:
+                    break
+                continue
+
+            if self.closed_topics.get(msg['topic'], False) and self.counters[msg['topic']] >= self.msg_len[msg['topic']]:
+                if msg['topic'] == self._axis:
+                    break
+                continue
+
             self.append_buffer(msg)
 
             if msg['topic'] == self._axis:
                 break
+
+    def _should_skip_replayed_message(self, topic: str) -> bool:
+        existing_count = self.counters.get(topic, 0)
+        seen = self._resume_seen.get(topic, 0)
+        if seen < existing_count:
+            self._resume_seen[topic] = seen + 1
+            return True
+        self._resume_seen[topic] = seen + 1
+        return False
 
     def append_buffer(self, msg: dict) -> None:
         topic = msg['topic']
@@ -212,6 +272,8 @@ class TileDBBuffer:
         tiledb_array = self._open_arrays[topic]
         timestamp_array = self._open_timestamp_arrays[topic]
         counter = self.counters[topic]
+        if counter >= self.msg_len[topic]:
+            raise ValueError(f"topic {topic} is already full at {counter} messages")
         self.names[topic] = msg["name"]
 
         key = (counter,) + tuple(slice(None) for _ in msg['data'].shape)

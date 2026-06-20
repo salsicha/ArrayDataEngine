@@ -8,6 +8,9 @@ from typing import Any
 import numpy as np
 
 
+DEFAULT_COLLECT_MAX_BYTES = 512 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class TopicMetadata:
     """Metadata carried with a buffered topic operation."""
@@ -380,6 +383,9 @@ class TopicPipeline:
         chunk_size: int = 1024,
         copy: bool = True,
         out: np.ndarray | None = None,
+        max_rows: int | None = None,
+        max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
+        allow_large: bool = False,
     ) -> dict:
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
@@ -387,19 +393,22 @@ class TopicPipeline:
         data_parts = []
         output = None if out is None else np.asarray(out)
         offset = 0
+        collected_bytes = 0
 
         for chunk in self.iter_chunks(chunk_size=chunk_size, copy=copy):
+            offset += len(chunk)
+            collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
+            _check_collect_limits(offset, collected_bytes, max_rows, max_bytes, allow_large)
+
             if chunk.ids is not None:
                 ids_parts.append(chunk.ids.copy() if copy else chunk.ids)
             ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
             if output is None:
                 data_parts.append(chunk.data.copy() if copy else chunk.data)
             else:
-                next_offset = offset + len(chunk)
-                if next_offset > output.shape[0]:
+                if offset > output.shape[0]:
                     raise ValueError("out is too small for collected pipeline output")
-                output[offset:next_offset] = chunk.data
-                offset = next_offset
+                output[offset - len(chunk):offset] = chunk.data
 
         ids = np.concatenate(ids_parts) if ids_parts else None
         timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
@@ -550,8 +559,20 @@ class TopicWindowPipeline:
                 copy=self.copy,
             )
 
-    def collect(self, chunk_size: int = 1024) -> list[TopicView]:
-        return list(self.iter_windows(chunk_size=chunk_size))
+    def collect(
+        self,
+        chunk_size: int = 1024,
+        max_windows: int | None = None,
+        max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
+        allow_large: bool = False,
+    ) -> list[TopicView]:
+        windows = []
+        collected_bytes = 0
+        for window in self.iter_windows(chunk_size=chunk_size):
+            windows.append(window)
+            collected_bytes += _topic_view_nbytes(window)
+            _check_collect_limits(len(windows), collected_bytes, max_windows, max_bytes, allow_large)
+        return windows
 
 
 def topic_view(
@@ -706,6 +727,33 @@ def _validated_chunk_size(chunk_size: int) -> int:
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1")
     return chunk_size
+
+
+def _topic_view_nbytes(view: TopicView, include_data: bool = True) -> int:
+    ids_nbytes = 0 if view.ids is None else view.ids.nbytes
+    data_nbytes = view.data.nbytes if include_data else 0
+    return int(data_nbytes + view.timestamps.nbytes + ids_nbytes)
+
+
+def _check_collect_limits(
+    rows: int,
+    nbytes: int,
+    max_rows: int | None,
+    max_bytes: int | None,
+    allow_large: bool,
+) -> None:
+    if allow_large:
+        return
+    if max_rows is not None and rows > max_rows:
+        raise MemoryError(
+            f"collect() would materialize {rows} rows, which exceeds max_rows={max_rows}; "
+            "tighten the query, iterate chunks, or pass a larger max_rows"
+        )
+    if max_bytes is not None and nbytes > max_bytes:
+        raise MemoryError(
+            f"collect() would materialize about {nbytes} bytes, which exceeds max_bytes={max_bytes}; "
+            "tighten the query, iterate chunks, pass out=, or set allow_large=True"
+        )
 
 
 def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:

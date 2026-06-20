@@ -99,6 +99,9 @@ class DataBuffer:
     def _get_data_source(self):
         data_source = self._init_source
 
+        if data_source is None and self.use_db:
+            return iter(())
+
         if hasattr(data_source, "get_topics") and hasattr(data_source, "get_message"):
             self.topics = data_source.get_topics()
             return data_source.get_message()
@@ -109,6 +112,8 @@ class DataBuffer:
         raise TypeError("data_source must expose get_message() or be a callable generator factory")
 
     def _get_preload_count(self, preload) -> int:
+        if self._init_source is None:
+            return 0
         if preload is None:
             preload = self.preload
         if preload is True:
@@ -127,6 +132,7 @@ class DataBuffer:
             from .buffers.tiledb_buffer import TileDBBuffer
 
             self.buffer_impl = TileDBBuffer(self.data_source, self._init_source, self.group_uri, self._axis, self.topics)
+            self.topics = self.buffer_impl.topics
 
         if not self._axis:
             return

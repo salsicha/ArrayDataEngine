@@ -68,6 +68,9 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add chunked operation execution for buffered topic arrays that do not fit in memory.
   - [x] Add lazy buffered-topic pipelines with explicit `collect()`, `iter_chunks()`, `iter_rows()`, `reduce()`, and sliding-window execution.
   - [x] Push lazy buffered-topic time and index constraints into TileDB before reading data chunks.
+  - [x] Add guarded materialization limits for explicit `collect()` calls.
+  - [x] Reopen existing TileDB datasets without the original source.
+  - [x] Resume partial TileDB ingest by replaying the source and skipping stored per-topic offsets.
   - [ ] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
   - [ ] Add optional parallel execution for independent chunks/topics.
   - [ ] Add progress reporting, cancellation, and resumable operation checkpoints.

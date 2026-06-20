@@ -174,8 +174,10 @@ for chunk in pipeline.iter_chunks(chunk_size=32):
     process(chunk.data, chunk.timestamps)
 
 summary = pipeline.reduce(lambda acc, frame: acc + frame.mean(), initial=0.0)
-small_result = pipeline.collect(chunk_size=32)
+small_result = pipeline.collect(chunk_size=32, max_rows=1_000)
 ```
+
+`collect()` is intentionally guarded. By default it refuses results above 512 MiB; pass `max_rows`, `max_bytes`, `out=`, or `allow_large=True` when materializing a large bounded result is intentional.
 
 `TopicView` is still available when the data is already in memory and you want eager, metadata-aware operations. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
 
@@ -220,6 +222,22 @@ with DataBuffer(
 Using `DataBuffer` as a context manager closes TileDB arrays cleanly and marks completed topic arrays as closed.
 
 TileDB-backed topics keep timestamps and message names in sidecar arrays. Time and index constraints from `buffer.topic(axis).time_range(...)` and `.index_range(...)` are pushed down before data chunks are read, so lazy pipelines avoid loading unselected message payloads.
+
+Existing TileDB groups can be reopened without the original source:
+
+```python
+reopened = DataBuffer(
+    data_source=None,
+    data_uri="/tmp/tiledb/my_dataset/",
+    axis=axis,
+    use_db=True,
+)
+
+for chunk in reopened.topic(axis).time_range(12.0, 20.0).iter_chunks(chunk_size=64):
+    process(chunk.data)
+```
+
+Interrupted ingests can be resumed by constructing a new `DataBuffer` with the same source and `data_uri`. Stored per-topic counts are loaded from TileDB metadata, previously written messages are skipped during source replay, and remaining messages are appended.
 
 ## DEM Tiles
 

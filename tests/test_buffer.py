@@ -291,6 +291,84 @@ def test_tiledb_buffer_lazy_pipeline_pushes_time_and_index_ranges_to_backend(tmp
         assert read_indices == [1, 3]
 
 
+def test_tiledb_buffer_reopens_without_original_source(tmp_path):
+    group_uri = str(tmp_path / "tiledb_reopen_group")
+
+    with DataBuffer(
+        data_source=MockDataSource(),
+        buffer_depth=5,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    ) as buf:
+        buf.load_data_db("sensor_topic")
+
+    reopened = DataBuffer(
+        data_source=None,
+        data_uri=group_uri,
+        axis="sensor_topic",
+        use_db=True,
+    )
+    try:
+        assert reopened.get_topics() == ["sensor_topic"]
+        assert reopened.get_size() == 5
+
+        time_range = reopened.get_time_range("sensor_topic", 100.1, 100.3)
+        assert np.allclose(time_range["ts"], np.array([100.1, 100.2, 100.3]))
+        assert np.allclose(time_range["data"], np.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]]))
+        assert time_range["name"].tolist() == [b"sensor_frame"] * 3
+
+        lazy = reopened.topic("sensor_topic").index_range(2, 5).collect(chunk_size=1)
+        assert np.allclose(lazy["ts"], np.array([100.2, 100.3, 100.4]))
+        assert np.allclose(lazy["data"], np.array([[2.0, 4.0], [3.0, 6.0], [4.0, 8.0]]))
+    finally:
+        reopened.close()
+
+
+def test_tiledb_buffer_resumes_partial_ingest(tmp_path):
+    group_uri = str(tmp_path / "tiledb_resume_group")
+
+    first = DataBuffer(
+        data_source=MockDataSource(),
+        buffer_depth=5,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    )
+    first.roll_buffer("sensor_topic")
+    first.roll_buffer("sensor_topic")
+    first.close(closed=False)
+
+    resumed = DataBuffer(
+        data_source=MockDataSource(),
+        buffer_depth=5,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    )
+    try:
+        assert resumed.buffer_impl.counters["sensor_topic"] == 2
+        resumed.load_data_db("sensor_topic")
+
+        data = resumed.get_buffer()["sensor_topic"]
+        assert np.allclose(data["ts"], np.array([100.0, 100.1, 100.2, 100.3, 100.4]))
+        assert np.allclose(data["data"], np.array([
+            [0.0, 0.0],
+            [1.0, 2.0],
+            [2.0, 4.0],
+            [3.0, 6.0],
+            [4.0, 8.0],
+        ]))
+    finally:
+        resumed.close()
+
+
 def test_tiledb_buffer_synthetic_multitopic_persistence(tmp_path):
     group_uri = str(tmp_path / "synthetic_tiledb_group") + "/"
 
