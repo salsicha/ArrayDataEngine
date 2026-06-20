@@ -1,5 +1,64 @@
 # TODO
 
+## Large Sensor Array Operations
+
+Open3D is a useful model for this project: keep the API small, composable, NumPy-first, and fast enough for very large robotics datasets. The operations below should work on in-memory buffers first, then TileDB-backed arrays where practical.
+
+Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/release/tutorial/geometry/pointcloud.html), [Open3D PointCloud API](https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html), and [Open3D ICP registration tutorial](https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html).
+
+- [ ] Define a common operation interface for buffered topics:
+  - [ ] Add `map(topic, fn)`, `filter(topic, predicate)`, `reduce(topic, fn)`, and `window(topic, size|seconds)` helpers.
+  - [ ] Support eager NumPy output and lazy/chunked iteration for larger-than-memory arrays.
+  - [ ] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
+  - [ ] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
+- [ ] Add dataset-level selection and indexing:
+  - [ ] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
+  - [ ] Add nearest-time lookup and interpolation helpers for synchronizing camera, point cloud, IMU, odometry, navsat, and DEM topics.
+  - [ ] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
+  - [ ] Add persistent secondary indexes for TileDB-backed timestamp, frame id, and spatial bounds queries.
+- [ ] Add geometry and coordinate-frame operations:
+  - [ ] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
+  - [ ] Convert IMU, odometry, and navsat streams into common pose/trajectory arrays.
+  - [ ] Add frame graph support for static and time-varying transforms.
+  - [ ] Add projection helpers between point clouds, depth images, RGB images, DEM tiles, and camera frames.
+  - [ ] Add crop/select helpers for axis-aligned bounds, oriented bounds, masks, and geographic bounding boxes.
+- [ ] Add point cloud operations:
+  - [ ] Downsample by voxel grid, uniform sampling, random sampling, and farthest-point sampling.
+  - [ ] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
+  - [ ] Remove outliers with statistical and radius-based filters.
+  - [ ] Cluster and segment with DBSCAN, plane fitting, connected components, and ground/non-ground separation.
+  - [ ] Add nearest-neighbor search with KNN, radius search, and hybrid search.
+  - [ ] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
+  - [ ] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
+- [ ] Add image and depth operations:
+  - [ ] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
+  - [ ] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
+  - [ ] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
+  - [ ] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
+  - [ ] Add camera model utilities for intrinsics, distortion, rectification, and projection.
+- [ ] Add IMU, odometry, and navsat operations:
+  - [ ] Resample and interpolate orientation, angular velocity, linear acceleration, position, velocity, and covariance.
+  - [ ] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
+  - [ ] Convert WGS84 navsat samples to local ENU/NED frames and back.
+  - [ ] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
+  - [ ] Add covariance propagation and quality/status masks for navigation streams.
+- [ ] Add DEM and raster operations:
+  - [ ] Mosaic, crop, reproject, resample, and cache DEM tiles.
+  - [ ] Compute slope, aspect, hillshade, normals, gradients, roughness, and traversability maps.
+  - [ ] Sample elevation at navsat/trajectory points and generate local terrain patches around a vehicle pose.
+  - [ ] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
+- [ ] Add large-array execution features:
+  - [ ] Add chunked operation execution for arrays that do not fit in memory.
+  - [ ] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
+  - [ ] Add optional parallel execution for independent chunks/topics.
+  - [ ] Add progress reporting, cancellation, and resumable operation checkpoints.
+  - [ ] Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
+- [ ] Add ML-ready dataset operations:
+  - [ ] Export topic windows to PyTorch, NumPy, and plain iterator datasets.
+  - [ ] Add deterministic train/validation/test splits by time, sequence, geography, or source file.
+  - [ ] Add augmentation operations for images, point clouds, trajectories, and DEM patches.
+  - [ ] Add batch collation for variable-size point clouds and mixed-rate sensor windows.
+
 ## Package And Publish To Python Registries
 
 - [ ] Confirm the package metadata in `pyproject.toml`:
