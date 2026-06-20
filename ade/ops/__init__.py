@@ -26,7 +26,16 @@ from .core import (
     window_topic,
 )
 from .dem import crop_raster, hillshade, mosaic_tiles, sample_grid, slope_aspect
-from .geometry import apply_transform, crop_bounds
+from .geometry import (
+    apply_transform,
+    crop_bounds,
+    dem_grid_to_points,
+    transform_dem_grid,
+    transform_navsat,
+    transform_odometry,
+    transform_poses,
+    transform_vectors,
+)
 from .image import depth_to_points, normalize_image, pad_image, resize_nearest, rgb_to_gray, valid_depth_mask
 from .nav import (
     enu_to_navsat,
@@ -56,6 +65,7 @@ __all__ = [
     "cluster_dbscan",
     "crop_bounds",
     "crop_raster",
+    "dem_grid_to_points",
     "depth_to_points",
     "dataset_query",
     "DatasetQuery",
@@ -94,6 +104,11 @@ __all__ = [
     "TopicView",
     "TopicWindowPipeline",
     "topic_view",
+    "transform_dem_grid",
+    "transform_navsat",
+    "transform_odometry",
+    "transform_poses",
+    "transform_vectors",
     "trajectory_speed",
     "valid_depth_mask",
     "voxel_downsample",

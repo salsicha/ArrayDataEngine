@@ -11,6 +11,7 @@ from ade.ops import (
     crop_bounds,
     crop_raster,
     dataset_query,
+    dem_grid_to_points,
     depth_to_points,
     DatasetQuery,
     enu_to_navsat,
@@ -43,6 +44,11 @@ from ade.ops import (
     TopicView,
     topic_pipeline,
     topic_view,
+    transform_dem_grid,
+    transform_navsat,
+    transform_odometry,
+    transform_poses,
+    transform_vectors,
     trajectory_speed,
     valid_depth_mask,
     voxel_downsample,
@@ -379,6 +385,9 @@ def test_geometry_and_point_cloud_operations():
     transformed = apply_transform(points, transform)
     assert np.allclose(transformed[0], np.array([1.0, 2.0, 3.0]))
 
+    vectors = transform_vectors(np.array([[1.0, 0.0, 0.0]]), transform)
+    assert np.allclose(vectors, np.array([[1.0, 0.0, 0.0]]))
+
     cropped, mask = crop_bounds(points, min_bound=[0, 0, -1], max_bound=[1.2, 1.2, 1], return_mask=True)
     assert cropped.shape == (4, 3)
     assert mask.tolist() == [True, True, True, True, False]
@@ -408,6 +417,56 @@ def test_geometry_and_point_cloud_operations():
     plane, inliers = segment_plane(points[:4], distance_threshold=1.0e-6, iterations=10, seed=1)
     assert np.isclose(abs(plane[2]), 1.0)
     assert inliers.all()
+
+
+def test_coordinate_frame_transforms_for_poses_navsat_odometry_and_dem():
+    theta = np.pi / 2.0
+    transform = np.array([
+        [np.cos(theta), -np.sin(theta), 0.0, 1.0],
+        [np.sin(theta), np.cos(theta), 0.0, 2.0],
+        [0.0, 0.0, 1.0, 3.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+    poses = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    transformed_poses = transform_poses(poses, transform)
+    assert np.allclose(transformed_poses[0, :3], np.array([1.0, 3.0, 3.0]))
+    assert np.allclose(transformed_poses[0, 3:7], np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)]))
+
+    odom = np.zeros((8, 4), dtype=np.float64)
+    odom[0] = [1.0, 0.0, 0.0, 0.0]
+    odom[1] = [1.0, 4.0, 9.0, 0.0]
+    odom[2] = [0.0, 0.0, 0.0, 1.0]
+    odom[4] = [1.0, 0.0, 0.0, 0.0]
+    odom[5] = [1.0, 4.0, 9.0, 0.0]
+    odom[6] = [0.0, 1.0, 0.0, 0.0]
+    transformed_odom = transform_odometry(odom, transform)
+    assert np.allclose(transformed_odom[0, :3], np.array([1.0, 3.0, 3.0]))
+    assert np.allclose(transformed_odom[2, :4], np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)]))
+    assert np.allclose(transformed_odom[4, :3], np.array([0.0, 1.0, 0.0]))
+    assert np.allclose(transformed_odom[6, :3], np.array([-1.0, 0.0, 0.0]))
+    assert np.allclose(transformed_odom[1, :3], np.array([4.0, 1.0, 9.0]))
+
+    navsat = np.array([[37.0, -122.0, 10.0]])
+    nav_transform = np.eye(4)
+    nav_transform[:3, 3] = [10.0, 20.0, 5.0]
+    transformed_navsat = transform_navsat(navsat, nav_transform, 37.0, -122.0, 10.0)
+    transformed_enu = navsat_to_enu(
+        transformed_navsat[:, 0],
+        transformed_navsat[:, 1],
+        transformed_navsat[:, 2],
+        37.0,
+        -122.0,
+        10.0,
+    )
+    assert np.allclose(transformed_enu, np.array([[10.0, 20.0, 5.0]]))
+
+    elevation = np.array([[1.0, 2.0], [3.0, 4.0]])
+    dem_points = dem_grid_to_points(elevation, resolution=2.0, origin=(10.0, 20.0))
+    assert np.allclose(dem_points[1, 1], np.array([12.0, 22.0, 4.0]))
+    transformed_dem = transform_dem_grid(elevation, nav_transform, resolution=2.0, origin=(10.0, 20.0))
+    assert transformed_dem.shape == (2, 2, 3)
+    assert np.allclose(transformed_dem[0, 0], np.array([20.0, 40.0, 6.0]))
 
 
 def test_image_depth_operations():

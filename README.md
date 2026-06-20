@@ -158,6 +158,16 @@ points = window["/points"]["data"][-1]
 reduced_points = voxel_downsample(points, voxel_size=0.25)
 ```
 
+SE(3) coordinate-frame helpers work across common robotics arrays:
+
+```python
+from ade.ops import apply_transform, transform_navsat, transform_odometry
+
+points_in_map = apply_transform(points_in_lidar, lidar_to_map)
+odom_in_map = transform_odometry(odom_message_array, odom_to_map)
+gps_in_map_frame = transform_navsat(gps_samples, enu_transform, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+```
+
 For large datasets, use the lazy topic pipeline. It records operations and only executes them when chunks, rows, reductions, windows, or explicit collection are requested.
 
 ```python
