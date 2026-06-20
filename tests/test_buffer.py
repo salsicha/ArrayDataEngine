@@ -56,6 +56,52 @@ class SyntheticMultiTopicSource:
             }
 
 
+class SpatialFrameSource:
+    def get_topics(self):
+        return ["sensor_topic"]
+
+    def get_count(self, topic):
+        return 4
+
+    def get_message(self):
+        messages = [
+            ("map", "frame_0", [0.0, 0.0, 0.0]),
+            ("odom", "frame_1", [5.0, 5.0, 0.0]),
+            ("map", "frame_2", [2.0, 2.0, 0.0]),
+            ("base", "frame_3", [10.0, 10.0, 0.0]),
+        ]
+        for index, (frame_id, name, data) in enumerate(messages):
+            yield {
+                "topic": "sensor_topic",
+                "timestamp": float(index),
+                "name": name,
+                "data": np.asarray(data, dtype=np.float64),
+                "frame_id": frame_id,
+            }
+
+
+class SpatialAabbSource:
+    def get_topics(self):
+        return ["sensor_topic"]
+
+    def get_count(self, topic):
+        return 2
+
+    def get_message(self):
+        messages = [
+            ("cloud_0", np.array([[0.0, 10.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float64)),
+            ("cloud_1", np.array([[5.0, 5.0, 0.0], [5.5, 5.5, 0.0]], dtype=np.float64)),
+        ]
+        for index, (name, data) in enumerate(messages):
+            yield {
+                "topic": "sensor_topic",
+                "timestamp": float(index),
+                "name": name,
+                "data": data,
+                "frame_id": "map",
+            }
+
+
 def test_numpy_buffer():
     source = MockDataSource()
     buf = DataBuffer(
@@ -290,6 +336,107 @@ def test_tiledb_buffer_lazy_pipeline_pushes_time_and_index_ranges_to_backend(tmp
         assert np.allclose(index_filtered["ts"], np.array([100.1, 100.3]))
         assert np.allclose(index_filtered["data"], np.array([[1.0, 2.0], [3.0, 6.0]]))
         assert read_indices == [1, 3]
+
+
+def test_tiledb_buffer_persists_frame_and_spatial_indexes_for_pushdown(tmp_path):
+    group_uri = str(tmp_path / "tiledb_frame_spatial_group") + "/"
+
+    with DataBuffer(
+        data_source=SpatialFrameSource(),
+        buffer_depth=4,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    ) as buf:
+        buf.load_data_db("sensor_topic")
+
+    timestamp_uri = group_uri + "sensor_topic__timestamps"
+    with tiledb.open(timestamp_uri, "r") as index_array:
+        attr_names = set(index_array.schema.attr_names)
+        assert {"frame_id", "spatial_valid", "spatial_min_0", "spatial_max_2"}.issubset(attr_names)
+        stored = index_array[0:4]
+        assert stored["frame_id"].tolist() == [b"map", b"odom", b"map", b"base"]
+        assert stored["spatial_valid"].tolist() == [1, 1, 1, 1]
+        assert np.allclose(stored["spatial_min_0"], np.array([0.0, 5.0, 2.0, 10.0]))
+        assert np.allclose(stored["spatial_max_1"], np.array([0.0, 5.0, 2.0, 10.0]))
+
+    reopened = DataBuffer(
+        data_source=None,
+        data_uri=group_uri,
+        axis="sensor_topic",
+        use_db=True,
+    )
+    try:
+        assert reopened.topic("sensor_topic").metadata.frame_id is None
+
+        read_indices = []
+        original_read_data_attr = reopened.buffer_impl._read_data_attr
+
+        def recording_read_data_attr(tiledb_array, indices):
+            read_indices.extend(indices.tolist())
+            return original_read_data_attr(tiledb_array, indices)
+
+        reopened.buffer_impl._read_data_attr = recording_read_data_attr
+
+        frame_filtered = reopened.dataset(["sensor_topic"]).frame_id("map").collect(chunk_size=1)
+        assert frame_filtered["sensor_topic"]["name"].tolist() == [b"frame_0", b"frame_2"]
+        assert read_indices == [0, 2]
+
+        read_indices.clear()
+        spatial_filtered = (
+            reopened.dataset(["sensor_topic"])
+            .spatial_bounds(min_bound=[-1.0, -1.0, -1.0], max_bound=[1.0, 1.0, 1.0])
+            .collect(chunk_size=1)
+        )
+        assert spatial_filtered["sensor_topic"]["name"].tolist() == [b"frame_0"]
+        assert read_indices == [0]
+
+        read_indices.clear()
+        combined = (
+            reopened.dataset(["sensor_topic"])
+            .frame_id("map")
+            .spatial_bounds(min_bound=[1.0, 1.0, -1.0], max_bound=[3.0, 3.0, 1.0])
+            .collect(chunk_size=1)
+        )
+        assert combined["sensor_topic"]["name"].tolist() == [b"frame_2"]
+        assert np.allclose(combined["sensor_topic"]["data"], np.array([[2.0, 2.0, 0.0]]))
+        assert read_indices == [2]
+    finally:
+        reopened.close()
+
+
+def test_tiledb_spatial_pushdown_preserves_index_order_after_exact_filter(tmp_path):
+    group_uri = str(tmp_path / "tiledb_spatial_order_group") + "/"
+
+    with DataBuffer(
+        data_source=SpatialAabbSource(),
+        buffer_depth=2,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True,
+        preload=0,
+    ) as buf:
+        buf.load_data_db("sensor_topic")
+
+    reopened = DataBuffer(
+        data_source=None,
+        data_uri=group_uri,
+        axis="sensor_topic",
+        use_db=True,
+    )
+    try:
+        result = (
+            reopened.dataset(["sensor_topic"])
+            .spatial_bounds(min_bound=[4.0, 4.0, -1.0], max_bound=[6.0, 6.0, 1.0])
+            .index_range(0, 1)
+            .collect(chunk_size=1)
+        )
+        assert result["sensor_topic"]["name"].tolist() == [b"cloud_1"]
+    finally:
+        reopened.close()
 
 
 def test_tiledb_buffer_reopens_without_original_source(tmp_path):

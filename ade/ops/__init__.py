@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from .core import (
+    align_bounded,
+    align_exact,
     align_nearest,
+    align_topic,
     dataset_query,
     filter_topic,
     iter_chunks,
     map_topic,
     nearest_time_index,
     reduce_topic,
+    resample_topic,
+    rolling_window_join,
     select_indices,
     select_time_range,
     DatasetQuery,
@@ -43,7 +48,10 @@ from .point_cloud import (
 )
 
 __all__ = [
+    "align_bounded",
+    "align_exact",
     "align_nearest",
+    "align_topic",
     "apply_transform",
     "cluster_dbscan",
     "crop_bounds",
@@ -68,7 +76,9 @@ __all__ = [
     "radius_outlier_filter",
     "radius_search",
     "reduce_topic",
+    "resample_topic",
     "resize_nearest",
+    "rolling_window_join",
     "rgb_to_gray",
     "sample_grid",
     "segment_plane",

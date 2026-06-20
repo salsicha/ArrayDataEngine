@@ -328,6 +328,19 @@ class TopicPipeline:
     ) -> "TopicPipeline":
         return self.index_range(start, stop, step)
 
+    def frame_id(self, *frame_ids: str | Iterable[str]) -> "TopicPipeline":
+        targets = _normalize_text_selection(frame_ids, "frame_id")
+        return self._with_operation("frame_id", targets)
+
+    def spatial_bounds(
+        self,
+        min_bound,
+        max_bound,
+        columns: tuple[int, ...] | None = None,
+    ) -> "TopicPipeline":
+        min_array, max_array, columns = _normalize_bounds(min_bound, max_bound, columns)
+        return self._with_operation("spatial_bounds", min_array, max_array, columns=columns)
+
     def iter_rows(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[dict]:
         for message_id, timestamp, value in self._iter_processed_rows(chunk_size=chunk_size, copy=copy):
             yield {
@@ -480,6 +493,21 @@ class TopicPipeline:
                         current_index = index_counters[op_index]
                         index_counters[op_index] += 1
                         keep = _slice_contains(current_index, *operation.args)
+                    elif operation.kind == "frame_id":
+                        targets = operation.args[0]
+                        metadata_frame_id = _decode_text(self.metadata.frame_id)
+                        if metadata_frame_id is not None:
+                            keep = metadata_frame_id in targets
+                        else:
+                            keep = _row_frame_id(current_value, current_id) in targets
+                    elif operation.kind == "spatial_bounds":
+                        min_bound, max_bound = operation.args
+                        keep = _spatial_value_in_bounds(
+                            current_value,
+                            min_bound=min_bound,
+                            max_bound=max_bound,
+                            columns=operation.kwargs["columns"],
+                        )
                     else:
                         raise ValueError(f"unsupported pipeline operation: {operation.kind}")
 
@@ -491,13 +519,19 @@ class TopicPipeline:
 
     def _split_pushdown_operations(self) -> tuple[tuple[_PipelineOperation, ...], tuple[_PipelineOperation, ...]]:
         pushdown_operations = []
+        remaining_operations = []
+        pushing = True
         for operation in self._operations:
-            if operation.kind not in {"time_range", "index_range"}:
-                break
-            pushdown_operations.append(operation)
+            if pushing and operation.kind in {"time_range", "index_range", "frame_id", "spatial_bounds"}:
+                pushdown_operations.append(operation)
+                if operation.kind == "spatial_bounds":
+                    remaining_operations.append(operation)
+                    pushing = False
+                continue
+            pushing = False
+            remaining_operations.append(operation)
 
-        pushed = tuple(pushdown_operations)
-        return pushed, self._operations[len(pushed):]
+        return tuple(pushdown_operations), tuple(remaining_operations)
 
     def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool) -> TopicView:
         ids_array = np.asarray(ids, dtype=object)
@@ -632,10 +666,7 @@ class DatasetQuery:
                     selected[topic] = pipeline
                 continue
 
-            selected[topic] = pipeline.filter(
-                lambda data, ts, name, targets=targets: _row_frame_id(data, name) in targets,
-                copy=False,
-            )
+            selected[topic] = pipeline.frame_id(targets)
         return DatasetQuery(selected)
 
     def geographic_bounds(
@@ -678,26 +709,7 @@ class DatasetQuery:
         max_bound,
         columns: tuple[int, ...] | None = None,
     ) -> "DatasetQuery":
-        min_array = np.asarray(min_bound, dtype=np.float64)
-        max_array = np.asarray(max_bound, dtype=np.float64)
-        if min_array.ndim != 1 or max_array.ndim != 1 or min_array.shape != max_array.shape:
-            raise ValueError("min_bound and max_bound must be one-dimensional arrays with the same shape")
-        if np.any(min_array > max_array):
-            raise ValueError("min_bound must be less than or equal to max_bound")
-        if columns is None:
-            columns = tuple(range(min_array.size))
-        if len(columns) != min_array.size:
-            raise ValueError("columns length must match bound dimensionality")
-
-        return self.filter(
-            lambda data, ts, name: _spatial_value_in_bounds(
-                data,
-                min_bound=min_array,
-                max_bound=max_array,
-                columns=columns,
-            ),
-            copy=False,
-        )
+        return self._map_pipelines(lambda pipeline: pipeline.spatial_bounds(min_bound, max_bound, columns=columns))
 
     def map(self, fn: Callable, copy: bool = True) -> "DatasetQuery":
         return self._map_pipelines(lambda pipeline: pipeline.map(fn, copy=copy))
@@ -848,6 +860,30 @@ def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOpera
             )
         elif operation.kind == "index_range":
             selected = selected.select_indices(*operation.args, copy=False)
+        elif operation.kind == "frame_id":
+            targets = operation.args[0]
+            metadata_frame_id = _decode_text(selected.metadata.frame_id)
+            if metadata_frame_id is not None:
+                if metadata_frame_id not in targets:
+                    selected = selected._select(np.zeros(len(selected), dtype=bool), copy=False)
+            else:
+                selected = selected.filter(
+                    lambda data, ts, name, targets=targets: _row_frame_id(data, name) in targets,
+                    copy=False,
+                )
+        elif operation.kind == "spatial_bounds":
+            min_bound, max_bound = operation.args
+            selected = selected.filter(
+                lambda data, ts, name, min_bound=min_bound, max_bound=max_bound, operation=operation: (
+                    _spatial_value_in_bounds(
+                        data,
+                        min_bound=min_bound,
+                        max_bound=max_bound,
+                        columns=operation.kwargs["columns"],
+                    )
+                ),
+                copy=False,
+            )
         else:
             raise ValueError(f"unsupported pushdown operation: {operation.kind}")
     return selected
@@ -997,6 +1033,22 @@ def _spatial_value_in_bounds(
     field_groups = tuple((name,) for name in ("x", "y", "z", "w")[: min_bound.size])
     coordinates = _coordinate_array(value, field_groups=field_groups, columns=columns)
     return _coordinates_in_bounds(coordinates, min_bound, max_bound)
+
+
+def _normalize_bounds(min_bound, max_bound, columns: tuple[int, ...] | None = None):
+    min_array = np.asarray(min_bound, dtype=np.float64)
+    max_array = np.asarray(max_bound, dtype=np.float64)
+    if min_array.ndim != 1 or max_array.ndim != 1 or min_array.shape != max_array.shape:
+        raise ValueError("min_bound and max_bound must be one-dimensional arrays with the same shape")
+    if np.any(min_array > max_array):
+        raise ValueError("min_bound must be less than or equal to max_bound")
+    if columns is None:
+        columns = tuple(range(min_array.size))
+    if len(columns) != min_array.size:
+        raise ValueError("columns length must match bound dimensionality")
+    if any(column < 0 for column in columns):
+        raise ValueError("columns must be non-negative")
+    return min_array, max_array, tuple(int(column) for column in columns)
 
 
 def _coordinate_array(
@@ -1171,27 +1223,317 @@ def nearest_time_index(timestamps: np.ndarray, query_time: float, tolerance: flo
     return int(best)
 
 
-def align_nearest(reference_topic: dict | np.ndarray, target_topic: dict | np.ndarray, tolerance: float | None = None) -> dict:
-    _, ref_ts, _ = topic_parts(reference_topic)
-    target_ids, target_ts, target_data = topic_parts(target_topic)
+def align_topic(
+    reference_topic: dict | np.ndarray | TopicView | None,
+    target_topic: dict | np.ndarray | TopicView,
+    mode: str = "nearest",
+    tolerance: float | None = None,
+    rate_hz: float | None = None,
+    period: float | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    interpolation: str = "linear",
+    seconds: float | None = None,
+    size: int | None = None,
+    lookback: float | None = None,
+    lookahead: float = 0.0,
+    copy: bool = True,
+) -> dict:
+    """Align or resample topic data using a named timestamp mode."""
 
-    indices = np.array([
+    normalized_mode = mode.lower().replace("-", "_")
+    if normalized_mode == "exact":
+        if reference_topic is None:
+            raise ValueError("reference_topic is required for exact alignment")
+        return align_exact(reference_topic, target_topic)
+    if normalized_mode in {"nearest", "nearest_neighbor"}:
+        if reference_topic is None:
+            raise ValueError("reference_topic is required for nearest alignment")
+        return align_nearest(reference_topic, target_topic, tolerance=tolerance)
+    if normalized_mode in {"bounded", "bounded_tolerance", "tolerance"}:
+        if reference_topic is None:
+            raise ValueError("reference_topic is required for bounded alignment")
+        return align_bounded(reference_topic, target_topic, tolerance=tolerance)
+    if normalized_mode in {"fixed_rate", "resample", "fixed_rate_resampling"}:
+        return resample_topic(
+            target_topic,
+            rate_hz=rate_hz,
+            period=period,
+            start=start,
+            end=end,
+            method=interpolation,
+            tolerance=tolerance,
+        )
+    if normalized_mode in {"rolling_window", "window", "rolling_window_join"}:
+        if reference_topic is None:
+            raise ValueError("reference_topic is required for rolling window joins")
+        return rolling_window_join(
+            reference_topic,
+            target_topic,
+            seconds=seconds,
+            size=size,
+            lookback=lookback,
+            lookahead=lookahead,
+            copy=copy,
+        )
+    raise ValueError(f"unsupported alignment mode: {mode}")
+
+
+def align_exact(reference_topic: dict | np.ndarray | TopicView, target_topic: dict | np.ndarray | TopicView) -> dict:
+    """Align target messages to exactly matching reference timestamps."""
+
+    reference = topic_view(reference_topic)
+    target = topic_view(target_topic)
+    indices = _exact_alignment_indices(reference.timestamps, target.timestamps)
+    return _aligned_topic_result(reference, target, indices, mode="exact")
+
+
+def align_nearest(
+    reference_topic: dict | np.ndarray | TopicView,
+    target_topic: dict | np.ndarray | TopicView,
+    tolerance: float | None = None,
+) -> dict:
+    """Align each reference timestamp to the nearest target message."""
+
+    reference = topic_view(reference_topic)
+    target = topic_view(target_topic)
+    indices = _nearest_alignment_indices(reference.timestamps, target.timestamps, tolerance=tolerance)
+    return _aligned_topic_result(reference, target, indices, mode="nearest")
+
+
+def align_bounded(
+    reference_topic: dict | np.ndarray | TopicView,
+    target_topic: dict | np.ndarray | TopicView,
+    tolerance: float | None,
+) -> dict:
+    """Align to the nearest target message, requiring a maximum time delta."""
+
+    if tolerance is None:
+        raise ValueError("tolerance is required for bounded alignment")
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+    reference = topic_view(reference_topic)
+    target = topic_view(target_topic)
+    indices = _nearest_alignment_indices(reference.timestamps, target.timestamps, tolerance=tolerance)
+    return _aligned_topic_result(reference, target, indices, mode="bounded_tolerance")
+
+
+def resample_topic(
+    topic_data: dict | np.ndarray | TopicView,
+    rate_hz: float | None = None,
+    period: float | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    method: str = "linear",
+    tolerance: float | None = None,
+) -> dict:
+    """Resample a topic onto a fixed-rate timestamp grid."""
+
+    view = topic_view(topic_data)
+    sample_ts = _fixed_rate_timestamps(view.timestamps, rate_hz=rate_hz, period=period, start=start, end=end)
+    normalized_method = method.lower().replace("-", "_")
+
+    if normalized_method in {"nearest", "nearest_neighbor"}:
+        indices = _nearest_alignment_indices(sample_ts, view.timestamps, tolerance=tolerance)
+        result = _aligned_topic_arrays(sample_ts, view, indices)
+        result["mode"] = "fixed_rate_nearest"
+        result["rate_hz"] = None if period is not None else rate_hz
+        result["period"] = _resolve_period(rate_hz=rate_hz, period=period)
+        return result
+
+    if normalized_method != "linear":
+        raise ValueError("method must be 'linear' or 'nearest'")
+
+    if sample_ts.size == 0:
+        data = np.empty((0,) + view.data.shape[1:], dtype=view.data.dtype)
+        valid = np.zeros(0, dtype=bool)
+    elif view.timestamps.size == 0:
+        data = np.full((sample_ts.size,) + view.data.shape[1:], np.nan, dtype=np.float64)
+        valid = np.zeros(sample_ts.size, dtype=bool)
+    else:
+        data = _interpolate_topic_data(view.timestamps, view.data, sample_ts)
+        valid = (sample_ts >= view.timestamps[0]) & (sample_ts <= view.timestamps[-1])
+
+    return {
+        "mode": "fixed_rate",
+        "ts": sample_ts,
+        "data": data,
+        "valid": valid,
+        "rate_hz": None if period is not None else rate_hz,
+        "period": _resolve_period(rate_hz=rate_hz, period=period),
+        "topic": view.metadata.topic,
+        "metadata": view.metadata,
+    }
+
+
+def rolling_window_join(
+    reference_topic: dict | np.ndarray | TopicView,
+    target_topic: dict | np.ndarray | TopicView,
+    seconds: float | None = None,
+    size: int | None = None,
+    lookback: float | None = None,
+    lookahead: float = 0.0,
+    copy: bool = True,
+) -> dict:
+    """Join each reference timestamp with a trailing target-topic window."""
+
+    if seconds is None and lookback is None and size is None:
+        raise ValueError("seconds, lookback, or size must be provided")
+    if seconds is not None and seconds < 0:
+        raise ValueError("seconds must be non-negative")
+    if lookback is not None and lookback < 0:
+        raise ValueError("lookback must be non-negative")
+    if lookahead < 0:
+        raise ValueError("lookahead must be non-negative")
+    if size is not None and size < 1:
+        raise ValueError("size must be at least 1")
+
+    reference = topic_view(reference_topic)
+    target = topic_view(target_topic)
+    window_lookback = seconds if lookback is None else lookback
+    counts = []
+    windows = []
+
+    for timestamp in reference.timestamps:
+        if window_lookback is None:
+            left = 0
+        else:
+            left = int(np.searchsorted(target.timestamps, timestamp - window_lookback, side="left"))
+        right = int(np.searchsorted(target.timestamps, timestamp + lookahead, side="right"))
+        if size is not None:
+            left = max(left, right - size)
+
+        ids = None if target.ids is None else target.ids[left:right]
+        ts = target.timestamps[left:right]
+        data = target.data[left:right]
+        window = TopicView(ids, ts, data, metadata=target.metadata, copy=copy)
+        windows.append(window)
+        counts.append(len(window))
+
+    result = {
+        "mode": "rolling_window",
+        "reference_ts": reference.timestamps.copy(),
+        "windows": windows,
+        "counts": np.asarray(counts, dtype=np.int64),
+        "valid": np.asarray(counts, dtype=np.int64) > 0,
+    }
+    if reference.ids is not None:
+        result["reference_id"] = reference.ids.copy()
+    return result
+
+
+def _exact_alignment_indices(reference_ts: np.ndarray, target_ts: np.ndarray) -> np.ndarray:
+    if target_ts.size == 0:
+        return np.full(reference_ts.shape, -1, dtype=np.int64)
+
+    positions = np.searchsorted(target_ts, reference_ts, side="left")
+    valid = (positions < target_ts.size) & (target_ts[np.minimum(positions, target_ts.size - 1)] == reference_ts)
+    return np.where(valid, positions, -1).astype(np.int64)
+
+
+def _nearest_alignment_indices(
+    reference_ts: np.ndarray,
+    target_ts: np.ndarray,
+    tolerance: float | None = None,
+) -> np.ndarray:
+    if tolerance is not None and tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+    return np.array([
         -1 if (idx := nearest_time_index(target_ts, float(timestamp), tolerance)) is None else idx
-        for timestamp in ref_ts
+        for timestamp in reference_ts
     ], dtype=np.int64)
+
+
+def _aligned_topic_result(reference: TopicView, target: TopicView, indices: np.ndarray, mode: str) -> dict:
+    result = _aligned_topic_arrays(reference.timestamps, target, indices)
+    result["mode"] = mode
+    result["reference_ts"] = reference.timestamps.copy()
+    if reference.ids is not None:
+        result["reference_id"] = reference.ids.copy()
+    return result
+
+
+def _aligned_topic_arrays(reference_ts: np.ndarray, target: TopicView, indices: np.ndarray) -> dict:
     valid = indices >= 0
     safe_indices = np.where(valid, indices, 0)
+    aligned_data = _empty_aligned_data(target.data, reference_ts.shape[0])
+    if valid.any():
+        aligned_data[valid] = target.data[indices[valid]]
+    target_ts = np.full(reference_ts.shape, np.nan, dtype=np.float64)
+    if target.timestamps.size:
+        target_ts = np.where(valid, target.timestamps[safe_indices], np.nan)
 
     aligned = {
-        "reference_ts": ref_ts.copy(),
-        "target_ts": np.where(valid, target_ts[safe_indices], np.nan),
+        "ts": reference_ts.copy(),
+        "target_ts": target_ts,
         "target_index": indices,
         "valid": valid,
+        "data": aligned_data,
+        "metadata": target.metadata,
     }
-    aligned_data = np.full((ref_ts.size,) + target_data.shape[1:], np.nan, dtype=np.float64)
-    if valid.any():
-        aligned_data[valid] = target_data[indices[valid]]
-    aligned["data"] = aligned_data
-    if target_ids is not None:
-        aligned["id"] = np.asarray([target_ids[i] if ok else None for i, ok in zip(safe_indices, valid)], dtype=object)
+    if target.metadata.topic is not None:
+        aligned["topic"] = target.metadata.topic
+    if target.ids is not None:
+        aligned["id"] = np.asarray([target.ids[i] if ok else None for i, ok in zip(safe_indices, valid)], dtype=object)
+        aligned["name"] = aligned["id"]
     return aligned
+
+
+def _empty_aligned_data(data: np.ndarray, count: int) -> np.ndarray:
+    shape = (count,) + data.shape[1:]
+    if np.issubdtype(data.dtype, np.number):
+        return np.full(shape, np.nan, dtype=np.result_type(data.dtype, np.float64))
+
+    aligned = np.empty(shape, dtype=object)
+    aligned[...] = None
+    return aligned
+
+
+def _resolve_period(rate_hz: float | None = None, period: float | None = None) -> float:
+    if period is not None:
+        period = float(period)
+        if period <= 0:
+            raise ValueError("period must be positive")
+        return period
+    if rate_hz is None:
+        raise ValueError("rate_hz or period must be provided")
+    rate_hz = float(rate_hz)
+    if rate_hz <= 0:
+        raise ValueError("rate_hz must be positive")
+    return 1.0 / rate_hz
+
+
+def _fixed_rate_timestamps(
+    source_ts: np.ndarray,
+    rate_hz: float | None = None,
+    period: float | None = None,
+    start: float | None = None,
+    end: float | None = None,
+) -> np.ndarray:
+    sample_period = _resolve_period(rate_hz=rate_hz, period=period)
+    if source_ts.size == 0 and (start is None or end is None):
+        return np.array([], dtype=np.float64)
+
+    sample_start = float(source_ts[0] if start is None else start)
+    sample_end = float(source_ts[-1] if end is None else end)
+    if sample_start > sample_end:
+        raise ValueError("start must be less than or equal to end")
+
+    count = int(np.floor((sample_end - sample_start) / sample_period + 1.0e-12)) + 1
+    return sample_start + np.arange(count, dtype=np.float64) * sample_period
+
+
+def _interpolate_topic_data(timestamps: np.ndarray, data: np.ndarray, target_timestamps: np.ndarray) -> np.ndarray:
+    if target_timestamps.size == 0:
+        return np.empty((0,) + data.shape[1:], dtype=np.result_type(data.dtype, np.float64))
+    if timestamps.size == 0:
+        return np.full((target_timestamps.size,) + data.shape[1:], np.nan, dtype=np.float64)
+    if not np.issubdtype(data.dtype, np.number):
+        raise TypeError("linear fixed-rate resampling requires numeric topic data")
+
+    flat = np.asarray(data, dtype=np.float64).reshape((data.shape[0], -1))
+    interpolated = np.column_stack([
+        np.interp(target_timestamps, timestamps, flat[:, dim])
+        for dim in range(flat.shape[1])
+    ])
+    return interpolated.reshape((target_timestamps.size,) + data.shape[1:])

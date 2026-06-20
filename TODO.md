@@ -16,9 +16,9 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add timestamp range and message index range selection helpers.
   - [x] Add nearest-time lookup and bounded nearest alignment helpers.
   - [x] Add generic numeric time-series interpolation helpers.
-  - [ ] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
+  - [x] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
   - [x] Add persistent secondary indexes for TileDB-backed timestamp and message-name queries.
-  - [ ] Add persistent secondary indexes for frame id and spatial bounds queries.
+  - [x] Add persistent secondary indexes for frame id and spatial bounds queries.
 - [ ] Add geometry and coordinate-frame operations:
   - [ ] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
   - [x] Add SE(3) transform helpers for XYZ point arrays.

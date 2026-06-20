@@ -7,6 +7,7 @@ import numpy as np
 import tiledb
 
 _logger = logging.getLogger(__name__)
+SPATIAL_INDEX_DIMS = 3
 
 
 def _encode_name(name) -> bytes:
@@ -27,6 +28,36 @@ def _decode_frame_id(value) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _encode_frame_id(value) -> bytes:
+    decoded = _decode_frame_id(value)
+    if decoded is None:
+        return b""
+    return decoded.encode()[:256]
+
+
+def _spatial_bounds_for_data(data) -> tuple[bool, np.ndarray, np.ndarray]:
+    mins = np.full(SPATIAL_INDEX_DIMS, np.nan, dtype=np.float64)
+    maxs = np.full(SPATIAL_INDEX_DIMS, np.nan, dtype=np.float64)
+    values = np.asarray(data)
+    if values.size == 0 or values.ndim == 0 or values.ndim > 2 or values.shape[-1] < 1:
+        return False, mins, maxs
+
+    dims = min(int(values.shape[-1]), SPATIAL_INDEX_DIMS)
+    try:
+        coords = values.astype(np.float64, copy=False).reshape((-1, int(values.shape[-1])))[:, :dims]
+    except (TypeError, ValueError):
+        return False, mins, maxs
+
+    finite = np.isfinite(coords).all(axis=1)
+    if not finite.any():
+        return False, mins, maxs
+
+    valid_coords = coords[finite]
+    mins[:dims] = np.min(valid_coords, axis=0)
+    maxs[:dims] = np.max(valid_coords, axis=0)
+    return True, mins, maxs
 
 
 def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:
@@ -245,6 +276,16 @@ class TileDBBuffer:
             attrs=[
                 tiledb.Attr(name="timestamp", dtype=np.float64),
                 tiledb.Attr(name="name", dtype="S256"),
+                tiledb.Attr(name="frame_id", dtype="S256"),
+                tiledb.Attr(name="spatial_valid", dtype=np.uint8),
+                *[
+                    tiledb.Attr(name=f"spatial_min_{dim}", dtype=np.float64)
+                    for dim in range(SPATIAL_INDEX_DIMS)
+                ],
+                *[
+                    tiledb.Attr(name=f"spatial_max_{dim}", dtype=np.float64)
+                    for dim in range(SPATIAL_INDEX_DIMS)
+                ],
             ],
         )
         os.makedirs(timestamp_uri, exist_ok=True)
@@ -307,11 +348,29 @@ class TileDBBuffer:
 
         key = (counter,) + tuple(slice(None) for _ in msg['data'].shape)
         tiledb_array[key] = msg['data']
-        timestamp_array[counter] = {
-            "timestamp": np.array(msg['timestamp'], dtype=np.float64),
-            "name": np.array(_encode_name(msg.get("name", topic)), dtype="S256"),
-        }
+        timestamp_array[counter] = self._timestamp_index_values(timestamp_array, msg)
         self.counters[topic] = counter + 1
+
+    def _timestamp_index_values(self, timestamp_array, msg: dict) -> dict:
+        values = {
+            "timestamp": np.array(msg['timestamp'], dtype=np.float64),
+            "name": np.array(_encode_name(msg.get("name", msg["topic"])), dtype="S256"),
+        }
+        attr_names = set(timestamp_array.schema.attr_names)
+        if "frame_id" in attr_names:
+            values["frame_id"] = np.array(_encode_frame_id(msg.get("frame_id")), dtype="S256")
+
+        valid, mins, maxs = _spatial_bounds_for_data(msg["data"])
+        if "spatial_valid" in attr_names:
+            values["spatial_valid"] = np.array(1 if valid else 0, dtype=np.uint8)
+        for dim in range(SPATIAL_INDEX_DIMS):
+            min_attr = f"spatial_min_{dim}"
+            max_attr = f"spatial_max_{dim}"
+            if min_attr in attr_names:
+                values[min_attr] = np.array(mins[dim], dtype=np.float64)
+            if max_attr in attr_names:
+                values[max_attr] = np.array(maxs[dim], dtype=np.float64)
+        return values
 
     def _record_frame_id(self, msg: dict) -> None:
         if "frame_id" not in msg or msg["frame_id"] is None:
@@ -437,7 +496,7 @@ class TileDBBuffer:
             yield indices
             current = int(indices[-1]) + step
 
-    def _iter_selected_indices(self, index_array, count: int, chunk_size: int, operations):
+    def _iter_selected_indices(self, axis: str, index_array, count: int, chunk_size: int, operations):
         operations = tuple(operations or ())
 
         scan_start = 0
@@ -474,11 +533,59 @@ class TileDBBuffer:
                         counters[operation_index] += 1
                         keep[i] = _slice_contains(current, *operation.args)
                     selected = selected[keep]
+                elif operation.kind == "frame_id":
+                    selected = self._filter_frame_indices(axis, index_array, selected, operation.args[0])
+                elif operation.kind == "spatial_bounds":
+                    min_bound, max_bound = operation.args
+                    selected = self._filter_spatial_indices(
+                        index_array,
+                        selected,
+                        min_bound=min_bound,
+                        max_bound=max_bound,
+                        columns=operation.kwargs["columns"],
+                    )
                 else:
                     raise ValueError(f"unsupported pushdown operation: {operation.kind}")
 
             if selected.size:
                 yield selected
+
+    def _filter_frame_indices(self, axis: str, index_array, indices: np.ndarray, targets) -> np.ndarray:
+        if "frame_id" not in index_array.schema.attr_names:
+            frame_id = _decode_frame_id(self.frame_ids.get(axis))
+            if frame_id is None:
+                return indices
+            return indices if frame_id in targets else indices[:0]
+
+        frame_ids = self._read_index_attr(index_array, "frame_id", indices)
+        decoded = np.asarray([_decode_frame_id(value) for value in frame_ids], dtype=object)
+        return indices[np.isin(decoded, list(targets))]
+
+    def _filter_spatial_indices(
+        self,
+        index_array,
+        indices: np.ndarray,
+        min_bound: np.ndarray,
+        max_bound: np.ndarray,
+        columns: tuple[int, ...],
+    ) -> np.ndarray:
+        attr_names = set(index_array.schema.attr_names)
+        required_attrs = {"spatial_valid"}
+        for column in columns:
+            if column >= SPATIAL_INDEX_DIMS:
+                return indices
+            required_attrs.add(f"spatial_min_{column}")
+            required_attrs.add(f"spatial_max_{column}")
+        if not required_attrs.issubset(attr_names):
+            return indices
+
+        keep = self._read_index_attr(index_array, "spatial_valid", indices).astype(bool)
+        for bound_index, column in enumerate(columns):
+            spatial_min = self._read_index_attr(index_array, f"spatial_min_{column}", indices)
+            spatial_max = self._read_index_attr(index_array, f"spatial_max_{column}", indices)
+            keep &= spatial_min <= max_bound[bound_index]
+            keep &= spatial_max >= min_bound[bound_index]
+        return indices[keep]
 
     def _read_topic_indices(self, axis: str, data_array, index_array, indices: np.ndarray, copy: bool = False) -> dict:
         uri = self._get_array_uri(axis)
@@ -514,7 +621,7 @@ class TileDBBuffer:
         uri = self._get_array_uri(axis)
         timestamp_uri = self._get_timestamp_array_uri(axis)
         with tiledb.DenseArray(uri) as data_array, tiledb.DenseArray(timestamp_uri) as index_array:
-            for indices in self._iter_selected_indices(index_array, count, chunk_size, operations):
+            for indices in self._iter_selected_indices(axis, index_array, count, chunk_size, operations):
                 yield self._read_topic_indices(axis, data_array, index_array, indices, copy=copy)
 
     def get_index_range(

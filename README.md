@@ -211,6 +211,16 @@ point_chunks = (
 )
 ```
 
+Topic alignment helpers cover exact timestamp joins, nearest-neighbor joins, bounded-tolerance joins, fixed-rate resampling, and rolling window joins.
+
+```python
+from ade.ops import align_topic, resample_topic, rolling_window_join
+
+imu_at_image_times = align_topic(images, imu, mode="bounded", tolerance=0.02)
+gps_10hz = resample_topic(gps, rate_hz=10.0)
+recent_points = rolling_window_join(images, points, seconds=0.25)
+```
+
 `TopicView` is still available when the data is already in memory and you want eager, metadata-aware operations. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
 
 ```python
@@ -253,7 +263,7 @@ with DataBuffer(
 
 Using `DataBuffer` as a context manager closes TileDB arrays cleanly and marks completed topic arrays as closed.
 
-TileDB-backed topics keep timestamps and message names in sidecar arrays. Time and index constraints from `buffer.topic(axis).time_range(...)` and `.index_range(...)` are pushed down before data chunks are read, so lazy pipelines avoid loading unselected message payloads.
+TileDB-backed topics keep timestamps, message names, frame ids, and per-message spatial bounds in sidecar arrays. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads.
 
 Existing TileDB groups can be reopened without the original source:
 

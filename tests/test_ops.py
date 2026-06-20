@@ -2,7 +2,10 @@ import numpy as np
 
 from ade.buffer import DataBuffer
 from ade.ops import (
+    align_bounded,
+    align_exact,
     align_nearest,
+    align_topic,
     apply_transform,
     cluster_dbscan,
     crop_bounds,
@@ -25,6 +28,8 @@ from ade.ops import (
     pad_image,
     radius_outlier_filter,
     reduce_topic,
+    resample_topic,
+    rolling_window_join,
     resize_nearest,
     rgb_to_gray,
     sample_grid,
@@ -86,6 +91,51 @@ def test_topic_operations_select_map_filter_reduce_window_and_align():
     aligned = align_nearest(topic, target, tolerance=0.2)
     assert aligned["target_index"].tolist() == [0, -1, -1, 1]
     assert aligned["valid"].tolist() == [True, False, False, True]
+
+
+def test_topic_alignment_modes():
+    reference = {
+        "id": np.array(["r0", "r1", "r2", "r3"], dtype=object),
+        "ts": np.array([0.0, 0.5, 1.0, 1.5]),
+        "data": np.array([[0.0], [1.0], [2.0], [3.0]]),
+    }
+    target = {
+        "id": np.array(["t0", "t1", "t2"], dtype=object),
+        "ts": np.array([0.0, 0.9, 1.5]),
+        "data": np.array([[10.0], [20.0], [30.0]]),
+        "topic": "/target",
+    }
+
+    exact = align_exact(reference, target)
+    assert exact["mode"] == "exact"
+    assert exact["target_index"].tolist() == [0, -1, -1, 2]
+    assert exact["id"].tolist() == ["t0", None, None, "t2"]
+    assert np.allclose(exact["data"][[0, 3]], np.array([[10.0], [30.0]]))
+    assert np.isnan(exact["data"][1]).all()
+
+    nearest = align_topic(reference, target, mode="nearest")
+    assert nearest["target_index"].tolist() == [0, 1, 1, 2]
+
+    bounded = align_bounded(reference, target, tolerance=0.15)
+    assert bounded["mode"] == "bounded_tolerance"
+    assert bounded["target_index"].tolist() == [0, -1, 1, 2]
+
+    linear = resample_topic(reference, period=0.75)
+    assert linear["mode"] == "fixed_rate"
+    assert np.allclose(linear["ts"], np.array([0.0, 0.75, 1.5]))
+    assert np.allclose(linear["data"], np.array([[0.0], [1.5], [3.0]]))
+
+    nearest_resampled = align_topic(None, target, mode="fixed_rate", period=0.5, interpolation="nearest", tolerance=0.11)
+    assert nearest_resampled["mode"] == "fixed_rate_nearest"
+    assert nearest_resampled["target_index"].tolist() == [0, -1, 1, 2]
+
+    joined = rolling_window_join(reference, target, seconds=0.6)
+    assert joined["mode"] == "rolling_window"
+    assert joined["counts"].tolist() == [1, 1, 1, 2]
+    assert [window.ids.tolist() for window in joined["windows"]] == [["t0"], ["t0"], ["t1"], ["t1", "t2"]]
+
+    joined_by_dispatch = align_topic(reference, target, mode="rolling_window", seconds=0.05)
+    assert joined_by_dispatch["counts"].tolist() == [1, 0, 0, 1]
 
 
 def test_topic_view_preserves_metadata_and_supports_chunked_operations():
