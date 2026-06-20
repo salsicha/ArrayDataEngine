@@ -129,6 +129,10 @@ def test_numpy_buffer_time_ranges():
     assert np.allclose(last_window["ts"], np.array([100.3, 100.4]))
     assert np.allclose(last_window["data"], np.array([[3.0, 6.0], [4.0, 8.0]]))
 
+    index_range = buf.get_index_range("sensor_topic", 1, 5, 2)
+    assert np.allclose(index_range["ts"], np.array([100.1, 100.3]))
+    assert np.allclose(index_range["data"], np.array([[1.0, 2.0], [3.0, 6.0]]))
+
 
 def test_tiledb_buffer():
     temp_dir = tempfile.mkdtemp()
@@ -193,6 +197,12 @@ def test_tiledb_buffer_time_ranges():
         time_range = buf.get_time_range("sensor_topic", 100.05, 100.25)
         assert np.allclose(time_range["ts"], np.array([100.1, 100.2]))
         assert np.allclose(time_range["data"], np.array([[1.0, 2.0], [2.0, 4.0]]))
+        assert time_range["name"].tolist() == [b"sensor_frame", b"sensor_frame"]
+
+        index_range = buf.get_index_range("sensor_topic", 1, 5, 2)
+        assert np.allclose(index_range["ts"], np.array([100.1, 100.3]))
+        assert np.allclose(index_range["data"], np.array([[1.0, 2.0], [3.0, 6.0]]))
+        assert index_range["name"].tolist() == [b"sensor_frame", b"sensor_frame"]
 
         last_window = buf.get_last_seconds("sensor_topic", 0.15)
         assert np.allclose(last_window["ts"], np.array([100.3, 100.4]))
@@ -224,6 +234,8 @@ def test_tiledb_buffer_context_manager_and_timestamp_sidecar():
 
             data_dict = buf.get_buffer()
             assert np.allclose(data_dict["sensor_topic"]["ts"], np.array([100.0, 100.1, 100.2, 100.3, 100.4]))
+            assert data_dict["sensor_topic"]["name"].tolist() == [b"sensor_frame"] * 5
+            assert buf.buffer_impl.timestamps == {}
 
         array_uri = group_uri + "sensor_topic"
         timestamp_uri = group_uri + "sensor_topic__timestamps"
@@ -235,11 +247,48 @@ def test_tiledb_buffer_context_manager_and_timestamp_sidecar():
 
         with tiledb.open(timestamp_uri, "r") as array:
             assert bool(array.meta["closed"]) is True
+            assert "name" in array.schema.attr_names
             assert np.allclose(array[0:5]["timestamp"], np.array([100.0, 100.1, 100.2, 100.3, 100.4]))
+            assert array[0:5]["name"].tolist() == [b"sensor_frame"] * 5
 
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
+
+def test_tiledb_buffer_lazy_pipeline_pushes_time_and_index_ranges_to_backend(tmp_path):
+    group_uri = str(tmp_path / "tiledb_pushdown_group") + "/"
+
+    with DataBuffer(
+        data_source=MockDataSource(),
+        buffer_depth=5,
+        data_uri=group_uri,
+        topics=["sensor_topic"],
+        axis="sensor_topic",
+        use_db=True
+    ) as buf:
+        for _ in range(4):
+            buf.roll_buffer("sensor_topic")
+
+        read_indices = []
+        original_read_data_attr = buf.buffer_impl._read_data_attr
+
+        def recording_read_data_attr(tiledb_array, indices):
+            read_indices.extend(indices.tolist())
+            return original_read_data_attr(tiledb_array, indices)
+
+        buf.buffer_impl._read_data_attr = recording_read_data_attr
+
+        time_filtered = buf.topic("sensor_topic").time_range(100.1, 100.2).map(lambda data: data + 1.0).collect(chunk_size=1)
+        assert np.allclose(time_filtered["ts"], np.array([100.1, 100.2]))
+        assert np.allclose(time_filtered["data"], np.array([[2.0, 3.0], [3.0, 5.0]]))
+        assert read_indices == [1, 2]
+
+        read_indices.clear()
+        index_filtered = buf.topic("sensor_topic").index_range(1, 5, 2).collect(chunk_size=1)
+        assert np.allclose(index_filtered["ts"], np.array([100.1, 100.3]))
+        assert np.allclose(index_filtered["data"], np.array([[1.0, 2.0], [3.0, 6.0]]))
+        assert read_indices == [1, 3]
 
 
 def test_tiledb_buffer_synthetic_multitopic_persistence(tmp_path):

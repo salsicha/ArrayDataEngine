@@ -133,6 +133,7 @@ Slice buffered data by timestamp:
 
 ```python
 time_range = buffer.get_time_range(axis, start=12.0, end=12.5)
+index_range = buffer.get_index_range(axis, start=100, stop=200, step=2)
 recent = buffer.get_last_seconds(axis, seconds=0.5)
 
 images = time_range["data"]
@@ -156,32 +157,38 @@ points = window["/points"]["data"][-1]
 reduced_points = voxel_downsample(points, voxel_size=0.25)
 ```
 
-For metadata-aware workflows, convert a topic to a `TopicView`. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
+For large datasets, use the lazy topic pipeline. It records operations and only executes them when chunks, rows, reductions, windows, or explicit collection are requested.
 
 ```python
 import numpy as np
+
+pipeline = (
+    buffer.topic("images")
+    .time_range(12.0, 20.0)
+    .index_range(0, 1_000)
+    .map(lambda frame: frame.astype(np.float32) / 255.0)
+    .filter(lambda frame, ts, name: frame.mean() > 0.05)
+)
+
+for chunk in pipeline.iter_chunks(chunk_size=32):
+    process(chunk.data, chunk.timestamps)
+
+summary = pipeline.reduce(lambda acc, frame: acc + frame.mean(), initial=0.0)
+small_result = pipeline.collect(chunk_size=32)
+```
+
+`TopicView` is still available when the data is already in memory and you want eager, metadata-aware operations. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
+
+```python
 from ade.ops import topic_view
 
 view = topic_view(window["images"], topic="images")
-
-out = np.empty(view.data.shape, dtype=np.float32)
-normalized = view.map(
-    lambda frame: frame.astype(np.float32) / 255.0,
-    out=out,
-    chunk_size=16,
-).as_dict()
-
-for chunk in view.iter_chunks(chunk_size=32):
-    print(chunk.metadata.start_time, chunk.metadata.end_time, chunk.data.shape)
+normalized = view.map(lambda frame: frame.astype(np.float32) / 255.0).as_dict()
 ```
 
-`DataBuffer` exposes the same interface and convenience wrappers for buffered topics:
+`DataBuffer` also keeps eager convenience wrappers for smaller results and compatibility:
 
 ```python
-images = buffer.topic_view("images")
-for chunk in buffer.iter_topic_chunks("images", chunk_size=32):
-    process(chunk.data, chunk.timestamps)
-
 normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 255.0)
 normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 255.0, chunk_size=16)
 recent_windows = list(buffer.window_topic("images", size=5))
@@ -211,6 +218,8 @@ with DataBuffer(
 ```
 
 Using `DataBuffer` as a context manager closes TileDB arrays cleanly and marks completed topic arrays as closed.
+
+TileDB-backed topics keep timestamps and message names in sidecar arrays. Time and index constraints from `buffer.topic(axis).time_range(...)` and `.index_range(...)` are pushed down before data chunks are read, so lazy pipelines avoid loading unselected message payloads.
 
 ## DEM Tiles
 

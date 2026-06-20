@@ -32,7 +32,9 @@ from ade.ops import (
     slerp,
     slope_aspect,
     statistical_outlier_filter,
+    TopicPipeline,
     TopicView,
+    topic_pipeline,
     topic_view,
     trajectory_speed,
     valid_depth_mask,
@@ -121,6 +123,39 @@ def test_topic_view_preserves_metadata_and_supports_chunked_operations():
     assert np.allclose(reduced, np.array([9.0, 9.0]))
 
 
+def test_topic_pipeline_executes_lazily_and_collects_explicitly():
+    calls = []
+    pipeline = (
+        topic_pipeline(_topic(), topic="/points")
+        .time_range(0.5, 1.5)
+        .map(lambda data, ts, name: calls.append((name, ts)) or data + ts)
+        .filter(lambda data: data[0] >= 3.0)
+    )
+
+    assert isinstance(pipeline, TopicPipeline)
+    assert calls == []
+
+    chunks = list(pipeline.iter_chunks(chunk_size=1))
+    assert [chunk.ids.tolist() for chunk in chunks] == [["c"], ["d"]]
+    assert np.allclose(chunks[0].data, np.array([[3.0, 3.0]]))
+    assert calls == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
+
+    calls.clear()
+    collected = pipeline.collect(chunk_size=2)
+    assert collected["id"].tolist() == ["c", "d"]
+    assert np.allclose(collected["data"], np.array([[3.0, 3.0], [4.5, 4.5]]))
+    assert calls == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
+
+    rows = list(topic_pipeline(_topic()).index_range(1, 4, 2).iter_rows(chunk_size=2))
+    assert [row["id"] for row in rows] == ["b", "d"]
+
+    reduced = pipeline.reduce(lambda acc, data: acc + data, initial=np.zeros(2), chunk_size=1)
+    assert np.allclose(reduced, np.array([7.5, 7.5]))
+
+    windows = topic_pipeline(_topic()).time_range(0.0, 1.0).window(size=2).collect(chunk_size=1)
+    assert [window.ids.tolist() for window in windows] == [["a"], ["a", "b"], ["b", "c"]]
+
+
 class _SmallSource:
     def get_topics(self):
         return ["axis"]
@@ -172,6 +207,25 @@ def test_data_buffer_operation_wrappers():
 
     windows = list(buffer.window_topic("axis", size=2))
     assert [window["ts"].tolist() for window in windows] == [[0.0], [0.0, 1.0], [1.0, 2.0]]
+
+
+def test_data_buffer_topic_pipeline_streams_without_get_buffer():
+    buffer = DataBuffer(_SmallSource(), buffer_depth=3, axis="axis", preload=True)
+
+    def fail_get_buffer(*args, **kwargs):
+        raise AssertionError("lazy topic pipeline should not call get_buffer")
+
+    buffer.get_buffer = fail_get_buffer
+    calls = []
+    pipeline = buffer.topic("axis").time_range(1.0, 2.0).map(
+        lambda data, ts: calls.append(ts) or data + 1.0
+    )
+
+    assert calls == []
+    collected = pipeline.collect(chunk_size=1)
+    assert calls == [1.0, 2.0]
+    assert np.allclose(collected["ts"], np.array([1.0, 2.0]))
+    assert np.allclose(collected["data"], np.array([[2.0], [3.0]]))
 
 
 def test_geometry_and_point_cloud_operations():

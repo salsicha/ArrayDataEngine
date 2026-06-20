@@ -17,7 +17,8 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add nearest-time lookup and bounded nearest alignment helpers.
   - [x] Add generic numeric time-series interpolation helpers.
   - [ ] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
-  - [ ] Add persistent secondary indexes for TileDB-backed timestamp, frame id, and spatial bounds queries.
+  - [x] Add persistent secondary indexes for TileDB-backed timestamp and message-name queries.
+  - [ ] Add persistent secondary indexes for frame id and spatial bounds queries.
 - [ ] Add geometry and coordinate-frame operations:
   - [ ] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
   - [x] Add SE(3) transform helpers for XYZ point arrays.
@@ -65,6 +66,8 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [ ] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
 - [ ] Add large-array execution features:
   - [x] Add chunked operation execution for buffered topic arrays that do not fit in memory.
+  - [x] Add lazy buffered-topic pipelines with explicit `collect()`, `iter_chunks()`, `iter_rows()`, `reduce()`, and sliding-window execution.
+  - [x] Push lazy buffered-topic time and index constraints into TileDB before reading data chunks.
   - [ ] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
   - [ ] Add optional parallel execution for independent chunks/topics.
   - [ ] Add progress reporting, cancellation, and resumable operation checkpoints.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -261,6 +262,298 @@ class TopicView:
                 yield index, self.timestamps[index], self.data[index], None if self.ids is None else self.ids[index]
 
 
+@dataclass(frozen=True)
+class _PipelineOperation:
+    kind: str
+    args: tuple
+    kwargs: dict
+
+
+class TopicPipeline:
+    """Lazy operation pipeline for buffered topic arrays."""
+
+    def __init__(
+        self,
+        chunk_source: Callable[..., Iterable[TopicView]],
+        operations: Iterable[_PipelineOperation] = (),
+        metadata: TopicMetadata | dict | None = None,
+        topic: str | None = None,
+        source_uri: str | None = None,
+        frame_id: str | None = None,
+    ):
+        self._chunk_source = chunk_source
+        self._operations = tuple(operations)
+        self.metadata = _coerce_metadata(metadata) or TopicMetadata(
+            topic=topic,
+            source_uri=source_uri,
+            frame_id=frame_id,
+        )
+
+    def map(self, fn: Callable, copy: bool = True) -> "TopicPipeline":
+        return self._with_operation("map", fn, copy=copy)
+
+    def filter(self, predicate: Callable, copy: bool = True) -> "TopicPipeline":
+        return self._with_operation("filter", predicate, copy=copy)
+
+    def time_range(self, start: float, end: float, inclusive: bool = True) -> "TopicPipeline":
+        if start > end:
+            raise ValueError("start must be less than or equal to end")
+        return self._with_operation("time_range", float(start), float(end), inclusive=inclusive)
+
+    def select_time_range(self, start: float, end: float, inclusive: bool = True) -> "TopicPipeline":
+        return self.time_range(start, end, inclusive=inclusive)
+
+    def index_range(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "TopicPipeline":
+        if start is not None and start < 0:
+            raise ValueError("negative lazy index ranges require collect() first")
+        if stop is not None and stop < 0:
+            raise ValueError("negative lazy index ranges require collect() first")
+        if step is not None and step < 1:
+            raise ValueError("step must be at least 1")
+        return self._with_operation("index_range", start, stop, step)
+
+    def select_indices(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "TopicPipeline":
+        return self.index_range(start, stop, step)
+
+    def iter_rows(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[dict]:
+        for message_id, timestamp, value in self._iter_processed_rows(chunk_size=chunk_size, copy=copy):
+            yield {
+                "id": message_id,
+                "name": message_id,
+                "ts": timestamp,
+                "data": value,
+            }
+
+    def iter_chunks(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[TopicView]:
+        chunk_size = _validated_chunk_size(chunk_size)
+        ids: list[Any] = []
+        timestamps: list[float] = []
+        values: list[np.ndarray] = []
+
+        for message_id, timestamp, value in self._iter_processed_rows(chunk_size=chunk_size, copy=copy):
+            ids.append(message_id)
+            timestamps.append(timestamp)
+            values.append(value.copy() if copy else value)
+            if len(values) == chunk_size:
+                yield self._make_chunk(ids, timestamps, values, copy=copy)
+                ids, timestamps, values = [], [], []
+
+        if values:
+            yield self._make_chunk(ids, timestamps, values, copy=copy)
+
+    def reduce(
+        self,
+        fn: Callable,
+        initial: Any | None = None,
+        chunk_size: int = 1024,
+        copy: bool = True,
+    ) -> Any:
+        iterator = self._iter_processed_rows(chunk_size=chunk_size, copy=copy)
+        if initial is None:
+            try:
+                _, _, value = next(iterator)
+            except StopIteration as exc:
+                raise ValueError("cannot reduce an empty topic without an initial value") from exc
+            acc = value.copy() if copy else value
+        else:
+            acc = initial
+
+        for message_id, timestamp, value in iterator:
+            try:
+                acc = fn(acc, value.copy() if copy else value, float(timestamp), message_id)
+            except TypeError:
+                acc = fn(acc, value.copy() if copy else value)
+        return acc
+
+    def collect(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = True,
+        out: np.ndarray | None = None,
+    ) -> dict:
+        chunk_size = _validated_chunk_size(chunk_size)
+        ids_parts = []
+        ts_parts = []
+        data_parts = []
+        output = None if out is None else np.asarray(out)
+        offset = 0
+
+        for chunk in self.iter_chunks(chunk_size=chunk_size, copy=copy):
+            if chunk.ids is not None:
+                ids_parts.append(chunk.ids.copy() if copy else chunk.ids)
+            ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
+            if output is None:
+                data_parts.append(chunk.data.copy() if copy else chunk.data)
+            else:
+                next_offset = offset + len(chunk)
+                if next_offset > output.shape[0]:
+                    raise ValueError("out is too small for collected pipeline output")
+                output[offset:next_offset] = chunk.data
+                offset = next_offset
+
+        ids = np.concatenate(ids_parts) if ids_parts else None
+        timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
+        if output is None:
+            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
+        else:
+            data = output if offset == output.shape[0] else output[:offset]
+        return TopicView(ids, timestamps, data, metadata=self.metadata).as_dict(copy=False)
+
+    def window(
+        self,
+        size: int | None = None,
+        seconds: float | None = None,
+        copy: bool = True,
+    ) -> "TopicWindowPipeline":
+        return TopicWindowPipeline(self, size=size, seconds=seconds, copy=copy)
+
+    def _with_operation(self, kind: str, *args, **kwargs) -> "TopicPipeline":
+        return TopicPipeline(
+            self._chunk_source,
+            operations=(*self._operations, _PipelineOperation(kind, args, kwargs)),
+            metadata=self.metadata,
+        )
+
+    def _source_chunks(self, chunk_size: int, copy: bool) -> Iterable[TopicView]:
+        pushdown_operations, _ = self._split_pushdown_operations()
+        yield from self._chunk_source(chunk_size, copy, pushdown_operations)
+
+    def _iter_processed_rows(self, chunk_size: int, copy: bool):
+        chunk_size = _validated_chunk_size(chunk_size)
+        _, operations = self._split_pushdown_operations()
+        index_counters = [0] * len(operations)
+
+        for chunk in self._source_chunks(chunk_size=chunk_size, copy=copy):
+            for _, timestamp, value, message_id in chunk._iter_rows():
+                current_value = value.copy() if copy else value
+                current_timestamp = float(timestamp)
+                current_id = message_id
+                keep = True
+
+                for op_index, operation in enumerate(operations):
+                    if operation.kind == "map":
+                        fn = operation.args[0]
+                        op_copy = operation.kwargs.get("copy", True)
+                        current_value = _call_with_metadata(
+                            fn,
+                            current_value.copy() if op_copy else current_value,
+                            current_timestamp,
+                            current_id,
+                        )
+                    elif operation.kind == "filter":
+                        predicate = operation.args[0]
+                        op_copy = operation.kwargs.get("copy", True)
+                        keep = bool(
+                            _call_with_metadata(
+                                predicate,
+                                current_value.copy() if op_copy else current_value,
+                                current_timestamp,
+                                current_id,
+                            )
+                        )
+                    elif operation.kind == "time_range":
+                        start, end = operation.args
+                        if operation.kwargs.get("inclusive", True):
+                            keep = current_timestamp >= start and current_timestamp <= end
+                        else:
+                            keep = current_timestamp > start and current_timestamp < end
+                    elif operation.kind == "index_range":
+                        current_index = index_counters[op_index]
+                        index_counters[op_index] += 1
+                        keep = _slice_contains(current_index, *operation.args)
+                    else:
+                        raise ValueError(f"unsupported pipeline operation: {operation.kind}")
+
+                    if not keep:
+                        break
+
+                if keep:
+                    yield current_id, current_timestamp, current_value
+
+    def _split_pushdown_operations(self) -> tuple[tuple[_PipelineOperation, ...], tuple[_PipelineOperation, ...]]:
+        pushdown_operations = []
+        for operation in self._operations:
+            if operation.kind not in {"time_range", "index_range"}:
+                break
+            pushdown_operations.append(operation)
+
+        pushed = tuple(pushdown_operations)
+        return pushed, self._operations[len(pushed):]
+
+    def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool) -> TopicView:
+        ids_array = np.asarray(ids, dtype=object)
+        ts_array = np.asarray(timestamps, dtype=np.float64)
+        data_array = np.asarray(values)
+        return TopicView(ids_array, ts_array, data_array, metadata=self.metadata, copy=copy)
+
+
+class TopicWindowPipeline:
+    """Lazy sliding-window view over a topic pipeline."""
+
+    def __init__(
+        self,
+        pipeline: TopicPipeline,
+        size: int | None = None,
+        seconds: float | None = None,
+        copy: bool = True,
+    ):
+        if size is None and seconds is None:
+            raise ValueError("size or seconds must be provided")
+        if size is not None and size < 1:
+            raise ValueError("size must be at least 1")
+        if seconds is not None and seconds < 0:
+            raise ValueError("seconds must be non-negative")
+
+        self.pipeline = pipeline
+        self.size = size
+        self.seconds = seconds
+        self.copy = copy
+
+    def iter_windows(self, chunk_size: int = 1024) -> Iterable[TopicView]:
+        ids = deque()
+        timestamps = deque()
+        values = deque()
+
+        for message_id, timestamp, value in self.pipeline._iter_processed_rows(chunk_size=chunk_size, copy=self.copy):
+            ids.append(message_id)
+            timestamps.append(timestamp)
+            values.append(value.copy() if self.copy else value)
+
+            if self.seconds is not None:
+                cutoff = timestamp - self.seconds
+                while timestamps and timestamps[0] < cutoff:
+                    ids.popleft()
+                    timestamps.popleft()
+                    values.popleft()
+
+            if self.size is not None:
+                while len(values) > self.size:
+                    ids.popleft()
+                    timestamps.popleft()
+                    values.popleft()
+
+            yield TopicView(
+                np.asarray(ids, dtype=object),
+                np.asarray(timestamps, dtype=np.float64),
+                np.asarray(values),
+                metadata=self.pipeline.metadata,
+                copy=self.copy,
+            )
+
+    def collect(self, chunk_size: int = 1024) -> list[TopicView]:
+        return list(self.iter_windows(chunk_size=chunk_size))
+
+
 def topic_view(
     topic_data: dict | np.ndarray | TopicView,
     topic: str | None = None,
@@ -303,6 +596,49 @@ def topic_view(
         frame_id=frame_id,
         copy=copy,
     )
+
+
+def topic_pipeline(
+    topic_data: dict | np.ndarray | TopicView,
+    topic: str | None = None,
+    source_uri: str | None = None,
+    frame_id: str | None = None,
+    metadata: TopicMetadata | dict | None = None,
+) -> TopicPipeline:
+    """Return a lazy operation pipeline over topic data."""
+
+    view = topic_view(
+        topic_data,
+        topic=topic,
+        source_uri=source_uri,
+        frame_id=frame_id,
+        metadata=metadata,
+        copy=False,
+    )
+
+    def source(chunk_size: int, copy: bool, operations=()):
+        selected = _apply_pushdown_to_view(view, operations)
+        yield from selected.iter_chunks(chunk_size=chunk_size, copy=copy)
+
+    return TopicPipeline(source, metadata=view.metadata)
+
+
+def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOperation]) -> TopicView:
+    selected = view
+    for operation in operations:
+        if operation.kind == "time_range":
+            start, end = operation.args
+            selected = selected.select_time_range(
+                start,
+                end,
+                inclusive=operation.kwargs.get("inclusive", True),
+                copy=False,
+            )
+        elif operation.kind == "index_range":
+            selected = selected.select_indices(*operation.args, copy=False)
+        else:
+            raise ValueError(f"unsupported pushdown operation: {operation.kind}")
+    return selected
 
 
 def topic_parts(topic_data: dict | np.ndarray | TopicView) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
@@ -370,6 +706,16 @@ def _validated_chunk_size(chunk_size: int) -> int:
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1")
     return chunk_size
+
+
+def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:
+    start = 0 if start is None else start
+    step = 1 if step is None else step
+    if index < start:
+        return False
+    if stop is not None and index >= stop:
+        return False
+    return (index - start) % step == 0
 
 
 def _call_with_metadata(fn: Callable, data: np.ndarray, ts: float, message_id: Any) -> Any:

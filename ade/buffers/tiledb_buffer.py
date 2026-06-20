@@ -8,6 +8,38 @@ import tiledb
 
 _logger = logging.getLogger(__name__)
 
+
+def _encode_name(name) -> bytes:
+    if isinstance(name, bytes):
+        return name[:256]
+    return str(name).encode()[:256]
+
+
+def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:
+    start = 0 if start is None else start
+    step = 1 if step is None else step
+    if index < start:
+        return False
+    if stop is not None and index >= stop:
+        return False
+    return (index - start) % step == 0
+
+
+def _concat_topic_parts(parts: list[dict]) -> dict:
+    if len(parts) == 1:
+        return parts[0]
+
+    first = parts[0]
+    return {
+        "id": np.concatenate([part["id"] for part in parts]),
+        "name": np.concatenate([part["name"] for part in parts]),
+        "ts": np.concatenate([part["ts"] for part in parts]),
+        "data": np.concatenate([part["data"] for part in parts], axis=0),
+        "topic": first["topic"],
+        "source_uri": first["source_uri"],
+    }
+
+
 class TileDBBuffer:
     def __init__(self, data_source, init_source, group_uri, axis="", topics=None):
         self.data_source = data_source
@@ -16,11 +48,11 @@ class TileDBBuffer:
         self._axis = axis
         self.topics = [] if topics is None else list(topics)
         self.counters = {}
-        self.timestamps = {}
         self.msg_len = {}
         self.names = {}
         self._open_arrays = {}
         self._open_timestamp_arrays = {}
+        self.timestamps = {}
 
     def _write_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
         if topic not in self.counters:
@@ -78,9 +110,9 @@ class TileDBBuffer:
     def reset(self) -> None:
         self.close()
         self.counters = {}
-        self.timestamps = {}
         self.msg_len = {}
         self.names = {}
+        self.timestamps = {}
 
     def _get_array_uri(self, topic: str) -> str:
         return self.group_uri + topic.replace("/", "_")
@@ -141,7 +173,10 @@ class TileDBBuffer:
                 tiledb.Dim(name="message", domain=(0, data_len - 1), tile=min(data_len, 1024), dtype=np.int32)
             ),
             sparse=False,
-            attrs=[tiledb.Attr(name="timestamp", dtype=np.float64)],
+            attrs=[
+                tiledb.Attr(name="timestamp", dtype=np.float64),
+                tiledb.Attr(name="name", dtype="S256"),
+            ],
         )
         os.makedirs(timestamp_uri, exist_ok=True)
         tiledb.Array.create(timestamp_uri, timestamp_schema)
@@ -152,10 +187,9 @@ class TileDBBuffer:
         while True:
             msg = next(self.data_source)
             
-            if not msg['topic'] in self.timestamps:
+            if msg['topic'] not in self.counters:
                 self.counters[msg['topic']] = 0
                 self.msg_len[msg['topic']] = self.init_source.get_count(msg['topic'])
-                self.timestamps[msg['topic']] = np.empty(max(self.msg_len[msg['topic']], 1), dtype=np.float64)
                 self._init_tdb(msg)
 
             self.append_buffer(msg)
@@ -178,46 +212,187 @@ class TileDBBuffer:
         tiledb_array = self._open_arrays[topic]
         timestamp_array = self._open_timestamp_arrays[topic]
         counter = self.counters[topic]
-        self.timestamps[topic][counter] = msg['timestamp']
         self.names[topic] = msg["name"]
 
         key = (counter,) + tuple(slice(None) for _ in msg['data'].shape)
         tiledb_array[key] = msg['data']
-        timestamp_array[counter] = msg['timestamp']
+        timestamp_array[counter] = {
+            "timestamp": np.array(msg['timestamp'], dtype=np.float64),
+            "name": np.array(_encode_name(msg.get("name", topic)), dtype="S256"),
+        }
         self.counters[topic] = counter + 1
 
-    def _get_timestamps(self, topic: str, count: int) -> np.ndarray:
+    def _get_timestamps(self, topic: str, count: int, start: int = 0, stop: int | None = None) -> np.ndarray:
         if count == 0:
             return np.array([], dtype=np.float64)
 
-        timestamps = self.timestamps.get(topic)
-        if timestamps is not None:
-            return np.asarray(timestamps[:count], dtype=np.float64).copy()
-
+        stop = count if stop is None else min(stop, count)
+        if start >= stop:
+            return np.array([], dtype=np.float64)
         timestamp_uri = self._get_timestamp_array_uri(topic)
         if not os.path.exists(timestamp_uri):
             return np.array([], dtype=np.float64)
 
         with tiledb.DenseArray(timestamp_uri) as tiledb_array:
-            return np.asarray(tiledb_array[0:count]["timestamp"], dtype=np.float64)
+            return np.asarray(tiledb_array[start:stop]["timestamp"], dtype=np.float64)
+
+    def _get_names(self, topic: str, count: int, start: int = 0, stop: int | None = None) -> np.ndarray:
+        stop = count if stop is None else min(stop, count)
+        if start >= stop:
+            return np.array([], dtype="S256")
+
+        timestamp_uri = self._get_timestamp_array_uri(topic)
+        if not os.path.exists(timestamp_uri):
+            return np.full(stop - start, topic, dtype=object)
+
+        with tiledb.DenseArray(timestamp_uri) as tiledb_array:
+            if "name" not in tiledb_array.schema.attr_names:
+                return np.full(stop - start, topic, dtype=object)
+            return np.asarray(tiledb_array[start:stop]["name"])
+
+    def _read_timestamp_scalar(self, tiledb_array, index: int) -> float:
+        return float(np.asarray(tiledb_array[index:index + 1]["timestamp"], dtype=np.float64)[0])
+
+    def _timestamp_search(self, tiledb_array, count: int, value: float, side: str = "left") -> int:
+        left = 0
+        right = count
+        while left < right:
+            mid = (left + right) // 2
+            timestamp = self._read_timestamp_scalar(tiledb_array, mid)
+            if timestamp < value or (side == "right" and timestamp <= value):
+                left = mid + 1
+            else:
+                right = mid
+        return left
+
+    def _time_range_to_index_range(
+        self,
+        tiledb_array,
+        count: int,
+        start: float,
+        end: float,
+        inclusive: bool = True,
+    ) -> tuple[int, int]:
+        if count == 0:
+            return 0, 0
+
+        lower_side = "left" if inclusive else "right"
+        upper_side = "right" if inclusive else "left"
+        first = self._timestamp_search(tiledb_array, count, start, side=lower_side)
+        last = self._timestamp_search(tiledb_array, count, end, side=upper_side)
+        return first, max(first, last)
+
+    def _normalize_index_range(
+        self,
+        count: int,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> tuple[int, int, int]:
+        range_start, range_stop, range_step = slice(start, stop, step).indices(count)
+        if range_step < 1:
+            raise ValueError("step must be positive")
+        return range_start, range_stop, range_step
+
+    def _read_index_attr(self, tiledb_array, attr: str, indices: np.ndarray, fallback: str | None = None) -> np.ndarray:
+        if indices.size == 0:
+            return np.array([])
+        if attr not in tiledb_array.schema.attr_names:
+            if fallback is None:
+                return np.array([])
+            return np.full(indices.size, fallback, dtype=object)
+
+        first = int(indices[0])
+        last = int(indices[-1]) + 1
+        values = np.asarray(tiledb_array[first:last][attr])
+        if indices.size != last - first or not np.array_equal(indices, np.arange(first, last)):
+            values = values[indices - first]
+        return values
+
+    def _read_data_attr(self, tiledb_array, indices: np.ndarray) -> np.ndarray:
+        if indices.size == 0:
+            return tiledb_array[0:0]["features"]
+
+        first = int(indices[0])
+        last = int(indices[-1]) + 1
+        values = tiledb_array[first:last]["features"]
+        if indices.size != last - first or not np.array_equal(indices, np.arange(first, last)):
+            values = values[indices - first]
+        return values
+
+    def _iter_range_indices(self, start: int, stop: int, step: int, chunk_size: int):
+        current = start
+        while current < stop:
+            remaining = ((stop - current - 1) // step) + 1
+            size = min(chunk_size, remaining)
+            indices = current + step * np.arange(size, dtype=np.int64)
+            yield indices
+            current = int(indices[-1]) + step
+
+    def _iter_selected_indices(self, index_array, count: int, chunk_size: int, operations):
+        operations = tuple(operations or ())
+
+        scan_start = 0
+        scan_stop = count
+        if operations and operations[0].kind == "time_range":
+            start, end = operations[0].args
+            scan_start, scan_stop = self._time_range_to_index_range(
+                index_array,
+                count,
+                start,
+                end,
+                inclusive=operations[0].kwargs.get("inclusive", True),
+            )
+            operations = operations[1:]
+
+        counters = [0] * len(operations)
+        for indices in self._iter_range_indices(scan_start, scan_stop, 1, chunk_size):
+            selected = indices
+            for operation_index, operation in enumerate(operations):
+                if selected.size == 0:
+                    break
+                if operation.kind == "time_range":
+                    start, end = operation.args
+                    timestamps = self._read_index_attr(index_array, "timestamp", selected)
+                    if operation.kwargs.get("inclusive", True):
+                        mask = (timestamps >= start) & (timestamps <= end)
+                    else:
+                        mask = (timestamps > start) & (timestamps < end)
+                    selected = selected[mask]
+                elif operation.kind == "index_range":
+                    keep = np.zeros(selected.size, dtype=bool)
+                    for i in range(selected.size):
+                        current = counters[operation_index]
+                        counters[operation_index] += 1
+                        keep[i] = _slice_contains(current, *operation.args)
+                    selected = selected[keep]
+                else:
+                    raise ValueError(f"unsupported pushdown operation: {operation.kind}")
+
+            if selected.size:
+                yield selected
+
+    def _read_topic_indices(self, axis: str, data_array, index_array, indices: np.ndarray, copy: bool = False) -> dict:
+        uri = self._get_array_uri(axis)
+        data = self._read_data_attr(data_array, indices)
+        timestamps = self._read_index_attr(index_array, "timestamp", indices)
+        names = self._read_index_attr(index_array, "name", indices, fallback=axis)
+        return {
+            "id": names.copy() if copy else names,
+            "name": names.copy() if copy else names,
+            "ts": timestamps.copy() if copy else timestamps,
+            "data": data.copy() if copy else data,
+            "topic": axis,
+            "source_uri": uri,
+        }
 
     def get_buffer(self, copy: bool = True) -> dict:
         buffer = {}
         for topic, count in self.counters.items():
-            self.close_topic(topic)
-            uri = self._get_array_uri(topic)
-            with tiledb.DenseArray(uri) as A:
-                buffer[topic] = {}
-                buffer[topic]['id'] = np.full(count, topic, dtype=object)
-                buffer[topic]['name'] = buffer[topic]['id']
-                buffer[topic]['ts'] = self._get_timestamps(topic, count)
-                data = A[0:count]["features"]
-                buffer[topic]['data'] = data.copy() if copy else data
-                buffer[topic]['topic'] = topic
-                buffer[topic]['source_uri'] = uri
+            buffer[topic] = self.get_index_range(topic, 0, count, copy=copy)
         return buffer
 
-    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False, operations=()):
         if chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
         if axis not in self.counters:
@@ -226,19 +401,51 @@ class TileDBBuffer:
         self.close_topic(axis)
         count = self.counters[axis]
         uri = self._get_array_uri(axis)
-        timestamps = self._get_timestamps(axis, count)
-        with tiledb.DenseArray(uri) as A:
-            for start in range(0, count, chunk_size):
-                stop = min(start + chunk_size, count)
-                data = A[start:stop]["features"]
-                yield {
-                    "id": np.full(stop - start, axis, dtype=object),
-                    "name": np.full(stop - start, axis, dtype=object),
-                    "ts": timestamps[start:stop].copy() if copy else timestamps[start:stop],
-                    "data": data.copy() if copy else data,
+        timestamp_uri = self._get_timestamp_array_uri(axis)
+        with tiledb.DenseArray(uri) as data_array, tiledb.DenseArray(timestamp_uri) as index_array:
+            for indices in self._iter_selected_indices(index_array, count, chunk_size, operations):
+                yield self._read_topic_indices(axis, data_array, index_array, indices, copy=copy)
+
+    def get_index_range(
+        self,
+        axis: str,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+        copy: bool = True,
+    ) -> dict:
+        if axis not in self.counters:
+            return {
+                "id": np.array([], dtype=object),
+                "name": np.array([], dtype=object),
+                "ts": np.array([], dtype=np.float64),
+                "data": np.array([]),
+                "topic": axis,
+                "source_uri": self._get_array_uri(axis),
+            }
+
+        self.close_topic(axis)
+        count = self.counters[axis]
+        range_start, range_stop, range_step = self._normalize_index_range(count, start, stop, step)
+        uri = self._get_array_uri(axis)
+        timestamp_uri = self._get_timestamp_array_uri(axis)
+        parts = []
+        with tiledb.DenseArray(uri) as data_array, tiledb.DenseArray(timestamp_uri) as index_array:
+            for indices in self._iter_range_indices(range_start, range_stop, range_step, 1024):
+                parts.append(self._read_topic_indices(axis, data_array, index_array, indices, copy=copy))
+
+            if not parts:
+                empty_data = data_array[0:0]["features"]
+                return {
+                    "id": np.array([], dtype=object),
+                    "name": np.array([], dtype=object),
+                    "ts": np.array([], dtype=np.float64),
+                    "data": empty_data.copy() if copy else empty_data,
                     "topic": axis,
                     "source_uri": uri,
                 }
+
+        return _concat_topic_parts(parts)
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         if axis not in self.counters:
@@ -252,27 +459,10 @@ class TileDBBuffer:
             }
 
         self.close_topic(axis)
-        timestamps = self._get_timestamps(axis, self.counters[axis])
-        mask = (timestamps >= start) & (timestamps <= end)
-        indices = np.flatnonzero(mask)
-        uri = self._get_array_uri(axis)
-
-        with tiledb.DenseArray(uri) as A:
-            if indices.size == 0:
-                data = A[0:0]["features"]
-            else:
-                first = int(indices[0])
-                last = int(indices[-1]) + 1
-                data = A[first:last]["features"][mask[first:last]]
-
-        return {
-            "id": np.full(indices.size, axis, dtype=object),
-            "name": np.full(indices.size, axis, dtype=object),
-            "ts": timestamps[mask],
-            "data": data,
-            "topic": axis,
-            "source_uri": uri,
-        }
+        timestamp_uri = self._get_timestamp_array_uri(axis)
+        with tiledb.DenseArray(timestamp_uri) as index_array:
+            first, last = self._time_range_to_index_range(index_array, self.counters[axis], start, end)
+        return self.get_index_range(axis, first, last)
 
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
         if axis not in self.counters or self.counters[axis] == 0:
@@ -285,8 +475,10 @@ class TileDBBuffer:
                 "source_uri": self._get_array_uri(axis),
             }
 
-        timestamps = self._get_timestamps(axis, self.counters[axis])
-        end = timestamps[-1]
+        self.close_topic(axis)
+        timestamp_uri = self._get_timestamp_array_uri(axis)
+        with tiledb.DenseArray(timestamp_uri) as index_array:
+            end = self._read_timestamp_scalar(index_array, self.counters[axis] - 1)
         return self.get_time_range(axis, end - seconds, end)
 
     def __getitem__(self, subscript):

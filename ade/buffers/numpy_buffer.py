@@ -79,11 +79,11 @@ class NumpyBuffer:
     def get_buffer(self, copy: bool = True) -> dict:
         return {topic: self._ordered_topic(topic, copy=copy) for topic in self._data_buffer}
 
-    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False, operations=()):
         if chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
 
-        topic = self._ordered_topic(axis, copy=False)
+        topic = self._apply_operations(self._valid_ordered_topic(axis), operations)
         for start in range(0, topic.shape[0], chunk_size):
             selected = topic[start:start + chunk_size]
             yield {
@@ -93,6 +93,17 @@ class NumpyBuffer:
                 "data": selected["data"].copy() if copy else selected["data"],
                 "topic": axis,
             }
+
+    def get_index_range(self, axis: str, start: int | None = None, stop: int | None = None, step: int | None = None) -> dict:
+        topic = self._valid_ordered_topic(axis)
+        selected = topic[slice(start, stop, step)]
+        return {
+            "id": selected['id'].copy(),
+            "name": selected['id'].copy(),
+            "ts": selected['ts'].copy(),
+            "data": selected['data'].copy(),
+            "topic": axis,
+        }
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         topic = self._valid_ordered_topic(axis)
@@ -118,6 +129,22 @@ class NumpyBuffer:
             }
         end = topic['ts'][-1]
         return self.get_time_range(axis, end - seconds, end)
+
+    def _apply_operations(self, topic: np.ndarray, operations) -> np.ndarray:
+        selected = topic
+        for operation in operations:
+            if operation.kind == "time_range":
+                start, end = operation.args
+                if operation.kwargs.get("inclusive", True):
+                    mask = (selected['ts'] >= start) & (selected['ts'] <= end)
+                else:
+                    mask = (selected['ts'] > start) & (selected['ts'] < end)
+                selected = selected[mask]
+            elif operation.kind == "index_range":
+                selected = selected[slice(*operation.args)]
+            else:
+                raise ValueError(f"unsupported pushdown operation: {operation.kind}")
+        return selected
 
     def __getitem__(self, subscript):
         ordered_data = self._ordered_topic(self._axis)['data']

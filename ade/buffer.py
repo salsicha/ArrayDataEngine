@@ -216,6 +216,19 @@ class DataBuffer:
             raise ValueError("start must be less than or equal to end")
         return self.buffer_impl.get_time_range(axis, start, end)
 
+    def get_index_range(
+        self,
+        axis: str,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> dict:
+        if axis not in self.topics:
+            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
+        if step is not None and step < 1:
+            raise ValueError("step must be positive")
+        return self.buffer_impl.get_index_range(axis, start, stop, step)
+
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
         if axis not in self.topics:
             raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
@@ -255,7 +268,25 @@ class DataBuffer:
             copy=False,
         )
 
-    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+    def topic(self, axis: str):
+        from .ops import TopicPipeline
+
+        self._validate_topic_axis(axis)
+        return TopicPipeline(
+            lambda chunk_size, copy, operations=(): self.iter_topic_chunks(
+                axis,
+                chunk_size,
+                copy=copy,
+                operations=operations,
+            ),
+            topic=axis,
+            source_uri=self._source_uri(),
+        )
+
+    def query_topic(self, axis: str):
+        return self.topic(axis)
+
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False, operations=()):
         from .ops import topic_view
 
         self._validate_topic_axis(axis)
@@ -264,7 +295,7 @@ class DataBuffer:
             raise ValueError("chunk_size must be at least 1")
 
         if hasattr(self.buffer_impl, "iter_topic_chunks"):
-            for chunk in self.buffer_impl.iter_topic_chunks(axis, chunk_size, copy=copy):
+            for chunk in self.buffer_impl.iter_topic_chunks(axis, chunk_size, copy=copy, operations=operations):
                 yield topic_view(
                     chunk,
                     topic=axis,
@@ -273,26 +304,14 @@ class DataBuffer:
                 )
             return
 
-        yield from self.topic_view(axis, copy=copy).iter_chunks(chunk_size, copy=False)
-
-    def _combine_topic_views(self, axis: str, views, data=None) -> dict:
-        from .ops import TopicView
-
-        ids_parts = []
-        ts_parts = []
-        data_parts = []
-        for view in views:
-            if view.ids is not None:
-                ids_parts.append(view.ids)
-            ts_parts.append(view.timestamps)
-            if data is None:
-                data_parts.append(view.data)
-
-        ids = np.concatenate(ids_parts) if ids_parts else None
-        timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
-        if data is None:
-            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
-        return TopicView(ids, timestamps, data, topic=axis, source_uri=self._source_uri()).as_dict()
+        view = self.topic_view(axis, copy=copy)
+        for operation in operations:
+            if operation.kind == "time_range":
+                start, end = operation.args
+                view = view.select_time_range(start, end, inclusive=operation.kwargs.get("inclusive", True), copy=False)
+            elif operation.kind == "index_range":
+                view = view.select_indices(*operation.args, copy=False)
+        yield from view.iter_chunks(chunk_size, copy=False)
 
     def map_topic(
         self,
@@ -305,19 +324,7 @@ class DataBuffer:
         self._validate_topic_axis(axis)
         if chunk_size is None:
             return self.topic_view(axis, copy=False).map(fn, copy=copy, out=out).as_dict()
-
-        output = None if out is None else np.asarray(out)
-        views = []
-        offset = 0
-        for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False):
-            chunk_out = None if output is None else output[offset:offset + len(chunk)]
-            mapped = chunk.map(fn, copy=copy, out=chunk_out)
-            views.append(mapped)
-            offset += len(chunk)
-
-        if output is not None and offset != output.shape[0]:
-            raise ValueError("out must have the same leading dimension as topic data")
-        return self._combine_topic_views(axis, views, data=output)
+        return self.topic(axis).map(fn, copy=copy).collect(chunk_size=chunk_size, out=out)
 
     def filter_topic(
         self,
@@ -329,12 +336,7 @@ class DataBuffer:
         self._validate_topic_axis(axis)
         if chunk_size is None:
             return self.topic_view(axis, copy=False).filter(predicate, copy=copy).as_dict()
-
-        views = [
-            chunk.filter(predicate, copy=copy)
-            for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False)
-        ]
-        return self._combine_topic_views(axis, views)
+        return self.topic(axis).filter(predicate, copy=copy).collect(chunk_size=chunk_size)
 
     def reduce_topic(
         self,
@@ -347,18 +349,7 @@ class DataBuffer:
         self._validate_topic_axis(axis)
         if chunk_size is None:
             return self.topic_view(axis, copy=False).reduce(fn, initial=initial, copy=copy)
-
-        has_acc = initial is not None
-        acc = initial
-        for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False):
-            if len(chunk) == 0:
-                continue
-            acc = chunk.reduce(fn, initial=acc if has_acc else None, copy=copy)
-            has_acc = True
-
-        if not has_acc:
-            raise ValueError("cannot reduce an empty topic without an initial value")
-        return acc
+        return self.topic(axis).reduce(fn, initial=initial, copy=copy, chunk_size=chunk_size)
 
     def window_topic(self, axis: str, size: int | None = None, seconds: float | None = None, copy: bool = True):
         self._validate_topic_axis(axis)
