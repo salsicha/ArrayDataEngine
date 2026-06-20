@@ -208,15 +208,48 @@ class TileDBBuffer:
             uri = self._get_array_uri(topic)
             with tiledb.DenseArray(uri) as A:
                 buffer[topic] = {}
-                buffer[topic]['id'] = topic
+                buffer[topic]['id'] = np.full(count, topic, dtype=object)
+                buffer[topic]['name'] = buffer[topic]['id']
                 buffer[topic]['ts'] = self._get_timestamps(topic, count)
                 data = A[0:count]["features"]
                 buffer[topic]['data'] = data.copy() if copy else data
+                buffer[topic]['topic'] = topic
+                buffer[topic]['source_uri'] = uri
         return buffer
+
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+        if axis not in self.counters:
+            return
+
+        self.close_topic(axis)
+        count = self.counters[axis]
+        uri = self._get_array_uri(axis)
+        timestamps = self._get_timestamps(axis, count)
+        with tiledb.DenseArray(uri) as A:
+            for start in range(0, count, chunk_size):
+                stop = min(start + chunk_size, count)
+                data = A[start:stop]["features"]
+                yield {
+                    "id": np.full(stop - start, axis, dtype=object),
+                    "name": np.full(stop - start, axis, dtype=object),
+                    "ts": timestamps[start:stop].copy() if copy else timestamps[start:stop],
+                    "data": data.copy() if copy else data,
+                    "topic": axis,
+                    "source_uri": uri,
+                }
 
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         if axis not in self.counters:
-            return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
+            return {
+                "id": np.array([], dtype=object),
+                "name": np.array([], dtype=object),
+                "ts": np.array([], dtype=np.float64),
+                "data": np.array([]),
+                "topic": axis,
+                "source_uri": self._get_array_uri(axis),
+            }
 
         self.close_topic(axis)
         timestamps = self._get_timestamps(axis, self.counters[axis])
@@ -232,11 +265,25 @@ class TileDBBuffer:
                 last = int(indices[-1]) + 1
                 data = A[first:last]["features"][mask[first:last]]
 
-        return {"id": axis, "ts": timestamps[mask], "data": data}
+        return {
+            "id": np.full(indices.size, axis, dtype=object),
+            "name": np.full(indices.size, axis, dtype=object),
+            "ts": timestamps[mask],
+            "data": data,
+            "topic": axis,
+            "source_uri": uri,
+        }
 
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
         if axis not in self.counters or self.counters[axis] == 0:
-            return {"id": axis, "ts": np.array([], dtype=np.float64), "data": np.array([])}
+            return {
+                "id": np.array([], dtype=object),
+                "name": np.array([], dtype=object),
+                "ts": np.array([], dtype=np.float64),
+                "data": np.array([]),
+                "topic": axis,
+                "source_uri": self._get_array_uri(axis),
+            }
 
         timestamps = self._get_timestamps(axis, self.counters[axis])
         end = timestamps[-1]

@@ -79,23 +79,42 @@ class NumpyBuffer:
     def get_buffer(self, copy: bool = True) -> dict:
         return {topic: self._ordered_topic(topic, copy=copy) for topic in self._data_buffer}
 
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+
+        topic = self._ordered_topic(axis, copy=False)
+        for start in range(0, topic.shape[0], chunk_size):
+            selected = topic[start:start + chunk_size]
+            yield {
+                "id": selected["id"].copy() if copy else selected["id"],
+                "name": selected["id"].copy() if copy else selected["id"],
+                "ts": selected["ts"].copy() if copy else selected["ts"],
+                "data": selected["data"].copy() if copy else selected["data"],
+                "topic": axis,
+            }
+
     def get_time_range(self, axis: str, start: float, end: float) -> dict:
         topic = self._valid_ordered_topic(axis)
         mask = (topic['ts'] >= start) & (topic['ts'] <= end)
         selected = topic[mask]
         return {
-            "id": axis,
+            "id": selected['id'].copy(),
+            "name": selected['id'].copy(),
             "ts": selected['ts'].copy(),
             "data": selected['data'].copy(),
+            "topic": axis,
         }
 
     def get_last_seconds(self, axis: str, seconds: float) -> dict:
         topic = self._valid_ordered_topic(axis)
         if topic.size == 0:
             return {
-                "id": axis,
+                "id": np.array([], dtype=topic['id'].dtype),
+                "name": np.array([], dtype=topic['id'].dtype),
                 "ts": np.array([], dtype=np.float64),
                 "data": topic['data'].copy(),
+                "topic": axis,
             }
         end = topic['ts'][-1]
         return self.get_time_range(axis, end - seconds, end)

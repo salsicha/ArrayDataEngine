@@ -122,6 +122,8 @@ def test_numpy_buffer_time_ranges():
     time_range = buf.get_time_range("sensor_topic", 100.05, 100.25)
     assert np.allclose(time_range["ts"], np.array([100.1, 100.2]))
     assert np.allclose(time_range["data"], np.array([[1.0, 2.0], [2.0, 4.0]]))
+    assert time_range["id"].tolist() == [b"sensor_frame", b"sensor_frame"]
+    assert time_range["topic"] == "sensor_topic"
 
     last_window = buf.get_last_seconds("sensor_topic", 0.15)
     assert np.allclose(last_window["ts"], np.array([100.3, 100.4]))

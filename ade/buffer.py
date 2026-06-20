@@ -223,33 +223,147 @@ class DataBuffer:
             raise ValueError("seconds must be non-negative")
         return self.buffer_impl.get_last_seconds(axis, seconds)
 
-    def map_topic(self, axis: str, fn, copy: bool = True) -> dict:
-        from .ops import map_topic
-
+    def _validate_topic_axis(self, axis: str) -> None:
         if axis not in self.topics:
             raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
-        return map_topic(self.get_buffer(copy=copy)[axis], fn, copy=copy)
 
-    def filter_topic(self, axis: str, predicate) -> dict:
-        from .ops import filter_topic
+    def _source_uri(self) -> str | None:
+        if self.use_db:
+            return self.group_uri
 
-        if axis not in self.topics:
-            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
-        return filter_topic(self.get_buffer()[axis], predicate)
+        source = self._init_source
+        for candidate in (source, getattr(source, "source", None)):
+            if candidate is None:
+                continue
+            get_data_path = getattr(candidate, "get_data_path", None)
+            if callable(get_data_path):
+                return get_data_path()
+            data_path = getattr(candidate, "data_path", None)
+            if data_path is not None:
+                return data_path
+        return None
 
-    def reduce_topic(self, axis: str, fn, initial=None):
-        from .ops import reduce_topic
+    def topic_view(self, axis: str, copy: bool = True, metadata=None):
+        from .ops import topic_view
 
-        if axis not in self.topics:
-            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
-        return reduce_topic(self.get_buffer(copy=False)[axis], fn, initial=initial)
+        self._validate_topic_axis(axis)
+        return topic_view(
+            self.get_buffer(copy=copy)[axis],
+            topic=axis,
+            source_uri=self._source_uri(),
+            metadata=metadata,
+            copy=False,
+        )
 
-    def window_topic(self, axis: str, size: int | None = None, seconds: float | None = None):
-        from .ops import window_topic
+    def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False):
+        from .ops import topic_view
 
-        if axis not in self.topics:
-            raise ValueError(f"Axis: {axis} not in topics: {self.topics}")
-        yield from window_topic(self.get_buffer()[axis], size=size, seconds=seconds)
+        self._validate_topic_axis(axis)
+        chunk_size = int(chunk_size)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+
+        if hasattr(self.buffer_impl, "iter_topic_chunks"):
+            for chunk in self.buffer_impl.iter_topic_chunks(axis, chunk_size, copy=copy):
+                yield topic_view(
+                    chunk,
+                    topic=axis,
+                    source_uri=chunk.get("source_uri", self._source_uri()),
+                    copy=False,
+                )
+            return
+
+        yield from self.topic_view(axis, copy=copy).iter_chunks(chunk_size, copy=False)
+
+    def _combine_topic_views(self, axis: str, views, data=None) -> dict:
+        from .ops import TopicView
+
+        ids_parts = []
+        ts_parts = []
+        data_parts = []
+        for view in views:
+            if view.ids is not None:
+                ids_parts.append(view.ids)
+            ts_parts.append(view.timestamps)
+            if data is None:
+                data_parts.append(view.data)
+
+        ids = np.concatenate(ids_parts) if ids_parts else None
+        timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
+        if data is None:
+            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
+        return TopicView(ids, timestamps, data, topic=axis, source_uri=self._source_uri()).as_dict()
+
+    def map_topic(
+        self,
+        axis: str,
+        fn,
+        copy: bool = True,
+        out: np.ndarray | None = None,
+        chunk_size: int | None = None,
+    ) -> dict:
+        self._validate_topic_axis(axis)
+        if chunk_size is None:
+            return self.topic_view(axis, copy=False).map(fn, copy=copy, out=out).as_dict()
+
+        output = None if out is None else np.asarray(out)
+        views = []
+        offset = 0
+        for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False):
+            chunk_out = None if output is None else output[offset:offset + len(chunk)]
+            mapped = chunk.map(fn, copy=copy, out=chunk_out)
+            views.append(mapped)
+            offset += len(chunk)
+
+        if output is not None and offset != output.shape[0]:
+            raise ValueError("out must have the same leading dimension as topic data")
+        return self._combine_topic_views(axis, views, data=output)
+
+    def filter_topic(
+        self,
+        axis: str,
+        predicate,
+        copy: bool = True,
+        chunk_size: int | None = None,
+    ) -> dict:
+        self._validate_topic_axis(axis)
+        if chunk_size is None:
+            return self.topic_view(axis, copy=False).filter(predicate, copy=copy).as_dict()
+
+        views = [
+            chunk.filter(predicate, copy=copy)
+            for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False)
+        ]
+        return self._combine_topic_views(axis, views)
+
+    def reduce_topic(
+        self,
+        axis: str,
+        fn,
+        initial=None,
+        copy: bool = True,
+        chunk_size: int | None = None,
+    ):
+        self._validate_topic_axis(axis)
+        if chunk_size is None:
+            return self.topic_view(axis, copy=False).reduce(fn, initial=initial, copy=copy)
+
+        has_acc = initial is not None
+        acc = initial
+        for chunk in self.iter_topic_chunks(axis, chunk_size, copy=False):
+            if len(chunk) == 0:
+                continue
+            acc = chunk.reduce(fn, initial=acc if has_acc else None, copy=copy)
+            has_acc = True
+
+        if not has_acc:
+            raise ValueError("cannot reduce an empty topic without an initial value")
+        return acc
+
+    def window_topic(self, axis: str, size: int | None = None, seconds: float | None = None, copy: bool = True):
+        self._validate_topic_axis(axis)
+        for window in self.topic_view(axis, copy=False).window(size=size, seconds=seconds, copy=copy):
+            yield window.as_dict()
 
     def __getitem__(self, subscript: slice | int) -> np.ndarray | float | int:
         return self.buffer_impl[subscript]

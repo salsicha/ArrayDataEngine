@@ -13,6 +13,7 @@ from ade.ops import (
     filter_topic,
     hillshade,
     interpolate_timeseries,
+    iter_chunks,
     knn_search,
     map_topic,
     mosaic_tiles,
@@ -31,6 +32,8 @@ from ade.ops import (
     slerp,
     slope_aspect,
     statistical_outlier_filter,
+    TopicView,
+    topic_view,
     trajectory_speed,
     valid_depth_mask,
     voxel_downsample,
@@ -81,6 +84,43 @@ def test_topic_operations_select_map_filter_reduce_window_and_align():
     assert aligned["valid"].tolist() == [True, False, False, True]
 
 
+def test_topic_view_preserves_metadata_and_supports_chunked_operations():
+    topic = _topic()
+    view = topic_view(topic, topic="/points", source_uri="/data/run", frame_id="map")
+
+    assert isinstance(view, TopicView)
+    assert view.metadata.topic == "/points"
+    assert view.metadata.source_uri == "/data/run"
+    assert view.metadata.frame_id == "map"
+    assert view.metadata.shape == (2,)
+    assert view.metadata.dtype == topic["data"].dtype
+    assert view.metadata.count == 4
+    assert view.metadata.start_time == 0.0
+    assert view.metadata.end_time == 1.5
+    assert view.metadata.names.tolist() == ["a", "b", "c", "d"]
+
+    chunks = list(iter_chunks(view, chunk_size=2))
+    assert [chunk.metadata.count for chunk in chunks] == [2, 2]
+    assert [chunk.metadata.start_time for chunk in chunks] == [0.0, 1.0]
+
+    mapped = view.map(lambda data, ts, name: data + ts + len(name), chunk_size=2)
+    assert mapped.metadata.topic == "/points"
+    assert mapped.metadata.count == 4
+    assert np.allclose(mapped.data[1], np.array([2.5, 2.5]))
+
+    out = np.empty_like(topic["data"])
+    mapped_dict = map_topic(topic, lambda data: data * 3, out=out, chunk_size=3)
+    assert mapped_dict["data"] is out
+    assert np.allclose(out, topic["data"] * 3)
+    assert mapped_dict["metadata"].names.tolist() == ["a", "b", "c", "d"]
+
+    filtered = filter_topic(topic, lambda data, ts, name: name in {"b", "d"}, chunk_size=1)
+    assert filtered["id"].tolist() == ["b", "d"]
+
+    reduced = reduce_topic(topic, lambda acc, data, ts, name: acc + data + ts, initial=np.zeros(2), chunk_size=2)
+    assert np.allclose(reduced, np.array([9.0, 9.0]))
+
+
 class _SmallSource:
     def get_topics(self):
         return ["axis"]
@@ -101,14 +141,34 @@ class _SmallSource:
 def test_data_buffer_operation_wrappers():
     buffer = DataBuffer(_SmallSource(), buffer_depth=3, axis="axis", preload=True)
 
+    view = buffer.topic_view("axis")
+    assert view.metadata.topic == "axis"
+    assert view.metadata.count == 3
+    assert view.metadata.names.tolist() == [b"frame_0", b"frame_1", b"frame_2"]
+
     mapped = buffer.map_topic("axis", lambda data: data * 2)
     assert np.allclose(mapped["data"], np.array([[0.0], [2.0], [4.0]]))
+
+    out = np.empty((3, 1), dtype=np.float64)
+    chunked_mapped = buffer.map_topic("axis", lambda data, ts: data + ts, out=out, chunk_size=2)
+    assert chunked_mapped["data"] is out
+    assert np.allclose(out, np.array([[0.0], [2.0], [4.0]]))
 
     filtered = buffer.filter_topic("axis", lambda data, ts: ts >= 1.0)
     assert np.allclose(filtered["ts"], np.array([1.0, 2.0]))
 
+    chunked_filtered = buffer.filter_topic("axis", lambda data, ts: ts != 1.0, chunk_size=1)
+    assert np.allclose(chunked_filtered["ts"], np.array([0.0, 2.0]))
+
     reduced = buffer.reduce_topic("axis", lambda acc, data: acc + data, initial=np.zeros(1))
     assert np.allclose(reduced, np.array([3.0]))
+
+    chunked_reduced = buffer.reduce_topic("axis", lambda acc, data: acc + data, initial=np.zeros(1), chunk_size=2)
+    assert np.allclose(chunked_reduced, np.array([3.0]))
+
+    chunks = list(buffer.iter_topic_chunks("axis", chunk_size=2))
+    assert [chunk.metadata.count for chunk in chunks] == [2, 1]
+    assert [chunk.metadata.topic for chunk in chunks] == ["axis", "axis"]
 
     windows = list(buffer.window_topic("axis", size=2))
     assert [window["ts"].tolist() for window in windows] == [[0.0], [0.0, 1.0], [1.0, 2.0]]

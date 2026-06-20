@@ -6,11 +6,11 @@ Open3D is a useful model for this project: keep the API small, composable, NumPy
 
 Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/release/tutorial/geometry/pointcloud.html), [Open3D PointCloud API](https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html), and [Open3D ICP registration tutorial](https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html).
 
-- [ ] Define a common operation interface for buffered topics:
+- [x] Define a common operation interface for buffered topics:
   - [x] Add `map(topic, fn)`, `filter(topic, predicate)`, `reduce(topic, fn)`, and `window(topic, size|seconds)` helpers.
-  - [ ] Support eager NumPy output and lazy/chunked iteration for larger-than-memory arrays.
-  - [ ] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
-  - [ ] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
+  - [x] Support eager NumPy output and lazy/chunked iteration for larger-than-memory arrays.
+  - [x] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
+  - [x] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
 - [ ] Add dataset-level selection and indexing:
   - [ ] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
   - [x] Add timestamp range and message index range selection helpers.
@@ -64,7 +64,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add raster grid sampling helper.
   - [ ] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
 - [ ] Add large-array execution features:
-  - [ ] Add chunked operation execution for arrays that do not fit in memory.
+  - [x] Add chunked operation execution for buffered topic arrays that do not fit in memory.
   - [ ] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
   - [ ] Add optional parallel execution for independent chunks/topics.
   - [ ] Add progress reporting, cancellation, and resumable operation checkpoints.

@@ -156,10 +156,34 @@ points = window["/points"]["data"][-1]
 reduced_points = voxel_downsample(points, voxel_size=0.25)
 ```
 
-`DataBuffer` also exposes convenience wrappers for buffered topics:
+For metadata-aware workflows, convert a topic to a `TopicView`. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
 
 ```python
+import numpy as np
+from ade.ops import topic_view
+
+view = topic_view(window["images"], topic="images")
+
+out = np.empty(view.data.shape, dtype=np.float32)
+normalized = view.map(
+    lambda frame: frame.astype(np.float32) / 255.0,
+    out=out,
+    chunk_size=16,
+).as_dict()
+
+for chunk in view.iter_chunks(chunk_size=32):
+    print(chunk.metadata.start_time, chunk.metadata.end_time, chunk.data.shape)
+```
+
+`DataBuffer` exposes the same interface and convenience wrappers for buffered topics:
+
+```python
+images = buffer.topic_view("images")
+for chunk in buffer.iter_topic_chunks("images", chunk_size=32):
+    process(chunk.data, chunk.timestamps)
+
 normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 255.0)
+normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 255.0, chunk_size=16)
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
