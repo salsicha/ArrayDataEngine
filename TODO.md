@@ -13,7 +13,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 3. [x] P1 - Add progress reporting, cancellation, and resumable operation checkpoints for long source and topic pipelines.
 4. [x] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
 5. [x] P2 - Add optional parallel execution for independent chunks/topics.
-6. [ ] P2 - Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
+6. [x] P2 - Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
 7. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
 
 ## Backlog
@@ -86,7 +86,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
   - [x] Add optional parallel execution for independent chunks/topics.
   - [x] Add progress reporting, cancellation, and resumable operation checkpoints.
-  - [ ] Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
+  - [x] Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
 - [ ] Add ML-ready dataset operations:
   - [ ] Export topic windows to PyTorch, NumPy, and plain iterator datasets.
   - [ ] Add deterministic train/validation/test splits by time, sequence, geography, or source file.

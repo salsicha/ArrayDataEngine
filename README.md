@@ -540,22 +540,28 @@ terrain_mesh = dem_to_mesh(vehicle_patch, resolution=30.0)
 
 ## Benchmarks
 
-Run the source adapter and lazy pipeline benchmarks with:
+Run the source adapter, synthetic operation, lazy pipeline, and TileDB benchmarks with:
 
 ```bash
 python -m pytest tests/test_source_benchmarks.py -q -s
 ```
 
-Results below were measured on 2026-06-20 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so those rows measure adapter overhead without requiring ROS bag files or Earthdata access.
+Results below were measured on 2026-06-21 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so those rows measure adapter overhead without requiring ROS bag files or Earthdata access.
 
-| Source | Workload | Messages | Elapsed | Throughput | Latency |
+| Benchmark | Workload | Items | Elapsed | Throughput | Latency |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.008944s | 22,362 msg/s | 44.7 us/msg |
-| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000160s | 1,253,596 msg/s | 0.8 us/msg |
-| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000160s | 1,249,024 msg/s | 0.8 us/msg |
-| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000073s | 54,795 msg/s | 18.2 us/msg |
-| `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.019936s | 501,609 msg/s | 2.0 us/msg |
-| `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.130066s | 769 msg/s | 1300.7 us/msg |
+| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.006395s | 31,274 items/s | 32.0 us/item |
+| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000125s | 1,600,000 items/s | 0.6 us/item |
+| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000124s | 1,609,657 items/s | 0.6 us/item |
+| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000048s | 82,616 items/s | 12.1 us/item |
+| `ImageOps.synthetic` | resize, normalize, and grayscale 96x96 RGB image frames | 64 | 0.001120s | 57,153 frames/s | 17.5 us/frame |
+| `PointCloudOps.synthetic` | voxel downsample, KNN search, and normal estimation on XYZ+intensity points | 1,024 | 0.010514s | 97,395 points/s | 10.3 us/point |
+| `IMUOps.synthetic` | resample synthetic IMU samples and dead-reckon the trajectory | 2,000 | 0.027607s | 72,445 samples/s | 13.8 us/sample |
+| `OdometryOps.synthetic` | resample synthetic odometry samples and dead-reckon the trajectory | 2,000 | 0.027660s | 72,306 samples/s | 13.8 us/sample |
+| `NavSatOps.synthetic` | convert and resample synthetic WGS84 NavSat samples into local trajectory arrays | 2,000 | 0.012711s | 157,349 samples/s | 6.4 us/sample |
+| `DEMOps.synthetic` | terrain normals, roughness, traversability, and point-cloud conversion over a DEM grid | 16,384 | 0.006353s | 2,579,024 cells/s | 0.4 us/cell |
+| `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.031245s | 320,053 items/s | 3.1 us/item |
+| `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.192457s | 520 items/s | 1924.6 us/item |
 
 ## Development
 
