@@ -62,6 +62,38 @@ class TopicMetadata:
         )
 
 
+@dataclass(frozen=True)
+class PipelineProgress:
+    """Progress snapshot for long-running source and topic pipelines."""
+
+    processed: int
+    emitted: int
+    skipped: int
+    topic: str | None = None
+    message_id: Any | None = None
+    timestamp: float | None = None
+    done: bool = False
+    cancelled: bool = False
+    checkpoint: dict[str, Any] | None = None
+
+
+class PipelineCancelled(RuntimeError):
+    """Raised when a pipeline cancellation token is set."""
+
+
+class CancellationToken:
+    """Mutable cancellation token shared with pipeline execution."""
+
+    def __init__(self, cancelled: bool = False):
+        self.cancelled = bool(cancelled)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def reset(self) -> None:
+        self.cancelled = False
+
+
 class TopicView:
     """Common operation interface for buffered topic arrays."""
 
@@ -341,8 +373,23 @@ class TopicPipeline:
         min_array, max_array, columns = _normalize_bounds(min_bound, max_bound, columns)
         return self._with_operation("spatial_bounds", min_array, max_array, columns=columns)
 
-    def iter_rows(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[dict]:
-        for message_id, timestamp, value in self._iter_processed_rows(chunk_size=chunk_size, copy=copy):
+    def iter_rows(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = False,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ) -> Iterable[dict]:
+        for message_id, timestamp, value in self._iter_processed_rows(
+            chunk_size=chunk_size,
+            copy=copy,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        ):
             yield {
                 "id": message_id,
                 "name": message_id,
@@ -350,13 +397,28 @@ class TopicPipeline:
                 "data": value,
             }
 
-    def iter_chunks(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[TopicView]:
+    def iter_chunks(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = False,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ) -> Iterable[TopicView]:
         chunk_size = _validated_chunk_size(chunk_size)
         ids: list[Any] = []
         timestamps: list[float] = []
         values: list[np.ndarray] = []
 
-        for message_id, timestamp, value in self._iter_processed_rows(chunk_size=chunk_size, copy=copy):
+        for message_id, timestamp, value in self._iter_processed_rows(
+            chunk_size=chunk_size,
+            copy=copy,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        ):
             ids.append(message_id)
             timestamps.append(timestamp)
             values.append(value.copy() if copy else value)
@@ -373,8 +435,19 @@ class TopicPipeline:
         initial: Any | None = None,
         chunk_size: int = 1024,
         copy: bool = True,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
     ) -> Any:
-        iterator = self._iter_processed_rows(chunk_size=chunk_size, copy=copy)
+        iterator = self._iter_processed_rows(
+            chunk_size=chunk_size,
+            copy=copy,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        )
         if initial is None:
             try:
                 _, _, value = next(iterator)
@@ -399,6 +472,10 @@ class TopicPipeline:
         max_rows: int | None = None,
         max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
         allow_large: bool = False,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
     ) -> dict:
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
@@ -408,7 +485,14 @@ class TopicPipeline:
         offset = 0
         collected_bytes = 0
 
-        for chunk in self.iter_chunks(chunk_size=chunk_size, copy=copy):
+        for chunk in self.iter_chunks(
+            chunk_size=chunk_size,
+            copy=copy,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        ):
             offset += len(chunk)
             collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
             _check_collect_limits(offset, collected_bytes, max_rows, max_bytes, allow_large)
@@ -450,13 +534,42 @@ class TopicPipeline:
         pushdown_operations, _ = self._split_pushdown_operations()
         yield from self._chunk_source(chunk_size, copy, pushdown_operations)
 
-    def _iter_processed_rows(self, chunk_size: int, copy: bool):
+    def _iter_processed_rows(
+        self,
+        chunk_size: int,
+        copy: bool,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ):
         chunk_size = _validated_chunk_size(chunk_size)
         _, operations = self._split_pushdown_operations()
-        index_counters = [0] * len(operations)
+        index_counters = _checkpoint_operation_counters(checkpoint, len(operations), kind="topic")
+        resume_processed = _checkpoint_processed(checkpoint)
+        processed = 0
+        emitted = _checkpoint_emitted(checkpoint)
+        skipped = _checkpoint_skipped(checkpoint)
+        progress_interval = _validated_progress_interval(progress_interval)
+        last_progress: PipelineProgress | None = None
 
         for chunk in self._source_chunks(chunk_size=chunk_size, copy=copy):
             for _, timestamp, value, message_id in chunk._iter_rows():
+                processed += 1
+                if processed <= resume_processed:
+                    continue
+                _raise_if_cancelled(
+                    cancel_token,
+                    checkpoint,
+                    PipelineProgress(
+                        processed=processed - 1,
+                        emitted=emitted,
+                        skipped=skipped,
+                        topic=self.metadata.topic,
+                        checkpoint=_checkpoint_snapshot(checkpoint),
+                    ),
+                    operation_counters=index_counters,
+                )
                 current_value = value.copy() if copy else value
                 current_timestamp = float(timestamp)
                 current_id = message_id
@@ -515,7 +628,37 @@ class TopicPipeline:
                         break
 
                 if keep:
+                    emitted += 1
+                else:
+                    skipped += 1
+
+                last_progress = PipelineProgress(
+                    processed=processed,
+                    emitted=emitted,
+                    skipped=skipped,
+                    topic=self.metadata.topic,
+                    message_id=current_id,
+                    timestamp=current_timestamp,
+                    checkpoint=_checkpoint_snapshot(checkpoint),
+                )
+                _update_checkpoint(checkpoint, last_progress, operation_counters=index_counters)
+                _notify_progress(progress_callback, last_progress, progress_interval)
+
+                if keep:
                     yield current_id, current_timestamp, current_value
+
+        done_progress = PipelineProgress(
+            processed=max(processed, resume_processed),
+            emitted=emitted,
+            skipped=skipped,
+            topic=self.metadata.topic,
+            message_id=None if last_progress is None else last_progress.message_id,
+            timestamp=None if last_progress is None else last_progress.timestamp,
+            done=True,
+            checkpoint=_checkpoint_snapshot(checkpoint),
+        )
+        _update_checkpoint(checkpoint, done_progress, operation_counters=index_counters)
+        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def _split_pushdown_operations(self) -> tuple[tuple[_PipelineOperation, ...], tuple[_PipelineOperation, ...]]:
         pushdown_operations = []
@@ -562,12 +705,26 @@ class TopicWindowPipeline:
         self.seconds = seconds
         self.copy = copy
 
-    def iter_windows(self, chunk_size: int = 1024) -> Iterable[TopicView]:
+    def iter_windows(
+        self,
+        chunk_size: int = 1024,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ) -> Iterable[TopicView]:
         ids = deque()
         timestamps = deque()
         values = deque()
 
-        for message_id, timestamp, value in self.pipeline._iter_processed_rows(chunk_size=chunk_size, copy=self.copy):
+        for message_id, timestamp, value in self.pipeline._iter_processed_rows(
+            chunk_size=chunk_size,
+            copy=self.copy,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        ):
             ids.append(message_id)
             timestamps.append(timestamp)
             values.append(value.copy() if self.copy else value)
@@ -599,10 +756,20 @@ class TopicWindowPipeline:
         max_windows: int | None = None,
         max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
         allow_large: bool = False,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
     ) -> list[TopicView]:
         windows = []
         collected_bytes = 0
-        for window in self.iter_windows(chunk_size=chunk_size):
+        for window in self.iter_windows(
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        ):
             windows.append(window)
             collected_bytes += _topic_view_nbytes(window)
             _check_collect_limits(len(windows), collected_bytes, max_windows, max_bytes, allow_large)
@@ -831,9 +998,36 @@ class SourcePipeline:
     ) -> "SourcePipeline":
         return self.index_range(start, stop, step)
 
-    def iter_messages(self, copy: bool = True) -> Iterable[dict]:
-        index_counters = [dict() for _ in self._operations]
+    def iter_messages(
+        self,
+        copy: bool = True,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ) -> Iterable[dict]:
+        index_counters = _checkpoint_operation_counters(checkpoint, len(self._operations), kind="source")
+        resume_processed = _checkpoint_processed(checkpoint)
+        processed = 0
+        emitted = _checkpoint_emitted(checkpoint)
+        skipped = _checkpoint_skipped(checkpoint)
+        progress_interval = _validated_progress_interval(progress_interval)
+        last_progress: PipelineProgress | None = None
         for raw_message in _source_messages(self.data_source):
+            processed += 1
+            if processed <= resume_processed:
+                continue
+            _raise_if_cancelled(
+                cancel_token,
+                checkpoint,
+                PipelineProgress(
+                    processed=processed - 1,
+                    emitted=emitted,
+                    skipped=skipped,
+                    checkpoint=_checkpoint_snapshot(checkpoint),
+                ),
+                operation_counters=index_counters,
+            )
             message = _normalize_source_message(raw_message, copy=copy)
             keep = True
 
@@ -873,7 +1067,37 @@ class SourcePipeline:
                     break
 
             if keep:
+                emitted += 1
+            else:
+                skipped += 1
+
+            last_progress = PipelineProgress(
+                processed=processed,
+                emitted=emitted,
+                skipped=skipped,
+                topic=message["topic"],
+                message_id=message.get("name"),
+                timestamp=float(message["timestamp"]),
+                checkpoint=_checkpoint_snapshot(checkpoint),
+            )
+            _update_checkpoint(checkpoint, last_progress, operation_counters=index_counters)
+            _notify_progress(progress_callback, last_progress, progress_interval)
+
+            if keep:
                 yield _copy_source_message(message) if copy else message
+
+        done_progress = PipelineProgress(
+            processed=max(processed, resume_processed),
+            emitted=emitted,
+            skipped=skipped,
+            topic=None if last_progress is None else last_progress.topic,
+            message_id=None if last_progress is None else last_progress.message_id,
+            timestamp=None if last_progress is None else last_progress.timestamp,
+            done=True,
+            checkpoint=_checkpoint_snapshot(checkpoint),
+        )
+        _update_checkpoint(checkpoint, done_progress, operation_counters=index_counters)
+        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def to_buffer(
         self,
@@ -882,11 +1106,21 @@ class SourcePipeline:
         use_db: bool = False,
         axis: str | None = None,
         buffer=None,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
     ):
         """Stream processed messages into a `DataBuffer`."""
 
         if buffer is not None:
-            return self._append_to_buffer(buffer)
+            return self._append_to_buffer(
+                buffer,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+            )
 
         if not self.topics:
             raise ValueError("source pipeline has no topics")
@@ -896,7 +1130,13 @@ class SourcePipeline:
         from ..buffer import DataBuffer
 
         selected_axis = axis if axis is not None else self.topics[0]
-        pipeline_source = _PipelineSource(self)
+        pipeline_source = _PipelineSource(
+            self,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        )
         result = DataBuffer(
             data_source=pipeline_source,
             buffer_depth=buffer_depth,
@@ -906,7 +1146,11 @@ class SourcePipeline:
             use_db=use_db,
             preload=0,
         )
-        result.load_data_db(selected_axis)
+        try:
+            result.load_data_db(selected_axis)
+        except PipelineCancelled:
+            result.close(closed=False)
+            raise
         return result
 
     def write_to_buffer(self, buffer=None, **kwargs):
@@ -919,10 +1163,23 @@ class SourcePipeline:
         data_uri: str,
         buffer_depth: int = 1,
         axis: str | None = None,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
     ):
         """Stream processed messages into a TileDB-backed `DataBuffer`."""
 
-        return self.to_buffer(buffer_depth=buffer_depth, data_uri=data_uri, use_db=True, axis=axis)
+        return self.to_buffer(
+            buffer_depth=buffer_depth,
+            data_uri=data_uri,
+            use_db=True,
+            axis=axis,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+            checkpoint=checkpoint,
+            progress_interval=progress_interval,
+        )
 
     def _with_operation(self, kind: str, *args, topics: Iterable[str] | None = None, **kwargs) -> "SourcePipeline":
         return SourcePipeline(
@@ -941,16 +1198,34 @@ class SourcePipeline:
         for topic in topics:
             self._topic_capacity(topic)
 
-    def _append_to_buffer(self, buffer):
-        for message in self.iter_messages(copy=True):
-            topic = message["topic"]
-            if topic not in buffer.topics:
-                buffer.topics.append(topic)
-            if hasattr(buffer.buffer_impl, "topics") and topic not in buffer.buffer_impl.topics:
-                buffer.buffer_impl.topics.append(topic)
+    def _append_to_buffer(
+        self,
+        buffer,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ):
+        try:
+            for message in self.iter_messages(
+                copy=True,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+            ):
+                topic = message["topic"]
+                if topic not in buffer.topics:
+                    buffer.topics.append(topic)
+                if hasattr(buffer.buffer_impl, "topics") and topic not in buffer.buffer_impl.topics:
+                    buffer.buffer_impl.topics.append(topic)
+                if getattr(buffer, "use_db", False):
+                    self._prepare_tiledb_append(buffer, message)
+                buffer.append_buffer(message)
+        except PipelineCancelled:
             if getattr(buffer, "use_db", False):
-                self._prepare_tiledb_append(buffer, message)
-            buffer.append_buffer(message)
+                buffer.close(closed=False)
+            raise
 
         if getattr(buffer, "use_db", False):
             for topic in buffer.topics:
@@ -974,8 +1249,19 @@ def source_pipeline(data_source, topics: Iterable[str] | None = None) -> SourceP
 
 
 class _PipelineSource:
-    def __init__(self, pipeline: SourcePipeline):
+    def __init__(
+        self,
+        pipeline: SourcePipeline,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+    ):
         self.pipeline = pipeline
+        self.progress_callback = progress_callback
+        self.cancel_token = cancel_token
+        self.checkpoint = checkpoint
+        self.progress_interval = progress_interval
 
     def get_topics(self):
         return list(self.pipeline.topics)
@@ -984,7 +1270,13 @@ class _PipelineSource:
         return max(self.pipeline._topic_capacity(topic), 1)
 
     def get_message(self):
-        yield from self.pipeline.iter_messages(copy=True)
+        yield from self.pipeline.iter_messages(
+            copy=True,
+            progress_callback=self.progress_callback,
+            cancel_token=self.cancel_token,
+            checkpoint=self.checkpoint,
+            progress_interval=self.progress_interval,
+        )
 
 
 def dataset_query(topics: Mapping[str, TopicPipeline | dict | np.ndarray | TopicView]) -> DatasetQuery:
@@ -1177,6 +1469,149 @@ def _mapped_source_message(previous: Mapping[str, Any], mapped, copy: bool) -> d
     data = np.asarray(mapped)
     result["data"] = data.copy() if copy else data
     return result
+
+
+def _validated_progress_interval(progress_interval: int) -> int:
+    progress_interval = int(progress_interval)
+    if progress_interval < 1:
+        raise ValueError("progress_interval must be at least 1")
+    return progress_interval
+
+
+def _checkpoint_processed(checkpoint: Mapping[str, Any] | None) -> int:
+    return 0 if checkpoint is None else int(checkpoint.get("processed", 0))
+
+
+def _checkpoint_emitted(checkpoint: Mapping[str, Any] | None) -> int:
+    return 0 if checkpoint is None else int(checkpoint.get("emitted", 0))
+
+
+def _checkpoint_skipped(checkpoint: Mapping[str, Any] | None) -> int:
+    return 0 if checkpoint is None else int(checkpoint.get("skipped", 0))
+
+
+def _checkpoint_operation_counters(
+    checkpoint: Mapping[str, Any] | None,
+    count: int,
+    kind: str,
+):
+    if checkpoint is None:
+        saved = None
+    else:
+        saved = checkpoint.get("operation_counters")
+    if kind == "source":
+        counters = [dict() for _ in range(count)]
+        if isinstance(saved, list):
+            for index, values in enumerate(saved[:count]):
+                if isinstance(values, Mapping):
+                    counters[index] = {str(key): int(value) for key, value in values.items()}
+        return counters
+
+    counters = [0] * count
+    if isinstance(saved, list):
+        for index, value in enumerate(saved[:count]):
+            try:
+                counters[index] = int(value)
+            except (TypeError, ValueError):
+                counters[index] = 0
+    return counters
+
+
+def _checkpoint_snapshot(checkpoint: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if checkpoint is None:
+        return None
+    snapshot = dict(checkpoint)
+    operation_counters = snapshot.get("operation_counters")
+    if isinstance(operation_counters, list):
+        snapshot["operation_counters"] = [
+            dict(counter) if isinstance(counter, Mapping) else counter
+            for counter in operation_counters
+        ]
+    return snapshot
+
+
+def _operation_counters_snapshot(operation_counters):
+    snapshot = []
+    for counter in operation_counters:
+        snapshot.append(dict(counter) if isinstance(counter, Mapping) else int(counter))
+    return snapshot
+
+
+def _update_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    progress: PipelineProgress,
+    operation_counters=None,
+) -> None:
+    if checkpoint is None:
+        return
+    checkpoint.update({
+        "processed": int(progress.processed),
+        "emitted": int(progress.emitted),
+        "skipped": int(progress.skipped),
+        "topic": progress.topic,
+        "message_id": progress.message_id,
+        "timestamp": progress.timestamp,
+        "done": bool(progress.done),
+        "cancelled": bool(progress.cancelled),
+    })
+    if operation_counters is not None:
+        checkpoint["operation_counters"] = _operation_counters_snapshot(operation_counters)
+
+
+def _notify_progress(
+    progress_callback: Callable[[PipelineProgress], Any] | None,
+    progress: PipelineProgress,
+    progress_interval: int,
+    force: bool = False,
+) -> None:
+    if progress_callback is None:
+        return
+    if force or progress.done or progress.cancelled or progress.processed % progress_interval == 0:
+        progress_callback(progress)
+
+
+def _cancel_requested(cancel_token: Any | None) -> bool:
+    if cancel_token is None:
+        return False
+    if isinstance(cancel_token, CancellationToken):
+        return cancel_token.cancelled
+
+    cancelled = getattr(cancel_token, "cancelled", None)
+    if callable(cancelled):
+        return bool(cancelled())
+    if cancelled is not None:
+        return bool(cancelled)
+
+    is_cancelled = getattr(cancel_token, "is_cancelled", None)
+    if callable(is_cancelled):
+        return bool(is_cancelled())
+
+    if callable(cancel_token):
+        return bool(cancel_token())
+    return bool(cancel_token)
+
+
+def _raise_if_cancelled(
+    cancel_token: Any | None,
+    checkpoint: dict[str, Any] | None,
+    progress: PipelineProgress,
+    operation_counters=None,
+) -> None:
+    if not _cancel_requested(cancel_token):
+        return
+    cancelled_progress = PipelineProgress(
+        processed=progress.processed,
+        emitted=progress.emitted,
+        skipped=progress.skipped,
+        topic=progress.topic,
+        message_id=progress.message_id,
+        timestamp=progress.timestamp,
+        done=False,
+        cancelled=True,
+        checkpoint=_checkpoint_snapshot(checkpoint),
+    )
+    _update_checkpoint(checkpoint, cancelled_progress, operation_counters=operation_counters)
+    raise PipelineCancelled("pipeline execution cancelled")
 
 
 def topic_parts(topic_data: dict | np.ndarray | TopicView) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:

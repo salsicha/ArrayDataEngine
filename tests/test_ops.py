@@ -20,6 +20,7 @@ from ade.ops import (
     CameraModel,
     camera_matrix,
     camera_model,
+    CancellationToken,
     cluster_dbscan,
     close_mask,
     connected_components,
@@ -112,6 +113,8 @@ from ade.ops import (
     pad_image,
     pad_images,
     pixels_to_normalized_points,
+    PipelineCancelled,
+    PipelineProgress,
     points_to_depth_image,
     point_to_plane_icp,
     point_to_point_icp,
@@ -537,6 +540,68 @@ def test_source_pipeline_streams_to_data_buffer_and_tiledb(tmp_path):
         assert np.allclose(persisted["data"], np.array([[12.0]]))
     finally:
         reopened.close()
+
+
+def test_pipeline_progress_cancellation_and_checkpoint_resume():
+    topic_events = []
+    topic_checkpoint = {}
+    topic_rows = list(
+        topic_pipeline(_topic(), topic="/points")
+        .filter(lambda data: data[0] >= 1.0)
+        .iter_rows(
+            chunk_size=2,
+            progress_callback=topic_events.append,
+            checkpoint=topic_checkpoint,
+            progress_interval=2,
+        )
+    )
+    assert [row["id"] for row in topic_rows] == ["b", "c", "d"]
+    assert isinstance(topic_events[-1], PipelineProgress)
+    assert topic_events[-1].done is True
+    assert topic_checkpoint["processed"] == 4
+    assert topic_checkpoint["emitted"] == 3
+    assert topic_checkpoint["skipped"] == 1
+    assert topic_checkpoint["done"] is True
+
+    resumed_topic_checkpoint = {"processed": 2, "emitted": 2, "skipped": 0}
+    resumed_rows = list(topic_pipeline(_topic(), topic="/points").iter_rows(checkpoint=resumed_topic_checkpoint))
+    assert [row["id"] for row in resumed_rows] == ["c", "d"]
+    assert resumed_topic_checkpoint["processed"] == 4
+    assert resumed_topic_checkpoint["emitted"] == 4
+    assert resumed_topic_checkpoint["done"] is True
+
+    cancel_token = CancellationToken()
+    source_checkpoint = {}
+    source_events = []
+
+    def cancel_after_two(progress):
+        source_events.append(progress)
+        if progress.processed == 2 and not progress.done:
+            cancel_token.cancel()
+
+    try:
+        list(
+            source_pipeline(_SmallSource()).iter_messages(
+                progress_callback=cancel_after_two,
+                cancel_token=cancel_token,
+                checkpoint=source_checkpoint,
+            )
+        )
+    except PipelineCancelled:
+        pass
+    else:
+        raise AssertionError("source pipeline should raise when cancellation is requested")
+
+    assert source_checkpoint["processed"] == 2
+    assert source_checkpoint["emitted"] == 2
+    assert source_checkpoint["cancelled"] is True
+
+    cancel_token.reset()
+    resumed = list(source_pipeline(_SmallSource()).iter_messages(checkpoint=source_checkpoint))
+    assert [message["name"] for message in resumed] == ["frame_2"]
+    assert source_checkpoint["processed"] == 3
+    assert source_checkpoint["emitted"] == 3
+    assert source_checkpoint["done"] is True
 
 
 def test_geometry_and_point_cloud_operations():

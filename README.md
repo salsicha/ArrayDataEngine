@@ -387,13 +387,21 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist directly to TileDB.
+Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist directly to TileDB. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row.
 
 ```python
-from ade.ops import source_pipeline, voxel_downsample
+import json
+
+from ade.ops import CancellationToken, PipelineCancelled, source_pipeline, voxel_downsample
 from ade.source import DataSources
 
 source = DataSources("/data/rosbag2/split_recording/")
+checkpoint = {}
+tiledb_checkpoint = {}
+cancel_token = CancellationToken()
+
+def report(progress):
+    print(progress.processed, progress.emitted, progress.topic)
 
 pipeline = (
     source_pipeline(source)
@@ -403,13 +411,24 @@ pipeline = (
     .filter(lambda msg: msg["data"].shape[0] > 0)
 )
 
-rolling_buffer = pipeline.to_buffer(buffer_depth=128)
-tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/")
+try:
+    rolling_buffer = pipeline.to_buffer(
+        buffer_depth=128,
+        progress_callback=report,
+        cancel_token=cancel_token,
+        checkpoint=checkpoint,
+        progress_interval=100,
+    )
+except PipelineCancelled:
+    with open("filtered_points.checkpoint.json", "w") as checkpoint_file:
+        json.dump(checkpoint, checkpoint_file)
+
+tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/", checkpoint=tiledb_checkpoint)
 ```
 
 TileDB persistence uses `source.get_count(topic)` to size the destination arrays, then records the actual filtered message count as metadata.
 
-Initial operation coverage includes source-level streaming pipelines, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 
