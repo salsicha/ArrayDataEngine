@@ -41,6 +41,8 @@ from ade.ops import (
     curvature_descriptors,
     dataset_query,
     dead_reckon_trajectory,
+    dem_to_mesh,
+    dem_to_point_cloud,
     dem_grid_to_points,
     depth_to_normals,
     depth_to_point_grid,
@@ -141,6 +143,9 @@ from ade.ops import (
     rgbd_to_points,
     rgb_to_gray,
     rotate_vectors_by_quaternion,
+    roughness_map,
+    sample_elevation,
+    sample_elevation_at_navsat,
     sample_grid,
     sample_image_at_pixels,
     sample_image_at_points,
@@ -158,6 +163,10 @@ from ade.ops import (
     smooth_trajectory,
     slope_aspect,
     statistical_outlier_filter,
+    terrain_gradients,
+    terrain_normals,
+    terrain_patch,
+    terrain_patch_at_navsat,
     threshold_image,
     TopicPipeline,
     TopicView,
@@ -172,6 +181,7 @@ from ade.ops import (
     transform_vectors,
     trajectory_quality_mask,
     trajectory_speed,
+    traversability_map,
     uniform_downsample,
     undistort_normalized_points,
     undistort_pixels,
@@ -1697,3 +1707,53 @@ def test_dem_raster_operations():
 
     samples = sample_grid(mosaic, np.array([0.5]), np.array([0.5]))
     assert np.allclose(samples, np.array([2.5]))
+    edge_samples = sample_grid(mosaic, np.array([-1.0, 9.0]), np.array([-1.0, 9.0]))
+    assert np.allclose(edge_samples, np.array([1.0, 8.0]))
+
+    dz_dx, dz_dy = terrain_gradients(elevation, resolution=1.0)
+    assert np.allclose(dz_dx, np.ones_like(elevation))
+    assert np.allclose(dz_dy, np.zeros_like(elevation))
+
+    normals = terrain_normals(elevation, resolution=1.0)
+    expected_normal = np.array([-1.0, 0.0, 1.0]) / np.sqrt(2.0)
+    assert np.allclose(normals[1, 1], expected_normal)
+
+    flat = np.ones((3, 3), dtype=np.float64)
+    assert np.allclose(roughness_map(flat), np.zeros((3, 3)))
+    traversable = traversability_map(flat, max_slope_degrees=20.0, max_roughness=0.1)
+    assert np.allclose(traversable, np.ones((3, 3)))
+
+    steep = np.array([[0.0, 10.0], [0.0, 10.0]])
+    steep_score, steep_mask = traversability_map(steep, max_slope_degrees=10.0, return_mask=True)
+    assert np.all(steep_score < 0.1)
+    assert not steep_mask.any()
+
+    sampled_elevation = sample_elevation(elevation, np.array([1.5]), np.array([1.0]))
+    assert np.allclose(sampled_elevation, np.array([1.5]))
+
+    ref_lat, ref_lon, ref_alt = 37.0, -122.0, 10.0
+    navsat = enu_to_navsat(np.array([1.0, 1.0, 0.0]), ref_lat, ref_lon, ref_alt)
+    assert np.allclose(sample_elevation_at_navsat(elevation, navsat, ref_lat, ref_lon, ref_alt), 1.0)
+
+    patch, patch_origin = terrain_patch(elevation, center=(1.0, 1.0), size=3, return_origin=True)
+    assert np.allclose(patch, elevation)
+    assert patch_origin == (0.0, 0.0)
+
+    edge_patch = terrain_patch(elevation, center=(0.0, 0.0), size=3)
+    assert np.isnan(edge_patch[0, 0])
+    assert np.allclose(edge_patch[1:, 1:], elevation[:2, :2])
+
+    nav_patch = terrain_patch_at_navsat(elevation, navsat, ref_lat, ref_lon, ref_alt, size=1)
+    assert np.allclose(nav_patch, np.array([[1.0]]))
+
+    points = dem_to_point_cloud(np.array([[1.0, np.nan], [3.0, 4.0]]), resolution=2.0, origin=(10.0, 20.0))
+    assert points.shape == (3, 3)
+    assert np.allclose(points[0], np.array([10.0, 20.0, 1.0]))
+
+    mesh = dem_to_mesh(np.array([[1.0, 2.0], [3.0, 4.0]]), resolution=2.0, origin=(10.0, 20.0))
+    assert mesh["vertices"].shape == (4, 3)
+    assert mesh["faces"].tolist() == [[0, 2, 1], [1, 2, 3]]
+
+    empty_mesh = dem_to_mesh(np.array([[1.0, np.nan], [3.0, 4.0]]))
+    assert empty_mesh["vertices"].shape == (0, 3)
+    assert empty_mesh["faces"].shape == (0, 3)

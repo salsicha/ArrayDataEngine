@@ -11,7 +11,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 1. [x] P0 - Finish navigation quality: covariance propagation plus quality/status masks.
 2. [x] P0 - Add operation pipelines that stream directly from `DataSources`, write to `DataBuffer`, and persist to TileDB without materializing full topics.
 3. [x] P1 - Add progress reporting, cancellation, and resumable operation checkpoints for long source and topic pipelines.
-4. [ ] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
+4. [x] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
 5. [ ] P2 - Add optional parallel execution for independent chunks/topics.
 6. [ ] P2 - Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
 7. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
@@ -71,11 +71,11 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 - [ ] Add DEM and raster operations:
   - [ ] Mosaic, crop, reproject, resample, and cache DEM tiles.
   - [x] Add mosaic, crop, bilinear sampling, and nearest sampling helpers.
-  - [ ] Compute slope, aspect, hillshade, normals, gradients, roughness, and traversability maps.
+  - [x] Compute slope, aspect, hillshade, normals, gradients, roughness, and traversability maps.
   - [x] Add slope, aspect, and hillshade helpers.
-  - [ ] Sample elevation at navsat/trajectory points and generate local terrain patches around a vehicle pose.
+  - [x] Sample elevation at navsat/trajectory points and generate local terrain patches around a vehicle pose.
   - [x] Add raster grid sampling helper.
-  - [ ] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
+  - [x] Convert DEM windows to point clouds, meshes, or height grids for fusion with sensor topics.
 - [ ] Add large-array execution features:
   - [x] Add chunked operation execution for buffered topic arrays that do not fit in memory.
   - [x] Add lazy buffered-topic pipelines with explicit `collect()`, `iter_chunks()`, `iter_rows()`, `reduce()`, and sliding-window execution.

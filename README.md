@@ -428,7 +428,7 @@ tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/", check
 
 TileDB persistence uses `source.get_count(topic)` to size the destination arrays, then records the actual filtered message count as metadata.
 
-Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
 
 ## TileDB Persistence
 
@@ -492,6 +492,37 @@ source = DataSources("DEM", bounds=[north, west])
 
 for tile in source.get_message():
     print(tile["name"], tile["data"].shape)
+```
+
+DEM helper functions operate on NumPy windows, so they can be used on individual tiles, cropped patches, or lazy pipeline chunks:
+
+```python
+from ade.ops import (
+    dem_to_mesh,
+    dem_to_point_cloud,
+    roughness_map,
+    sample_elevation,
+    terrain_normals,
+    terrain_patch,
+    traversability_map,
+)
+
+tile = next(source.get_message())
+elevation = tile["data"].astype("float64")
+
+normals = terrain_normals(elevation, resolution=30.0)
+roughness = roughness_map(elevation, window_size=5)
+traversability = traversability_map(
+    elevation,
+    resolution=30.0,
+    max_slope_degrees=25.0,
+    max_roughness=1.0,
+)
+
+vehicle_patch = terrain_patch(elevation, center=(150.0, 240.0), size=(64, 64), resolution=30.0)
+vehicle_elevation = sample_elevation(elevation, x=[150.0], y=[240.0], resolution=30.0)
+terrain_points = dem_to_point_cloud(vehicle_patch, resolution=30.0)
+terrain_mesh = dem_to_mesh(vehicle_patch, resolution=30.0)
 ```
 
 ## Benchmarks
