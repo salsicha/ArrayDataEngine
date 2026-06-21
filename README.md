@@ -329,6 +329,13 @@ small_result = pipeline.collect(chunk_size=32, max_rows=1_000)
 
 `collect()` is intentionally guarded. By default it refuses results above 512 MiB; pass `max_rows`, `max_bytes`, `out=`, or `allow_large=True` when materializing a large bounded result is intentional.
 
+Independent topic chunks can be processed concurrently with `max_workers`. The parallel path preserves output order and requires stateful `index_range()` filters to be placed before row maps/filters so they can be pushed down before chunks are scheduled.
+
+```python
+for chunk in pipeline.iter_chunks(chunk_size=32, max_workers=4):
+    process(chunk.data, chunk.timestamps)
+```
+
 Use `DataBuffer.dataset()` when the query spans multiple topics. Topic, timestamp, and message-index constraints are applied before later row filters. On TileDB-backed buffers, leading timestamp and index ranges are pushed down before payload arrays are read.
 
 ```python
@@ -342,6 +349,12 @@ selection = (
 
 for topic, chunk in selection.iter_chunks(chunk_size=64):
     process(topic, chunk.data, chunk.timestamps)
+```
+
+Use `topic_workers` when collecting independent topics concurrently. `max_workers` still controls per-topic chunk workers:
+
+```python
+selected = selection.collect(chunk_size=64, max_workers=2, topic_workers=3, max_rows=30_000)
 ```
 
 Geographic bounds expect latitude/longitude values by default in columns `(0, 1)`, matching NavSat arrays shaped like `[latitude, longitude, altitude]`. Spatial bounds work with XYZ vectors or point arrays and keep a message when any point falls inside the bounds.

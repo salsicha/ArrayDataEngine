@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -304,6 +305,16 @@ class _PipelineOperation:
     kwargs: dict
 
 
+@dataclass(frozen=True)
+class _ProcessedChunk:
+    rows: tuple[tuple[Any, float, np.ndarray], ...]
+    processed: int
+    emitted: int
+    skipped: int
+    message_id: Any | None = None
+    timestamp: float | None = None
+
+
 class TopicPipeline:
     """Lazy operation pipeline for buffered topic arrays."""
 
@@ -381,7 +392,27 @@ class TopicPipeline:
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
+        max_workers: int | None = 1,
     ) -> Iterable[dict]:
+        if _validated_max_workers(max_workers) > 1:
+            for chunk in self.iter_chunks(
+                chunk_size=chunk_size,
+                copy=copy,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+                max_workers=max_workers,
+            ):
+                for _, timestamp, value, message_id in chunk._iter_rows():
+                    yield {
+                        "id": message_id,
+                        "name": message_id,
+                        "ts": float(timestamp),
+                        "data": value.copy() if copy else value,
+                    }
+            return
+
         for message_id, timestamp, value in self._iter_processed_rows(
             chunk_size=chunk_size,
             copy=copy,
@@ -405,20 +436,35 @@ class TopicPipeline:
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
+        max_workers: int | None = 1,
     ) -> Iterable[TopicView]:
         chunk_size = _validated_chunk_size(chunk_size)
+        max_workers = _validated_max_workers(max_workers)
         ids: list[Any] = []
         timestamps: list[float] = []
         values: list[np.ndarray] = []
 
-        for message_id, timestamp, value in self._iter_processed_rows(
-            chunk_size=chunk_size,
-            copy=copy,
-            progress_callback=progress_callback,
-            cancel_token=cancel_token,
-            checkpoint=checkpoint,
-            progress_interval=progress_interval,
-        ):
+        if max_workers == 1:
+            processed_rows = self._iter_processed_rows(
+                chunk_size=chunk_size,
+                copy=copy,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+            )
+        else:
+            processed_rows = self._iter_processed_rows_parallel(
+                chunk_size=chunk_size,
+                copy=copy,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+                max_workers=max_workers,
+            )
+
+        for message_id, timestamp, value in processed_rows:
             ids.append(message_id)
             timestamps.append(timestamp)
             values.append(value.copy() if copy else value)
@@ -476,6 +522,7 @@ class TopicPipeline:
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
+        max_workers: int | None = 1,
     ) -> dict:
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
@@ -492,6 +539,7 @@ class TopicPipeline:
             cancel_token=cancel_token,
             checkpoint=checkpoint,
             progress_interval=progress_interval,
+            max_workers=max_workers,
         ):
             offset += len(chunk)
             collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
@@ -658,6 +706,118 @@ class TopicPipeline:
             checkpoint=_checkpoint_snapshot(checkpoint),
         )
         _update_checkpoint(checkpoint, done_progress, operation_counters=index_counters)
+        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
+
+    def _iter_processed_rows_parallel(
+        self,
+        chunk_size: int,
+        copy: bool,
+        progress_callback: Callable[[PipelineProgress], Any] | None = None,
+        cancel_token: Any | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        progress_interval: int = 1,
+        max_workers: int | None = 1,
+    ):
+        chunk_size = _validated_chunk_size(chunk_size)
+        max_workers = _validated_max_workers(max_workers)
+        _, operations = self._split_pushdown_operations()
+        _validate_parallel_operations(operations)
+
+        resume_processed = _checkpoint_processed(checkpoint)
+        processed = resume_processed
+        emitted = _checkpoint_emitted(checkpoint)
+        skipped = _checkpoint_skipped(checkpoint)
+        progress_interval = _validated_progress_interval(progress_interval)
+        operation_counters = _checkpoint_operation_counters(checkpoint, len(operations), kind="topic")
+        source_seen = 0
+        next_sequence = 0
+        next_yield = 0
+        pending = {}
+        last_progress: PipelineProgress | None = None
+
+        def submit_ready(executor, source_iter):
+            nonlocal next_sequence, source_seen
+            while len(pending) < max_workers * 2:
+                _raise_if_cancelled(
+                    cancel_token,
+                    checkpoint,
+                    PipelineProgress(
+                        processed=processed,
+                        emitted=emitted,
+                        skipped=skipped,
+                        topic=self.metadata.topic,
+                        checkpoint=_checkpoint_snapshot(checkpoint),
+                    ),
+                    operation_counters=operation_counters,
+                )
+                try:
+                    chunk = next(source_iter)
+                except StopIteration:
+                    return
+
+                chunk_length = len(chunk)
+                if source_seen + chunk_length <= resume_processed:
+                    source_seen += chunk_length
+                    continue
+                if source_seen < resume_processed:
+                    chunk = chunk._select(slice(resume_processed - source_seen, None), copy=copy)
+                    source_seen = resume_processed
+
+                source_seen += len(chunk)
+                pending[next_sequence] = executor.submit(
+                    _process_pipeline_chunk,
+                    chunk,
+                    operations,
+                    self.metadata,
+                    copy,
+                )
+                next_sequence += 1
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            source_iter = iter(self._source_chunks(chunk_size=chunk_size, copy=copy))
+            submit_ready(executor, source_iter)
+            while pending:
+                future = pending.pop(next_yield)
+                result = future.result()
+                next_yield += 1
+
+                processed += result.processed
+                emitted += result.emitted
+                skipped += result.skipped
+                last_progress = PipelineProgress(
+                    processed=processed,
+                    emitted=emitted,
+                    skipped=skipped,
+                    topic=self.metadata.topic,
+                    message_id=result.message_id,
+                    timestamp=result.timestamp,
+                    checkpoint=_checkpoint_snapshot(checkpoint),
+                )
+                _update_checkpoint(checkpoint, last_progress, operation_counters=operation_counters)
+                _notify_progress(progress_callback, last_progress, progress_interval)
+                _raise_if_cancelled(
+                    cancel_token,
+                    checkpoint,
+                    last_progress,
+                    operation_counters=operation_counters,
+                )
+
+                for row in result.rows:
+                    yield row
+
+                submit_ready(executor, source_iter)
+
+        done_progress = PipelineProgress(
+            processed=processed,
+            emitted=emitted,
+            skipped=skipped,
+            topic=self.metadata.topic,
+            message_id=None if last_progress is None else last_progress.message_id,
+            timestamp=None if last_progress is None else last_progress.timestamp,
+            done=True,
+            checkpoint=_checkpoint_snapshot(checkpoint),
+        )
+        _update_checkpoint(checkpoint, done_progress, operation_counters=operation_counters)
         _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def _split_pushdown_operations(self) -> tuple[tuple[_PipelineOperation, ...], tuple[_PipelineOperation, ...]]:
@@ -887,14 +1047,24 @@ class DatasetQuery:
     def iter_topics(self) -> Iterable[tuple[str, TopicPipeline]]:
         yield from self._pipelines.items()
 
-    def iter_chunks(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[tuple[str, TopicView]]:
+    def iter_chunks(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = False,
+        max_workers: int | None = 1,
+    ) -> Iterable[tuple[str, TopicView]]:
         for topic, pipeline in self._pipelines.items():
-            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy):
+            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy, max_workers=max_workers):
                 yield topic, chunk
 
-    def iter_rows(self, chunk_size: int = 1024, copy: bool = False) -> Iterable[dict]:
+    def iter_rows(
+        self,
+        chunk_size: int = 1024,
+        copy: bool = False,
+        max_workers: int | None = 1,
+    ) -> Iterable[dict]:
         for topic, pipeline in self._pipelines.items():
-            for row in pipeline.iter_rows(chunk_size=chunk_size, copy=copy):
+            for row in pipeline.iter_rows(chunk_size=chunk_size, copy=copy, max_workers=max_workers):
                 row["topic"] = topic
                 yield row
 
@@ -905,8 +1075,23 @@ class DatasetQuery:
         max_rows: int | None = None,
         max_bytes: int | None = DEFAULT_COLLECT_MAX_BYTES,
         allow_large: bool = False,
+        max_workers: int | None = 1,
+        topic_workers: int | None = 1,
     ) -> dict[str, dict]:
         chunk_size = _validated_chunk_size(chunk_size)
+        max_workers = _validated_max_workers(max_workers)
+        topic_workers = _validated_max_workers(topic_workers)
+        if topic_workers > 1:
+            return self._collect_parallel_topics(
+                chunk_size=chunk_size,
+                copy=copy,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                allow_large=allow_large,
+                max_workers=max_workers,
+                topic_workers=topic_workers,
+            )
+
         collected = {}
         total_rows = 0
         total_bytes = 0
@@ -915,7 +1100,7 @@ class DatasetQuery:
             ids_parts = []
             ts_parts = []
             data_parts = []
-            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy):
+            for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy, max_workers=max_workers):
                 total_rows += len(chunk)
                 total_bytes += _topic_view_nbytes(chunk)
                 _check_collect_limits(total_rows, total_bytes, max_rows, max_bytes, allow_large)
@@ -937,6 +1122,44 @@ class DatasetQuery:
 
     def _map_pipelines(self, fn: Callable[[TopicPipeline], TopicPipeline]) -> "DatasetQuery":
         return DatasetQuery({topic: fn(pipeline) for topic, pipeline in self._pipelines.items()})
+
+    def _collect_parallel_topics(
+        self,
+        chunk_size: int,
+        copy: bool,
+        max_rows: int | None,
+        max_bytes: int | None,
+        allow_large: bool,
+        max_workers: int,
+        topic_workers: int,
+    ) -> dict[str, dict]:
+        collected = {}
+        total_rows = 0
+        total_bytes = 0
+        items = list(self._pipelines.items())
+
+        def collect_topic(item):
+            topic, pipeline = item
+            return topic, pipeline.collect(
+                chunk_size=chunk_size,
+                copy=copy,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                allow_large=allow_large,
+                max_workers=max_workers,
+            )
+
+        with ThreadPoolExecutor(max_workers=topic_workers) as executor:
+            futures = [executor.submit(collect_topic, item) for item in items]
+            for future in futures:
+                topic, result = future.result()
+                rows = int(np.asarray(result["ts"]).shape[0])
+                total_rows += rows
+                total_bytes += _topic_result_nbytes(result)
+                _check_collect_limits(total_rows, total_bytes, max_rows, max_bytes, allow_large)
+                collected[topic] = result
+
+        return collected
 
 
 class SourcePipeline:
@@ -1396,6 +1619,102 @@ def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOpera
     return selected
 
 
+def _process_pipeline_chunk(
+    chunk: TopicView,
+    operations: tuple[_PipelineOperation, ...],
+    metadata: TopicMetadata,
+    copy: bool,
+) -> _ProcessedChunk:
+    rows = []
+    processed = 0
+    emitted = 0
+    skipped = 0
+    last_id = None
+    last_timestamp = None
+    metadata_frame_id = _decode_text(metadata.frame_id)
+
+    for _, timestamp, value, message_id in chunk._iter_rows():
+        processed += 1
+        current_value = value.copy() if copy else value
+        current_timestamp = float(timestamp)
+        current_id = message_id
+        keep = True
+        last_id = current_id
+        last_timestamp = current_timestamp
+
+        for operation in operations:
+            if operation.kind == "map":
+                fn = operation.args[0]
+                op_copy = operation.kwargs.get("copy", True)
+                current_value = _call_with_metadata(
+                    fn,
+                    current_value.copy() if op_copy else current_value,
+                    current_timestamp,
+                    current_id,
+                )
+            elif operation.kind == "filter":
+                predicate = operation.args[0]
+                op_copy = operation.kwargs.get("copy", True)
+                keep = bool(
+                    _call_with_metadata(
+                        predicate,
+                        current_value.copy() if op_copy else current_value,
+                        current_timestamp,
+                        current_id,
+                    )
+                )
+            elif operation.kind == "time_range":
+                start, end = operation.args
+                if operation.kwargs.get("inclusive", True):
+                    keep = current_timestamp >= start and current_timestamp <= end
+                else:
+                    keep = current_timestamp > start and current_timestamp < end
+            elif operation.kind == "frame_id":
+                targets = operation.args[0]
+                if metadata_frame_id is not None:
+                    keep = metadata_frame_id in targets
+                else:
+                    keep = _row_frame_id(current_value, current_id) in targets
+            elif operation.kind == "spatial_bounds":
+                min_bound, max_bound = operation.args
+                keep = _spatial_value_in_bounds(
+                    current_value,
+                    min_bound=min_bound,
+                    max_bound=max_bound,
+                    columns=operation.kwargs["columns"],
+                )
+            elif operation.kind == "index_range":
+                raise ValueError("parallel topic execution does not support non-leading index_range operations")
+            else:
+                raise ValueError(f"unsupported pipeline operation: {operation.kind}")
+
+            if not keep:
+                break
+
+        if keep:
+            emitted += 1
+            rows.append((current_id, current_timestamp, current_value))
+        else:
+            skipped += 1
+
+    return _ProcessedChunk(
+        rows=tuple(rows),
+        processed=processed,
+        emitted=emitted,
+        skipped=skipped,
+        message_id=last_id,
+        timestamp=last_timestamp,
+    )
+
+
+def _validate_parallel_operations(operations: Iterable[_PipelineOperation]) -> None:
+    if any(operation.kind == "index_range" for operation in operations):
+        raise ValueError(
+            "parallel topic execution requires index_range operations to appear before map/filter operations "
+            "so they can be pushed down before chunks are processed"
+        )
+
+
 def _source_topics(data_source, topics: Iterable[str] | None = None) -> list[str]:
     if topics is not None:
         return [str(topic) for topic in topics]
@@ -1832,10 +2151,27 @@ def _validated_chunk_size(chunk_size: int) -> int:
     return chunk_size
 
 
+def _validated_max_workers(max_workers: int | None) -> int:
+    if max_workers is None:
+        return 1
+    max_workers = int(max_workers)
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1")
+    return max_workers
+
+
 def _topic_view_nbytes(view: TopicView, include_data: bool = True) -> int:
     ids_nbytes = 0 if view.ids is None else view.ids.nbytes
     data_nbytes = view.data.nbytes if include_data else 0
     return int(data_nbytes + view.timestamps.nbytes + ids_nbytes)
+
+
+def _topic_result_nbytes(topic: Mapping[str, Any]) -> int:
+    total = np.asarray(topic["ts"]).nbytes + np.asarray(topic["data"]).nbytes
+    ids = topic.get("id", topic.get("name"))
+    if ids is not None:
+        total += np.asarray(ids).nbytes
+    return int(total)
 
 
 def _check_collect_limits(

@@ -334,10 +334,16 @@ def test_topic_pipeline_executes_lazily_and_collects_explicitly():
     assert calls == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
 
     calls.clear()
-    collected = pipeline.collect(chunk_size=2)
+    parallel_chunks = list(pipeline.iter_chunks(chunk_size=1, max_workers=2))
+    assert [chunk.ids.tolist() for chunk in parallel_chunks] == [["c"], ["d"]]
+    assert np.allclose(parallel_chunks[1].data, np.array([[4.5, 4.5]]))
+    assert sorted(calls) == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
+
+    calls.clear()
+    collected = pipeline.collect(chunk_size=2, max_workers=2)
     assert collected["id"].tolist() == ["c", "d"]
     assert np.allclose(collected["data"], np.array([[3.0, 3.0], [4.5, 4.5]]))
-    assert calls == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
+    assert sorted(calls) == [("b", 0.5), ("c", 1.0), ("d", 1.5)]
 
     try:
         topic_pipeline(_topic()).collect(max_rows=2)
@@ -363,6 +369,17 @@ def test_topic_pipeline_executes_lazily_and_collects_explicitly():
 
     rows = list(topic_pipeline(_topic()).index_range(1, 4, 2).iter_rows(chunk_size=2))
     assert [row["id"] for row in rows] == ["b", "d"]
+
+    parallel_rows = list(topic_pipeline(_topic()).map(lambda data: data + 1.0).iter_rows(chunk_size=2, max_workers=2))
+    assert [row["id"] for row in parallel_rows] == ["a", "b", "c", "d"]
+    assert np.allclose(parallel_rows[-1]["data"], np.array([4.0, 4.0]))
+
+    try:
+        list(topic_pipeline(_topic()).map(lambda data: data).index_range(1, 3).iter_chunks(max_workers=2))
+    except ValueError as exc:
+        assert "index_range" in str(exc)
+    else:
+        raise AssertionError("parallel chunk execution should reject non-leading index_range")
 
     reduced = pipeline.reduce(lambda acc, data: acc + data, initial=np.zeros(2), chunk_size=1)
     assert np.allclose(reduced, np.array([7.5, 7.5]))
@@ -426,6 +443,15 @@ def test_dataset_query_selects_topics_time_index_frame_and_bounds():
 
     rows = list(query.select_topics(["/camera"]).iter_rows(chunk_size=1))
     assert [row["topic"] for row in rows] == ["/camera", "/camera"]
+
+    parallel_selected = query.select_topics("/navsat", "/camera").collect(
+        chunk_size=1,
+        max_workers=2,
+        topic_workers=2,
+    )
+    assert list(parallel_selected) == ["/navsat", "/camera"]
+    assert parallel_selected["/navsat"]["id"].tolist() == ["n0", "n1", "n2"]
+    assert parallel_selected["/camera"]["id"].tolist() == ["c0", "c1"]
 
 
 class _SmallSource:
