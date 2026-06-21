@@ -631,16 +631,150 @@ def project_dem_to_image(
     return pixels, valid
 
 
-def crop_bounds(points: np.ndarray, min_bound=None, max_bound=None, return_mask: bool = False):
-    """Select points inside axis-aligned XYZ bounds."""
+def select_mask(values: np.ndarray, mask: np.ndarray, axis: int = 0, copy: bool = True) -> np.ndarray:
+    """Select rows or leading grid cells from an array with a boolean mask."""
+
+    arr = np.asarray(values)
+    keep = np.asarray(mask, dtype=bool)
+    if arr.ndim == 0:
+        raise ValueError("values must have at least one dimension")
+    axis = int(axis)
+    if axis < 0:
+        axis += arr.ndim
+    if axis < 0 or axis >= arr.ndim:
+        raise ValueError("axis is out of bounds for values")
+
+    if axis != 0 and keep.ndim == 1 and keep.shape[0] == arr.shape[axis]:
+        selected = np.compress(keep, arr, axis=axis)
+    elif keep.shape == arr.shape[: keep.ndim]:
+        selected = arr[keep]
+    elif keep.ndim == 1 and arr.ndim > 0 and keep.shape[0] == arr.shape[axis]:
+        selected = np.compress(keep, arr, axis=axis)
+    else:
+        raise ValueError("mask must match leading dimensions or the selected axis length")
+    return selected.copy() if copy else selected
+
+
+def bounds_mask(
+    points: np.ndarray,
+    min_bound=None,
+    max_bound=None,
+    columns: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Return a mask for rows inside axis-aligned bounds."""
+
+    coords, min_array, max_array = _axis_bounds_inputs(points, min_bound, max_bound, columns)
+    return np.logical_and(coords >= min_array, coords <= max_array).all(axis=1)
+
+
+def crop_bounds(
+    points: np.ndarray,
+    min_bound=None,
+    max_bound=None,
+    columns: tuple[int, ...] | None = None,
+    return_mask: bool = False,
+):
+    """Select rows inside axis-aligned coordinate bounds."""
+
+    arr = np.asarray(points)
+    mask = bounds_mask(arr, min_bound=min_bound, max_bound=max_bound, columns=columns)
+    cropped = select_mask(arr, mask)
+    return (cropped, mask) if return_mask else cropped
+
+
+def oriented_bounds_mask(
+    points: np.ndarray,
+    center,
+    extent,
+    rotation: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return a mask for XYZ points inside an oriented bounding box."""
 
     arr = _as_points(points)
-    mask = np.ones(arr.shape[0], dtype=bool)
-    if min_bound is not None:
-        mask &= np.all(arr[:, :3] >= np.asarray(min_bound, dtype=np.float64), axis=1)
-    if max_bound is not None:
-        mask &= np.all(arr[:, :3] <= np.asarray(max_bound, dtype=np.float64), axis=1)
-    cropped = arr[mask].copy()
+    center_array = _vector3(center, "center")
+    extent_array = _vector3(extent, "extent")
+    if np.any(extent_array < 0.0):
+        raise ValueError("extent values must be non-negative")
+
+    if rotation is None:
+        rotation_matrix = np.eye(3, dtype=np.float64)
+    else:
+        rotation_matrix = np.asarray(rotation, dtype=np.float64)
+        if rotation_matrix.shape != (3, 3):
+            raise ValueError("rotation must have shape (3, 3)")
+
+    local = (np.asarray(arr[:, :3], dtype=np.float64) - center_array) @ rotation_matrix
+    half_extent = extent_array / 2.0
+    return np.less_equal(np.abs(local), half_extent).all(axis=1)
+
+
+def crop_oriented_bounds(
+    points: np.ndarray,
+    center,
+    extent,
+    rotation: np.ndarray | None = None,
+    return_mask: bool = False,
+):
+    """Select points inside an oriented bounding box."""
+
+    arr = _as_points(points)
+    mask = oriented_bounds_mask(arr, center=center, extent=extent, rotation=rotation)
+    cropped = select_mask(arr, mask)
+    return (cropped, mask) if return_mask else cropped
+
+
+def geographic_bounds_mask(
+    coordinates: np.ndarray,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+    columns: tuple[int, int] = (0, 1),
+    wrap_longitude: bool = True,
+) -> np.ndarray:
+    """Return a mask for latitude/longitude coordinates inside a geographic box."""
+
+    if min_lat > max_lat:
+        raise ValueError("min_lat must be less than or equal to max_lat")
+    if len(columns) != 2:
+        raise ValueError("columns must contain latitude and longitude column indices")
+
+    coords = _last_axis_columns(coordinates, columns)
+    lat = coords[..., 0]
+    lon = coords[..., 1]
+    lat_mask = np.isfinite(lat) & (lat >= min_lat) & (lat <= max_lat)
+    if min_lon <= max_lon:
+        lon_mask = (lon >= min_lon) & (lon <= max_lon)
+    elif wrap_longitude:
+        lon_mask = (lon >= min_lon) | (lon <= max_lon)
+    else:
+        raise ValueError("min_lon must be less than or equal to max_lon unless wrap_longitude=True")
+    return lat_mask & np.isfinite(lon) & lon_mask
+
+
+def crop_geographic_bounds(
+    coordinates: np.ndarray,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+    columns: tuple[int, int] = (0, 1),
+    wrap_longitude: bool = True,
+    return_mask: bool = False,
+):
+    """Select latitude/longitude rows or grid cells inside a geographic bounding box."""
+
+    arr = np.asarray(coordinates)
+    mask = geographic_bounds_mask(
+        arr,
+        min_lat=min_lat,
+        min_lon=min_lon,
+        max_lat=max_lat,
+        max_lon=max_lon,
+        columns=columns,
+        wrap_longitude=wrap_longitude,
+    )
+    cropped = select_mask(arr, mask)
     return (cropped, mask) if return_mask else cropped
 
 
@@ -681,6 +815,65 @@ def _image_height_width(image_shape: tuple[int, int]) -> tuple[int, int]:
     if height <= 0 or width <= 0:
         raise ValueError("image_shape must contain positive height and width")
     return height, width
+
+
+def _axis_bounds_inputs(points: np.ndarray, min_bound, max_bound, columns: tuple[int, ...] | None):
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError("points must have shape (N, D)")
+
+    if columns is None:
+        if min_bound is not None:
+            dim = int(np.asarray(min_bound).size)
+        elif max_bound is not None:
+            dim = int(np.asarray(max_bound).size)
+        else:
+            dim = min(3, arr.shape[1])
+        columns = tuple(range(dim))
+    else:
+        columns = tuple(int(column) for column in columns)
+        dim = len(columns)
+
+    if dim == 0:
+        raise ValueError("bounds must include at least one dimension")
+    if any(column < 0 or column >= arr.shape[1] for column in columns):
+        raise ValueError("columns must be valid point-array column indices")
+
+    min_array = _optional_bound(min_bound, dim, -np.inf, "min_bound")
+    max_array = _optional_bound(max_bound, dim, np.inf, "max_bound")
+    if np.any(min_array > max_array):
+        raise ValueError("min_bound must be less than or equal to max_bound")
+
+    return arr[:, columns], min_array, max_array
+
+
+def _optional_bound(bound, dim: int, fill_value: float, name: str) -> np.ndarray:
+    if bound is None:
+        return np.full(dim, fill_value, dtype=np.float64)
+    array = np.asarray(bound, dtype=np.float64)
+    if array.ndim == 0 and dim == 1:
+        array = array.reshape(1)
+    if array.ndim != 1 or array.size != dim:
+        raise ValueError(f"{name} must contain {dim} values")
+    return array
+
+
+def _vector3(values, name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (3,):
+        raise ValueError(f"{name} must have shape (3,)")
+    return array
+
+
+def _last_axis_columns(values: np.ndarray, columns: tuple[int, ...]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        raise ValueError("coordinates must have at least one dimension")
+    if any(column < 0 for column in columns):
+        raise ValueError("columns must be non-negative")
+    if max(columns) >= arr.shape[-1]:
+        raise ValueError("columns must be valid coordinate-array column indices")
+    return np.take(arr, columns, axis=-1)
 
 
 def _normalize_frame_transform(transform: np.ndarray, timestamps: np.ndarray | None):

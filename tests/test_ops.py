@@ -7,10 +7,13 @@ from ade.ops import (
     align_nearest,
     align_topic,
     apply_transform,
+    bounds_mask,
     camera_matrix,
     cluster_dbscan,
     colorize_points,
     crop_bounds,
+    crop_geographic_bounds,
+    crop_oriented_bounds,
     crop_raster,
     dataset_query,
     dem_grid_to_points,
@@ -20,6 +23,7 @@ from ade.ops import (
     estimate_normals,
     filter_topic,
     FrameGraph,
+    geographic_bounds_mask,
     hillshade,
     imu_to_trajectory,
     interpolate_timeseries,
@@ -32,6 +36,7 @@ from ade.ops import (
     normalize_image,
     normalize_quaternion,
     odometry_to_trajectory,
+    oriented_bounds_mask,
     pad_image,
     points_to_depth_image,
     project_dem_to_image,
@@ -48,6 +53,7 @@ from ade.ops import (
     sample_image_at_points,
     segment_plane,
     select_indices,
+    select_mask,
     select_time_range,
     sensor_to_trajectory,
     slerp,
@@ -405,6 +411,45 @@ def test_geometry_and_point_cloud_operations():
     assert cropped.shape == (4, 3)
     assert mask.tolist() == [True, True, True, True, False]
 
+    xy_mask = bounds_mask(points, min_bound=[0.0, 0.0], max_bound=[1.0, 1.0], columns=(0, 1))
+    assert xy_mask.tolist() == [True, True, True, False, False]
+
+    selected_rows = select_mask(points, np.array([True, False, True, False, False]))
+    assert np.allclose(selected_rows, np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]))
+
+    image = np.arange(12).reshape(2, 2, 3)
+    selected_pixels = select_mask(image, np.array([[True, False], [False, True]]))
+    assert np.allclose(selected_pixels, np.array([[0, 1, 2], [9, 10, 11]]))
+
+    theta = np.pi / 4.0
+    rotation = np.array([
+        [np.cos(theta), -np.sin(theta), 0.0],
+        [np.sin(theta), np.cos(theta), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    local_points = np.array([
+        [0.0, 0.0, 0.0],
+        [0.9, 0.4, 0.0],
+        [1.1, 0.0, 0.0],
+        [0.0, 0.6, 0.0],
+        [0.0, 0.0, 0.6],
+    ])
+    oriented_points = local_points @ rotation.T
+    oriented_mask = oriented_bounds_mask(
+        oriented_points,
+        center=[0.0, 0.0, 0.0],
+        extent=[2.0, 1.0, 1.0],
+        rotation=rotation,
+    )
+    assert oriented_mask.tolist() == [True, True, False, False, False]
+    oriented_crop = crop_oriented_bounds(
+        oriented_points,
+        center=[0.0, 0.0, 0.0],
+        extent=[2.0, 1.0, 1.0],
+        rotation=rotation,
+    )
+    assert np.allclose(oriented_crop, oriented_points[:2])
+
     downsampled = voxel_downsample(points[:4], voxel_size=0.5)
     assert downsampled.shape == (2, 3)
     assert np.allclose(downsampled, np.array([[0.05, 0.0, 0.0], [1.05, 1.0, 0.0]]))
@@ -430,6 +475,34 @@ def test_geometry_and_point_cloud_operations():
     plane, inliers = segment_plane(points[:4], distance_threshold=1.0e-6, iterations=10, seed=1)
     assert np.isclose(abs(plane[2]), 1.0)
     assert inliers.all()
+
+
+def test_geographic_crop_and_bounds_masks():
+    navsat = np.array([
+        [37.0, -122.0, 10.0],
+        [36.8, -122.0, 11.0],
+        [37.1, -121.8, 12.0],
+        [37.0, 170.0, 0.0],
+        [37.0, -175.0, 0.0],
+        [np.nan, -122.0, 0.0],
+    ])
+
+    mask = geographic_bounds_mask(navsat, min_lat=36.9, min_lon=-122.2, max_lat=37.2, max_lon=-121.9)
+    assert mask.tolist() == [True, False, False, False, False, False]
+
+    cropped, returned_mask = crop_geographic_bounds(
+        navsat,
+        min_lat=36.9,
+        min_lon=-122.2,
+        max_lat=37.2,
+        max_lon=-121.9,
+        return_mask=True,
+    )
+    assert np.allclose(cropped, np.array([[37.0, -122.0, 10.0]]))
+    assert returned_mask.tolist() == mask.tolist()
+
+    wrapped = crop_geographic_bounds(navsat, min_lat=36.0, min_lon=170.0, max_lat=38.0, max_lon=-170.0)
+    assert np.allclose(wrapped, np.array([[37.0, 170.0, 0.0], [37.0, -175.0, 0.0]]))
 
 
 def test_coordinate_frame_transforms_for_poses_navsat_odometry_and_dem():

@@ -196,6 +196,17 @@ rendered_depth = points_to_depth_image(points_in_camera, image_shape=rgb_image.s
 dem_pixels, dem_mask = project_dem_to_image(elevation, fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2])
 ```
 
+Crop/select helpers cover row masks, axis-aligned bounds, oriented 3D bounds, and geographic bounding boxes.
+
+```python
+from ade.ops import crop_bounds, crop_geographic_bounds, crop_oriented_bounds, select_mask
+
+valid_points = select_mask(points, valid_mask)
+nearby_points = crop_bounds(points, min_bound=[-10, -10, -2], max_bound=[10, 10, 3])
+vehicle_box = crop_oriented_bounds(points, center=pose_xyz, extent=[8.0, 4.0, 3.0], rotation=pose_rotation)
+gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, max_lat=37.8, max_lon=-121.7)
+```
+
 IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity.
 
 ```python
@@ -286,7 +297,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 
