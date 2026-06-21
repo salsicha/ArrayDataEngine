@@ -258,19 +258,53 @@ vehicle_box = crop_oriented_bounds(points, center=pose_xyz, extent=[8.0, 4.0, 3.
 gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, max_lat=37.8, max_lon=-121.7)
 ```
 
-IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields.
+IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing.
 
 ```python
-from ade.ops import imu_to_trajectory, navsat_to_trajectory, odometry_to_trajectory, resample_imu, resample_navsat, resample_odometry, resample_trajectory
+from ade.ops import (
+    compensate_imu_gravity,
+    correct_imu_bias,
+    add_trajectory_quality_mask,
+    dead_reckon_trajectory,
+    differentiate_trajectory,
+    euler_to_quaternion,
+    imu_to_trajectory,
+    integrate_trajectory,
+    local_to_navsat,
+    mask_trajectory,
+    navsat_to_local,
+    navsat_to_trajectory,
+    odometry_to_trajectory,
+    quaternion_to_euler,
+    resample_imu,
+    resample_navsat,
+    resample_odometry,
+    resample_trajectory,
+    smooth_trajectory,
+    propagate_trajectory_covariance,
+)
 
-imu_traj = imu_to_trajectory(window["/imu"])
+corrected_imu = correct_imu_bias(compensate_imu_gravity(window["/imu"]), sample_slice=slice(0, 50))
+imu_traj = imu_to_trajectory(corrected_imu)
 odom_traj = odometry_to_trajectory(window["/odom"])
 gps_traj = navsat_to_trajectory(window["/gps"], ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+gps_ned, gps_ref = navsat_to_local(window["/gps"], frame="ned", return_reference=True)
+gps_roundtrip = local_to_navsat(gps_ned, gps_ref["lat"], gps_ref["lon"], gps_ref["alt"], frame=gps_ref["frame"])
+orientation = euler_to_quaternion(roll=0.0, pitch=0.0, yaw=1.57)
+roll_pitch_yaw = quaternion_to_euler(odom_traj["orientation"])
 
 odom_50hz = resample_trajectory(odom_traj, period=0.02)
 imu_at_image_times = resample_imu(window["/imu"], target_timestamps=image_timestamps)
 odom_at_image_times = resample_odometry(window["/odom"], target_timestamps=image_timestamps)
 gps_at_image_times = resample_navsat(window["/gps"], target_timestamps=image_timestamps, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+
+smoothed_odom = smooth_trajectory(odom_50hz, window_size=5)
+derived_odom = differentiate_trajectory(smoothed_odom)
+integrated_odom = integrate_trajectory(derived_odom, initial_position=odom_traj["position"][0])
+dead_reckoned = dead_reckon_trajectory(odom_at_image_times, initial_position=odom_traj["position"][0])
+covar_odom = propagate_trajectory_covariance(dead_reckoned, process_noise={"position": [0.02, 0.02, 0.05]})
+quality_odom = add_trajectory_quality_mask(covar_odom, covariance_limits={"position": [1.0, 1.0, 2.0]})
+trusted_odom = mask_trajectory(quality_odom, quality_odom["quality_mask"], drop=True)
 ```
 
 For large datasets, use the lazy topic pipeline. It records operations and only executes them when chunks, rows, reductions, windows, or explicit collection are requested.
@@ -353,7 +387,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU conversion, quaternion interpolation, trajectory resampling, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 

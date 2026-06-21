@@ -11,6 +11,8 @@ from ade.ops import (
     align_images,
     align_nearest,
     align_topic,
+    angular_velocity_from_quaternions,
+    add_trajectory_quality_mask,
     apply_image_mask,
     apply_transform,
     backproject_pixels,
@@ -24,6 +26,10 @@ from ade.ops import (
     convert_color,
     convert_image_dtype,
     colorize_points,
+    compensate_gravity,
+    compensate_imu_gravity,
+    correct_bias,
+    correct_imu_bias,
     crop_camera_matrix,
     crop_bounds,
     crop_geographic_bounds,
@@ -33,18 +39,24 @@ from ade.ops import (
     crop_raster,
     curvature_descriptors,
     dataset_query,
+    dead_reckon_trajectory,
     dem_grid_to_points,
     depth_to_normals,
     depth_to_point_grid,
     depth_to_points,
     DatasetQuery,
+    differentiate_timeseries,
+    differentiate_trajectory,
     dilate_mask,
     distort_normalized_points,
     distort_pixels,
     enu_to_navsat,
+    enu_to_ned,
     erode_mask,
+    estimate_bias,
     estimate_image_shift,
     estimate_normals,
+    euler_to_quaternion,
     farthest_point_downsample,
     filter_topic,
     FrameGraph,
@@ -66,18 +78,27 @@ from ade.ops import (
     interpolate_quaternions,
     interpolate_timeseries,
     interpolate_trajectory,
+    integrate_orientations,
+    integrate_timeseries,
+    integrate_trajectory,
     iter_chunks,
     knn_search,
     local_covariances,
     local_mean,
     local_statistics,
     local_std,
+    local_to_navsat,
     map_topic,
+    mask_trajectory,
     mosaic_tiles,
     motion_compensated_rolling_windows,
     multi_scale_icp,
     navsat_to_enu,
+    navsat_to_local,
+    navsat_to_ned,
     navsat_to_trajectory,
+    ned_to_enu,
+    ned_to_navsat,
     nearest_neighbor_distance_stats,
     nearest_neighbor_distances,
     normalized_points_to_pixels,
@@ -94,6 +115,9 @@ from ade.ops import (
     points_to_depth_image,
     point_to_plane_icp,
     point_to_point_icp,
+    propagate_trajectory_covariance,
+    quaternion_to_euler,
+    quaternion_to_rotation_matrix,
     project_camera_points,
     project_dem_to_image,
     project_points_to_image,
@@ -113,6 +137,7 @@ from ade.ops import (
     resize_nearest,
     rgbd_to_points,
     rgb_to_gray,
+    rotate_vectors_by_quaternion,
     sample_grid,
     sample_image_at_pixels,
     sample_image_at_points,
@@ -124,6 +149,8 @@ from ade.ops import (
     select_time_range,
     sensor_to_trajectory,
     slerp,
+    smooth_timeseries,
+    smooth_trajectory,
     slope_aspect,
     statistical_outlier_filter,
     threshold_image,
@@ -138,6 +165,7 @@ from ade.ops import (
     transform_odometry,
     transform_poses,
     transform_vectors,
+    trajectory_quality_mask,
     trajectory_speed,
     uniform_downsample,
     undistort_normalized_points,
@@ -1240,6 +1268,26 @@ def test_navigation_operations():
     assert np.isclose(np.linalg.norm(halfway), 1.0)
     assert np.allclose(abs(halfway[2]), np.sqrt(0.5))
 
+    euler = np.array([0.1, -0.2, 0.3])
+    quaternion = euler_to_quaternion(euler)
+    assert np.allclose(quaternion_to_euler(quaternion), euler)
+    yaw_quaternion = euler_to_quaternion(0.0, 0.0, 90.0, degrees=True)
+    rotated = rotate_vectors_by_quaternion(np.array([1.0, 0.0, 0.0]), yaw_quaternion)
+    assert np.allclose(rotated, np.array([0.0, 1.0, 0.0]), atol=1e-12)
+    rotation = quaternion_to_rotation_matrix(yaw_quaternion)
+    assert np.allclose(rotation @ np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), atol=1e-12)
+
+    stationary_accel = np.array([[0.0, 0.0, 9.80665]])
+    compensated = compensate_gravity(stationary_accel, np.array([[0.0, 0.0, 0.0, 1.0]]))
+    assert np.allclose(compensated, np.zeros((1, 3)))
+
+    biased = np.array([[2.0, 3.0, 4.0], [4.0, 5.0, 6.0]])
+    bias = estimate_bias(biased, axis=0)
+    assert np.allclose(bias, np.array([3.0, 4.0, 5.0]))
+    corrected, returned_bias = correct_bias(biased, return_bias=True)
+    assert np.allclose(returned_bias, bias)
+    assert np.allclose(corrected, np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]))
+
     interp = interpolate_timeseries(
         np.array([0.0, 1.0, 2.0]),
         np.array([[0.0, 0.0], [10.0, 20.0], [20.0, 40.0]]),
@@ -1250,6 +1298,26 @@ def test_navigation_operations():
     enu = navsat_to_enu(np.array([37.0001]), np.array([-122.0001]), np.array([12.0]), 37.0, -122.0, 10.0)
     llh = enu_to_navsat(enu, 37.0, -122.0, 10.0)
     assert np.allclose(llh, np.array([[37.0001, -122.0001, 12.0]]))
+
+    navsat_samples = np.array([
+        [37.0, -122.0, 10.0],
+        [
+            37.0 + np.rad2deg(20.0 / 6378137.0),
+            -122.0 + np.rad2deg(10.0 / (6378137.0 * np.cos(np.deg2rad(37.0)))),
+            8.0,
+        ],
+    ])
+    local_enu, reference = navsat_to_local(navsat_samples, frame="enu", return_reference=True)
+    assert reference == {"lat": 37.0, "lon": -122.0, "alt": 10.0, "frame": "enu"}
+    assert np.allclose(local_enu, np.array([[0.0, 0.0, 0.0], [10.0, 20.0, -2.0]]))
+    local_ned = navsat_to_local({"data": navsat_samples}, frame="ned")
+    assert np.allclose(local_ned, np.array([[0.0, 0.0, -0.0], [20.0, 10.0, 2.0]]))
+    assert np.allclose(enu_to_ned(local_enu), local_ned)
+    assert np.allclose(ned_to_enu(local_ned), local_enu)
+    assert np.allclose(navsat_to_ned(navsat_samples[:, 0], navsat_samples[:, 1], navsat_samples[:, 2], 37.0, -122.0, 10.0), local_ned)
+    assert np.allclose(local_to_navsat(local_enu, 37.0, -122.0, 10.0, frame="enu"), navsat_samples)
+    assert np.allclose(ned_to_navsat(local_ned, 37.0, -122.0, 10.0), navsat_samples)
+    assert np.allclose(local_to_navsat(local_ned, 37.0, -122.0, 10.0, frame="ned"), navsat_samples)
 
     speed = trajectory_speed(np.array([0.0, 1.0, 2.0]), np.array([[0.0, 0.0], [1.0, 0.0], [3.0, 0.0]]))
     assert np.allclose(speed, np.array([1.0, 1.5, 2.0]))
@@ -1294,6 +1362,116 @@ def test_navigation_operations():
     fixed_rate = resample_trajectory(trajectory, period=0.5)
     assert np.allclose(fixed_rate["ts"], np.array([0.0, 0.5, 1.0]))
 
+    smoothed = smooth_timeseries(np.array([[0.0], [9.0], [0.0]]), window_size=3)
+    assert np.allclose(smoothed, np.array([[3.0], [3.0], [3.0]]))
+
+    motion_ts = np.array([0.0, 1.0, 2.0])
+    motion_position = np.column_stack((motion_ts ** 2, np.zeros((motion_ts.size, 2))))
+    differentiated_position = differentiate_timeseries(motion_ts, motion_position)
+    assert np.allclose(differentiated_position[:, 0], np.array([1.0, 2.0, 3.0]))
+
+    constant_velocity = np.tile(np.array([1.0, 0.0, 0.0]), (motion_ts.size, 1))
+    integrated_position = integrate_timeseries(motion_ts, constant_velocity, initial=np.zeros(3))
+    assert np.allclose(integrated_position, np.column_stack((motion_ts, np.zeros((motion_ts.size, 2)))))
+
+    yaw = np.array([0.0, 0.5, 1.0])
+    motion_orientation = euler_to_quaternion(np.column_stack((
+        np.zeros(motion_ts.size),
+        np.zeros(motion_ts.size),
+        yaw,
+    )))
+    angular_velocity = angular_velocity_from_quaternions(motion_ts, motion_orientation)
+    assert np.allclose(angular_velocity, np.tile(np.array([0.0, 0.0, 0.5]), (motion_ts.size, 1)))
+    integrated_orientation = integrate_orientations(
+        motion_ts,
+        angular_velocity,
+        initial_orientation=motion_orientation[0],
+    )
+    assert np.allclose(quaternion_to_euler(integrated_orientation)[:, 2], yaw)
+
+    trajectory_motion = {
+        "ts": motion_ts,
+        "position": motion_position,
+        "orientation": motion_orientation,
+        "linear_velocity": constant_velocity,
+        "angular_velocity": angular_velocity,
+        "linear_acceleration": np.zeros((motion_ts.size, 3)),
+        "position_covariance": np.zeros((motion_ts.size, 3)),
+        "orientation_covariance": np.zeros((motion_ts.size, 3)),
+        "linear_velocity_covariance": np.zeros((motion_ts.size, 3)),
+        "angular_velocity_covariance": np.zeros((motion_ts.size, 3)),
+        "linear_acceleration_covariance": np.zeros((motion_ts.size, 3)),
+        "source": "synthetic",
+    }
+    smoothed_trajectory = smooth_trajectory(
+        {**trajectory_motion, "position": np.array([[0.0, 0.0, 0.0], [9.0, 0.0, 0.0], [0.0, 0.0, 0.0]])},
+        window_size=3,
+        fields=("position",),
+        smooth_orientation=False,
+    )
+    assert np.allclose(smoothed_trajectory["position"][:, 0], np.array([3.0, 3.0, 3.0]))
+
+    differentiated_trajectory = differentiate_trajectory(trajectory_motion)
+    assert np.allclose(differentiated_trajectory["linear_velocity"][:, 0], np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(differentiated_trajectory["angular_velocity"][:, 2], np.array([0.5, 0.5, 0.5]))
+    assert np.allclose(differentiated_trajectory["linear_acceleration"][:, 0], np.array([1.0, 1.0, 1.0]))
+
+    dead_reckoned = dead_reckon_trajectory(trajectory_motion, initial_position=np.zeros(3))
+    assert np.allclose(dead_reckoned["position"], np.column_stack((motion_ts, np.zeros((motion_ts.size, 2)))))
+    assert np.allclose(quaternion_to_euler(dead_reckoned["orientation"])[:, 2], yaw)
+    integrated_trajectory = integrate_trajectory(trajectory_motion, initial_position=np.zeros(3))
+    assert np.allclose(integrated_trajectory["position"], dead_reckoned["position"])
+
+    body_frame_input = {**trajectory_motion, "angular_velocity": np.zeros((motion_ts.size, 3))}
+    body_frame = dead_reckon_trajectory(
+        body_frame_input,
+        initial_position=np.zeros(3),
+        initial_orientation=euler_to_quaternion(0.0, 0.0, 90.0, degrees=True),
+        body_frame_velocity=True,
+    )
+    assert np.allclose(body_frame["position"][:, 0], np.zeros(motion_ts.size), atol=1e-12)
+    assert np.allclose(body_frame["position"][:, 1], motion_ts, atol=1e-12)
+
+    propagated = propagate_trajectory_covariance(
+        trajectory_motion,
+        process_noise={"position": np.array([0.1, 0.2, 0.3]), "orientation_covariance": 0.01},
+    )
+    assert np.allclose(propagated["position_covariance"][2], np.array([0.2, 0.4, 0.6]))
+    assert np.allclose(propagated["orientation_covariance"][2], np.array([0.02, 0.02, 0.02]))
+
+    quality_input = {
+        **trajectory_motion,
+        "position_covariance": np.array([
+            [0.1, 0.1, 0.1],
+            [5.0, 0.1, 0.1],
+            [0.1, 0.1, 0.1],
+        ]),
+        "status": np.array([0, 0, -1]),
+    }
+    quality_mask = trajectory_quality_mask(
+        quality_input,
+        covariance_limits={"position": 1.0},
+        valid_statuses={0},
+    )
+    assert quality_mask.tolist() == [True, False, False]
+
+    annotated = add_trajectory_quality_mask(
+        quality_input,
+        covariance_limits={"position": 1.0},
+        valid_statuses={0},
+    )
+    assert annotated["quality_mask"].tolist() == [True, False, False]
+
+    masked = mask_trajectory(quality_input, quality_mask)
+    assert np.allclose(masked["ts"], motion_ts)
+    assert np.isnan(masked["position"][1:]).all()
+    assert masked["quality_mask"].tolist() == [True, False, False]
+
+    dropped = mask_trajectory(quality_input, quality_mask, drop=True)
+    assert np.allclose(dropped["ts"], np.array([0.0]))
+    assert np.allclose(dropped["position"], quality_input["position"][:1])
+    assert dropped["quality_mask"].tolist() == [True]
+
 
 def test_sensor_streams_convert_to_common_trajectory_arrays():
     timestamps = np.array([0.0, 1.0])
@@ -1316,6 +1494,17 @@ def test_sensor_streams_convert_to_common_trajectory_arrays():
     assert np.allclose(imu_traj["angular_velocity"][:, 2], np.array([0.1, 0.2]))
     assert np.allclose(imu_traj["linear_acceleration"][1], np.array([4.0, 5.0, 6.0]))
 
+    corrected_imu, imu_biases = correct_imu_bias({"ts": timestamps, "data": imu}, sample_slice=slice(0, 1), return_bias=True)
+    assert np.allclose(imu_biases["angular_velocity"], np.array([0.0, 0.0, 0.1]))
+    assert np.allclose(imu_biases["linear_acceleration"], np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(corrected_imu["data"][1, 2, :3], np.array([0.0, 0.0, 0.1]))
+    assert np.allclose(corrected_imu["data"][1, 4, :3], np.array([3.0, 3.0, 3.0]))
+
+    gravity_imu = imu.copy()
+    gravity_imu[:, 4, :3] = np.array([0.0, 0.0, 9.80665])
+    gravity_corrected = compensate_imu_gravity(gravity_imu)
+    assert np.allclose(gravity_corrected[:, 4, :3], np.zeros((2, 3)))
+
     odom = np.zeros((2, 8, 4), dtype=np.float64)
     odom[:, 0, :3] = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
     odom[:, 1, :3] = np.array([0.1, 0.2, 0.3])
@@ -1332,11 +1521,23 @@ def test_sensor_streams_convert_to_common_trajectory_arrays():
         [37.0, -122.0, 10.0],
         [37.0 + np.rad2deg(20.0 / 6378137.0), -122.0, 12.0],
     ])
-    nav_traj = navsat_to_trajectory({"ts": timestamps, "data": navsat}, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+    nav_traj = navsat_to_trajectory(
+        {
+            "ts": timestamps,
+            "data": navsat,
+            "status": np.array([0, -1]),
+            "position_covariance": np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        },
+        ref_lat=37.0,
+        ref_lon=-122.0,
+        ref_alt=10.0,
+    )
     assert nav_traj["source"] == "navsat"
     assert nav_traj["reference"] == {"lat": 37.0, "lon": -122.0, "alt": 10.0}
     assert np.allclose(nav_traj["position"], np.array([[0.0, 0.0, 0.0], [0.0, 20.0, 2.0]]))
     assert np.allclose(nav_traj["linear_velocity"], np.array([[0.0, 20.0, 2.0], [0.0, 20.0, 2.0]]))
+    assert nav_traj["status"].tolist() == [0, -1]
+    assert np.allclose(nav_traj["position_covariance"][1], np.array([4.0, 5.0, 6.0]))
 
     dispatched = sensor_to_trajectory(odom, kind="odometry", timestamps=timestamps)
     assert np.allclose(dispatched["pose"], odom_traj["pose"])

@@ -6,12 +6,22 @@ Open3D is a useful model for this project: keep the API small, composable, NumPy
 
 Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/release/tutorial/geometry/pointcloud.html), [Open3D PointCloud API](https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html), and [Open3D ICP registration tutorial](https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html).
 
+## Prioritized Next Work
+
+1. [x] P0 - Finish navigation quality: covariance propagation plus quality/status masks.
+2. [ ] P0 - Add operation pipelines that stream directly from `DataSources`, write to `DataBuffer`, and persist to TileDB without materializing full topics.
+3. [ ] P1 - Add progress reporting, cancellation, and resumable operation checkpoints.
+4. [ ] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
+5. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
+
+## Backlog
+
 - [x] Define a common operation interface for buffered topics:
   - [x] Add `map(topic, fn)`, `filter(topic, predicate)`, `reduce(topic, fn)`, and `window(topic, size|seconds)` helpers.
   - [x] Support eager NumPy output and lazy/chunked iteration for larger-than-memory arrays.
   - [x] Preserve message metadata: `timestamp`, `topic`, `name`, frame id, shape, dtype, and source URI.
   - [x] Add consistent `copy`, `out`, and `chunk_size` options for memory-sensitive workflows.
-- [ ] Add dataset-level selection and indexing:
+- [x] Add dataset-level selection and indexing:
   - [x] Select by topic, timestamp range, message index range, frame id, geographic bounds, and spatial bounds.
   - [x] Add timestamp range and message index range selection helpers.
   - [x] Add nearest-time lookup and bounded nearest alignment helpers.
@@ -19,7 +29,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add topic alignment modes: exact timestamp, nearest neighbor, bounded tolerance, fixed-rate resampling, and rolling window joins.
   - [x] Add persistent secondary indexes for TileDB-backed timestamp and message-name queries.
   - [x] Add persistent secondary indexes for frame id and spatial bounds queries.
-- [ ] Add geometry and coordinate-frame operations:
+- [x] Add geometry and coordinate-frame operations:
   - [x] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
   - [x] Add SE(3) transform helpers for XYZ point arrays.
   - [x] Convert IMU, odometry, and navsat streams into common pose/trajectory arrays.
@@ -27,7 +37,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add projection helpers between point clouds, depth images, RGB images, DEM tiles, and camera frames.
   - [x] Add crop/select helpers for axis-aligned bounds, oriented bounds, masks, and geographic bounding boxes.
   - [x] Add axis-aligned XYZ bounds cropping with mask output.
-- [ ] Add point cloud operations:
+- [x] Add point cloud operations:
   - [x] Downsample by voxel grid, uniform sampling, random sampling, and farthest-point sampling.
   - [x] Add voxel-grid downsampling.
   - [x] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
@@ -39,7 +49,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add KNN and radius search.
   - [x] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
   - [x] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
-- [ ] Add image and depth operations:
+- [x] Add image and depth operations:
   - [x] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
   - [x] Add resize-nearest, pad, normalize, and RGB-to-gray helpers.
   - [x] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
@@ -47,15 +57,15 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add valid-depth masks and depth backprojection to point clouds.
   - [x] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
   - [x] Add camera model utilities for intrinsics, distortion, rectification, and projection.
-- [ ] Add IMU, odometry, and navsat operations:
+- [x] Add IMU, odometry, and navsat operations:
   - [x] Resample and interpolate orientation, angular velocity, linear acceleration, position, velocity, and covariance.
   - [x] Add generic numeric time-series interpolation.
-  - [ ] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
+  - [x] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
   - [x] Add quaternion normalization and SLERP.
-  - [ ] Convert WGS84 navsat samples to local ENU/NED frames and back.
+  - [x] Convert WGS84 navsat samples to local ENU/NED frames and back.
   - [x] Add approximate WGS84 to local ENU conversion and inverse conversion.
-  - [ ] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
-  - [ ] Add covariance propagation and quality/status masks for navigation streams.
+  - [x] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
+  - [x] Add covariance propagation and quality/status masks for navigation streams.
 - [ ] Add DEM and raster operations:
   - [ ] Mosaic, crop, reproject, resample, and cache DEM tiles.
   - [x] Add mosaic, crop, bilinear sampling, and nearest sampling helpers.
