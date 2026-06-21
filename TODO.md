@@ -33,9 +33,9 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
   - [x] Add normal estimation.
   - [x] Remove outliers with statistical and radius-based filters.
-  - [ ] Cluster and segment with DBSCAN, plane fitting, connected components, and ground/non-ground separation.
+  - [x] Cluster and segment with DBSCAN, plane fitting, connected components, and ground/non-ground separation.
   - [x] Add DBSCAN clustering and RANSAC-style plane fitting.
-  - [ ] Add nearest-neighbor search with KNN, radius search, and hybrid search.
+  - [x] Add nearest-neighbor search with KNN, radius search, and hybrid search.
   - [x] Add KNN and radius search.
   - [ ] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
   - [ ] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.

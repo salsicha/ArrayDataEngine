@@ -162,12 +162,15 @@ preview_points = random_downsample(points, count=10_000, seed=42)
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
-from ade.ops import curvature_descriptors, farthest_point_downsample, nearest_neighbor_distance_stats, uniform_downsample
+from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, nearest_neighbor_distance_stats, segment_ground, uniform_downsample
 
 uniform_points = uniform_downsample(points, every_k=4)
 keypoints = farthest_point_downsample(points, count=2_048)
 shape_features = curvature_descriptors(points, k=16)
 spacing = nearest_neighbor_distance_stats(points, k=4)
+distances, indices, counts = hybrid_search(points, query_points, radius=0.5, max_neighbors=32)
+components = connected_components(points, radius=0.5, min_component_size=20)
+ground, obstacles, ground_mask = segment_ground(points, distance_threshold=0.15)
 ```
 
 SE(3) coordinate-frame helpers work across common robotics arrays:
@@ -309,7 +312,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/sampling/search/normals/covariance descriptors/distance stats/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 

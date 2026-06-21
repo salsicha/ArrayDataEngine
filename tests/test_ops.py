@@ -10,6 +10,7 @@ from ade.ops import (
     bounds_mask,
     camera_matrix,
     cluster_dbscan,
+    connected_components,
     colorize_points,
     crop_bounds,
     crop_geographic_bounds,
@@ -27,6 +28,7 @@ from ade.ops import (
     FrameGraph,
     geographic_bounds_mask,
     hillshade,
+    hybrid_search,
     imu_to_trajectory,
     interpolate_timeseries,
     iter_chunks,
@@ -57,6 +59,7 @@ from ade.ops import (
     sample_grid,
     sample_image_at_pixels,
     sample_image_at_points,
+    segment_ground,
     segment_plane,
     select_indices,
     select_mask,
@@ -483,6 +486,19 @@ def test_geometry_and_point_cloud_operations():
     assert indices.shape == (1, 2)
     assert np.allclose(distances[0, 0], 0.0)
 
+    hybrid_distances, hybrid_indices, hybrid_counts = hybrid_search(
+        points,
+        np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 10.0], [100.0, 0.0, 0.0]]),
+        radius=0.3,
+        max_neighbors=2,
+    )
+    assert hybrid_counts.tolist() == [2, 1, 0]
+    assert hybrid_indices[0].tolist() == [0, 1]
+    assert np.allclose(hybrid_distances[0], np.array([0.0, 0.1]))
+    assert hybrid_indices[1].tolist() == [4, -1]
+    assert np.isinf(hybrid_distances[1, 1])
+    assert hybrid_indices[2].tolist() == [-1, -1]
+
     normals = estimate_normals(points[:4], k=3, orient_toward=np.array([0.0, 0.0, 1.0]))
     assert np.allclose(normals[:, 2], np.ones(4))
 
@@ -520,9 +536,44 @@ def test_geometry_and_point_cloud_operations():
     labels = cluster_dbscan(points, eps=0.25, min_points=2)
     assert labels.tolist() == [0, 0, 1, 1, -1]
 
+    component_points = np.array([
+        [0.0, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.1, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+    ])
+    component_labels, component_counts = connected_components(component_points, radius=0.2, return_counts=True)
+    assert component_labels.tolist() == [0, 0, 1, 1, 2]
+    assert component_counts.tolist() == [2, 2, 1]
+    filtered_components = connected_components(component_points, radius=0.2, min_component_size=2)
+    assert filtered_components.tolist() == [0, 0, 1, 1, -1]
+
     plane, inliers = segment_plane(points[:4], distance_threshold=1.0e-6, iterations=10, seed=1)
     assert np.isclose(abs(plane[2]), 1.0)
     assert inliers.all()
+
+    scene = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [2.0, 0.0, 0.02],
+        [0.0, 2.0, -0.01],
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 1.2],
+    ])
+    ground, non_ground, ground_mask, ground_plane = segment_ground(
+        scene,
+        distance_threshold=0.05,
+        iterations=50,
+        seed=3,
+        return_plane=True,
+    )
+    assert ground.shape[0] == 6
+    assert non_ground.shape[0] == 2
+    assert ground_mask.tolist() == [True, True, True, True, True, True, False, False]
+    assert ground_plane[2] > 0.0
 
 
 def test_geographic_crop_and_bounds_masks():

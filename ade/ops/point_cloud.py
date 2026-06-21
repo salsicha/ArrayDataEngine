@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from itertools import product
 
 import numpy as np
 
@@ -156,15 +157,145 @@ def _sampling_count(n_points: int, count: int | None, ratio: float | None, repla
     return sample_count
 
 
-def radius_search(points: np.ndarray, queries: np.ndarray, radius: float) -> list[np.ndarray]:
-    if radius < 0:
-        raise ValueError("radius must be non-negative")
-    arr = _as_points(points)
+def _radius_neighbors(points: np.ndarray, queries: np.ndarray, radius: float) -> list[np.ndarray]:
+    arr = _as_points(points).astype(np.float64, copy=False)
     query = np.asarray(queries, dtype=np.float64)
     if query.ndim == 1:
         query = query.reshape(1, -1)
-    distances = np.linalg.norm(arr[None, :, :3] - query[:, None, :3], axis=2)
-    return [np.flatnonzero(row <= radius) for row in distances]
+    if query.ndim != 2 or query.shape[1] < 3:
+        raise ValueError("queries must have shape (Q, 3+) or (3,)")
+    if arr.shape[0] == 0:
+        return [np.empty((0,), dtype=np.int64) for _ in range(query.shape[0])]
+
+    if radius == 0:
+        return [
+            np.flatnonzero(np.all(arr[:, :3] == item[:3], axis=1)).astype(np.int64, copy=False)
+            for item in query
+        ]
+
+    cell_size = float(radius)
+    radius_squared = cell_size * cell_size
+    point_cells = np.floor(arr[:, :3] / cell_size).astype(np.int64)
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    for point_index, cell in enumerate(point_cells):
+        buckets.setdefault(tuple(int(v) for v in cell), []).append(point_index)
+
+    offsets = tuple(product((-1, 0, 1), repeat=3))
+    neighborhoods = []
+    for item in query:
+        cell = np.floor(item[:3] / cell_size).astype(np.int64)
+        candidate_indices = []
+        for offset in offsets:
+            key = tuple(int(cell[dim] + offset[dim]) for dim in range(3))
+            candidate_indices.extend(buckets.get(key, ()))
+        if not candidate_indices:
+            neighborhoods.append(np.empty((0,), dtype=np.int64))
+            continue
+
+        candidates = np.asarray(sorted(set(candidate_indices)), dtype=np.int64)
+        diff = arr[candidates, :3] - item[:3]
+        distances = np.einsum("ij,ij->i", diff, diff)
+        neighborhoods.append(candidates[distances <= radius_squared])
+    return neighborhoods
+
+
+def radius_search(points: np.ndarray, queries: np.ndarray, radius: float) -> list[np.ndarray]:
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    return _radius_neighbors(points, queries, radius)
+
+
+def hybrid_search(
+    points: np.ndarray,
+    queries: np.ndarray,
+    radius: float,
+    max_neighbors: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Find up to `max_neighbors` nearest points within `radius` for each query."""
+
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    max_neighbors = int(max_neighbors)
+    if max_neighbors < 1:
+        raise ValueError("max_neighbors must be at least 1")
+
+    arr = _as_points(points).astype(np.float64, copy=False)
+    query = np.asarray(queries, dtype=np.float64)
+    if query.ndim == 1:
+        query = query.reshape(1, -1)
+    if query.ndim != 2 or query.shape[1] < 3:
+        raise ValueError("queries must have shape (Q, 3+) or (3,)")
+
+    neighborhoods = _radius_neighbors(arr, query, radius)
+    distances = np.full((query.shape[0], max_neighbors), np.inf, dtype=np.float64)
+    indices = np.full((query.shape[0], max_neighbors), -1, dtype=np.int64)
+    counts = np.zeros((query.shape[0],), dtype=np.int64)
+
+    for row, candidates in enumerate(neighborhoods):
+        if candidates.size == 0:
+            continue
+        candidate_distances = np.linalg.norm(arr[candidates, :3] - query[row, :3], axis=1)
+        order = np.argsort(candidate_distances, kind="stable")[:max_neighbors]
+        selected = candidates[order]
+        count = selected.size
+        counts[row] = count
+        indices[row, :count] = selected
+        distances[row, :count] = candidate_distances[order]
+
+    return distances, indices, counts
+
+
+def connected_components(
+    points: np.ndarray,
+    radius: float,
+    min_component_size: int = 1,
+    return_counts: bool = False,
+):
+    """Label radius-connected point components."""
+
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    min_component_size = int(min_component_size)
+    if min_component_size < 1:
+        raise ValueError("min_component_size must be at least 1")
+
+    arr = _as_points(points)
+    labels = np.full(arr.shape[0], -1, dtype=np.int64)
+    if arr.shape[0] == 0:
+        counts = np.empty((0,), dtype=np.int64)
+        return (labels, counts) if return_counts else labels
+
+    neighborhoods = _radius_neighbors(arr, arr[:, :3], radius)
+    raw_components: list[list[int]] = []
+    visited = np.zeros(arr.shape[0], dtype=bool)
+    for point_index in range(arr.shape[0]):
+        if visited[point_index]:
+            continue
+
+        component = []
+        queue = deque([point_index])
+        visited[point_index] = True
+        while queue:
+            current = queue.popleft()
+            component.append(current)
+            for neighbor in neighborhoods[current]:
+                neighbor = int(neighbor)
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+        raw_components.append(component)
+
+    component_id = 0
+    counts = []
+    for component in raw_components:
+        if len(component) < min_component_size:
+            continue
+        labels[np.asarray(component, dtype=np.int64)] = component_id
+        counts.append(len(component))
+        component_id += 1
+
+    counts_array = np.asarray(counts, dtype=np.int64)
+    return (labels, counts_array) if return_counts else labels
 
 
 def local_covariances(points: np.ndarray, k: int = 8, return_indices: bool = False):
@@ -363,12 +494,35 @@ def _plane_from_points(points: np.ndarray) -> np.ndarray | None:
     return np.r_[normal, -np.dot(normal, p0)]
 
 
-def segment_plane(points: np.ndarray, distance_threshold: float, iterations: int = 100, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def _segment_plane_ransac(
+    points: np.ndarray,
+    distance_threshold: float,
+    iterations: int,
+    seed: int,
+    normal: np.ndarray | None = None,
+    max_angle_degrees: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     if distance_threshold < 0:
         raise ValueError("distance_threshold must be non-negative")
     arr = _as_points(points).astype(np.float64, copy=False)
     if arr.shape[0] < 3:
         raise ValueError("at least three points are required to segment a plane")
+
+    normal_filter = None
+    if normal is not None:
+        normal_filter = np.asarray(normal, dtype=np.float64)
+        if normal_filter.shape != (3,):
+            raise ValueError("normal must have shape (3,)")
+        norm = np.linalg.norm(normal_filter)
+        if norm == 0:
+            raise ValueError("normal must be non-zero")
+        normal_filter = normal_filter / norm
+    if max_angle_degrees is not None:
+        if max_angle_degrees < 0:
+            raise ValueError("max_angle_degrees must be non-negative")
+        min_alignment = np.cos(np.deg2rad(max_angle_degrees))
+    else:
+        min_alignment = None
 
     rng = np.random.default_rng(seed)
     best_plane = None
@@ -378,6 +532,9 @@ def segment_plane(points: np.ndarray, distance_threshold: float, iterations: int
         plane = _plane_from_points(sample)
         if plane is None:
             continue
+        if normal_filter is not None and min_alignment is not None:
+            if abs(float(np.dot(plane[:3], normal_filter))) < min_alignment:
+                continue
         distances = np.abs(arr[:, :3] @ plane[:3] + plane[3])
         mask = distances <= distance_threshold
         if mask.sum() > best_mask.sum():
@@ -389,13 +546,51 @@ def segment_plane(points: np.ndarray, distance_threshold: float, iterations: int
     return best_plane, best_mask
 
 
+def segment_plane(points: np.ndarray, distance_threshold: float, iterations: int = 100, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    return _segment_plane_ransac(points, distance_threshold, iterations, seed)
+
+
+def segment_ground(
+    points: np.ndarray,
+    distance_threshold: float,
+    up_axis=(0.0, 0.0, 1.0),
+    max_slope_degrees: float = 20.0,
+    iterations: int = 100,
+    seed: int = 0,
+    return_plane: bool = False,
+):
+    """Split points into ground and non-ground sets using an up-aligned RANSAC plane."""
+
+    arr = _as_points(points)
+    plane, ground_mask = _segment_plane_ransac(
+        arr,
+        distance_threshold=distance_threshold,
+        iterations=iterations,
+        seed=seed,
+        normal=np.asarray(up_axis, dtype=np.float64),
+        max_angle_degrees=max_slope_degrees,
+    )
+    up = np.asarray(up_axis, dtype=np.float64)
+    up = up / np.linalg.norm(up)
+    if np.dot(plane[:3], up) < 0:
+        plane = -plane
+
+    ground = arr[ground_mask].copy()
+    non_ground = arr[~ground_mask].copy()
+    if return_plane:
+        return ground, non_ground, ground_mask, plane
+    return ground, non_ground, ground_mask
+
+
 __all__ = [
     "apply_transform",
     "cluster_dbscan",
+    "connected_components",
     "crop_bounds",
     "curvature_descriptors",
     "estimate_normals",
     "farthest_point_downsample",
+    "hybrid_search",
     "knn_search",
     "local_covariances",
     "nearest_neighbor_distance_stats",
@@ -403,6 +598,7 @@ __all__ = [
     "radius_outlier_filter",
     "radius_search",
     "random_downsample",
+    "segment_ground",
     "segment_plane",
     "statistical_outlier_filter",
     "uniform_downsample",
