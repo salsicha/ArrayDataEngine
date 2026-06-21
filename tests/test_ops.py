@@ -101,6 +101,7 @@ from ade.ops import (
     local_to_navsat,
     map_topic,
     mask_trajectory,
+    mosaic_dem_tiles,
     mosaic_tiles,
     motion_compensated_rolling_windows,
     multi_scale_icp,
@@ -1818,6 +1819,37 @@ def test_dem_raster_operations(tmp_path):
     tile_b = np.array([[5, 6], [7, 8]])
     mosaic = mosaic_tiles({(0, 0): tile_a, (0, 1): tile_b})
     assert np.array_equal(mosaic, np.array([[1, 2, 5, 6], [3, 4, 7, 8]]))
+
+    sparse_mosaic, latitudes, longitudes = mosaic_dem_tiles(
+        {
+            "N2W2": np.full((2, 2), 1.0),
+            "N2W1": np.full((2, 2), 2.0),
+            "N1W2": np.full((2, 2), 3.0),
+        },
+        fill_value=-1.0,
+        return_index=True,
+    )
+    assert latitudes.tolist() == [2, 1]
+    assert longitudes.tolist() == [-2, -1]
+    assert np.array_equal(
+        sparse_mosaic,
+        np.array(
+            [
+                [1.0, 1.0, 2.0, 2.0],
+                [1.0, 1.0, 2.0, 2.0],
+                [3.0, 3.0, -1.0, -1.0],
+                [3.0, 3.0, -1.0, -1.0],
+            ]
+        ),
+    )
+
+    message_mosaic = mosaic_dem_tiles(
+        [
+            {"name": "N1E1", "data": np.ones((1, 1))},
+            {"name": "N1E2", "data": np.full((1, 1), 2.0)},
+        ]
+    )
+    assert np.array_equal(message_mosaic, np.array([[1.0, 2.0]]))
 
     cropped = crop_raster(mosaic, 0, 2, 1, 3)
     assert np.array_equal(cropped, np.array([[2, 5], [4, 7]]))

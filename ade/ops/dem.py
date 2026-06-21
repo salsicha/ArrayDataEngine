@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -22,6 +23,62 @@ def mosaic_tiles(tiles: dict[tuple[int, int], np.ndarray] | list[list[np.ndarray
         ])
 
     return np.vstack([np.hstack([np.asarray(tile) for tile in row]) for row in tiles])
+
+
+def mosaic_dem_tiles(tiles, fill_value=np.nan, return_index: bool = False):
+    """Mosaic SRTM-style DEM tiles using tile names or DEMSource messages.
+
+    Accepts mappings of `{name: raster}`, iterables of `(name, raster)` pairs,
+    or DEMSource-style messages containing `name` and `data`. Tile names must
+    look like `N37W122` or `S02E003`. Missing cells in a sparse tile grid are
+    filled with `fill_value`.
+    """
+
+    named_tiles = _normalize_dem_tiles(tiles)
+    if not named_tiles:
+        raise ValueError("tiles must contain at least one DEM tile")
+
+    keyed_tiles: dict[tuple[int, int], np.ndarray] = {}
+    tile_shape: tuple[int, int] | None = None
+    for name, raster in named_tiles:
+        lat, lon = _parse_dem_tile_name(name)
+        arr = np.asarray(raster)
+        if arr.ndim != 2:
+            raise ValueError("DEM tile rasters must be two-dimensional")
+        if tile_shape is None:
+            tile_shape = arr.shape
+        elif arr.shape != tile_shape:
+            raise ValueError("all DEM tiles must have the same shape")
+        key = (lat, lon)
+        if key in keyed_tiles:
+            raise ValueError(f"duplicate DEM tile coordinate {key}")
+        keyed_tiles[key] = arr
+
+    assert tile_shape is not None
+    latitudes = np.array(sorted({lat for lat, _ in keyed_tiles}, reverse=True), dtype=np.int64)
+    longitudes = np.array(sorted({lon for _, lon in keyed_tiles}), dtype=np.int64)
+    dtype = np.result_type(*(tile.dtype for tile in keyed_tiles.values()), np.asarray(fill_value).dtype)
+    tile_rows, tile_cols = tile_shape
+    mosaic = np.full(
+        (latitudes.size * tile_rows, longitudes.size * tile_cols),
+        fill_value,
+        dtype=dtype,
+    )
+
+    for row_index, lat in enumerate(latitudes):
+        row_start = row_index * tile_rows
+        row_stop = row_start + tile_rows
+        for col_index, lon in enumerate(longitudes):
+            tile = keyed_tiles.get((int(lat), int(lon)))
+            if tile is None:
+                continue
+            col_start = col_index * tile_cols
+            col_stop = col_start + tile_cols
+            mosaic[row_start:row_stop, col_start:col_stop] = tile
+
+    if return_index:
+        return mosaic, latitudes, longitudes
+    return mosaic
 
 
 def resample_raster(raster: np.ndarray, shape: tuple[int, int], method: str = "bilinear") -> np.ndarray:
@@ -451,6 +508,45 @@ def _grid_points(
     z = _elevation_grid(elevation)
     xx, yy = _coordinate_grid(z, x=x, y=y, resolution=resolution, origin=origin)
     return np.stack((xx, yy, z), axis=-1)
+
+
+def _normalize_dem_tiles(tiles) -> list[tuple[object, np.ndarray]]:
+    if isinstance(tiles, dict):
+        return list(tiles.items())
+
+    normalized = []
+    for tile in tiles:
+        if isinstance(tile, dict):
+            if "name" not in tile or "data" not in tile:
+                raise ValueError("DEM tile messages must contain 'name' and 'data'")
+            normalized.append((tile["name"], tile["data"]))
+            continue
+
+        try:
+            name, raster = tile
+        except (TypeError, ValueError) as exc:
+            raise ValueError("DEM tiles must be messages or (name, raster) pairs") from exc
+        normalized.append((name, raster))
+    return normalized
+
+
+def _parse_dem_tile_name(name) -> tuple[int, int]:
+    if isinstance(name, tuple) and len(name) == 2:
+        return int(name[0]), int(name[1])
+
+    tile_name = Path(str(name)).name.upper()
+    match = re.match(r"^([NS])(\d+)([EW])(\d+)", tile_name)
+    if match is None:
+        raise ValueError("DEM tile names must look like N37W122 or S02E003")
+
+    lat_hemi, lat_value, lon_hemi, lon_value = match.groups()
+    lat = int(lat_value)
+    lon = int(lon_value)
+    if lat_hemi == "S":
+        lat = -lat
+    if lon_hemi == "W":
+        lon = -lon
+    return lat, lon
 
 
 def _patch_size(size: int | tuple[int, int]) -> tuple[int, int]:

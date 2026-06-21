@@ -545,6 +545,7 @@ DEM helper functions operate on NumPy windows, so they can be used on individual
 from ade.ops import (
     dem_to_mesh,
     dem_to_point_cloud,
+    mosaic_dem_tiles,
     read_dem_cache,
     reproject_raster,
     resample_raster,
@@ -558,6 +559,7 @@ from ade.ops import (
 
 tile = next(source.get_message())
 elevation = tile["data"].astype("float64")
+region = mosaic_dem_tiles([tile])
 
 normals = terrain_normals(elevation, resolution=30.0)
 roughness = roughness_map(elevation, window_size=5)
@@ -584,6 +586,8 @@ local_grid = reproject_raster(
 write_dem_cache("/tmp/ade-dem-cache", tile["name"], elevation, metadata={"bounds": [west[0], north[0], west[0] + 1.0, north[0] + 1.0]})
 cached_elevation, metadata = read_dem_cache("/tmp/ade-dem-cache", tile["name"], return_metadata=True)
 ```
+
+`mosaic_dem_tiles` also accepts `{name: raster}` mappings or `(name, raster)` pairs and fills sparse regions when adjacent SRTM tiles are missing.
 
 ## Benchmarks
 
