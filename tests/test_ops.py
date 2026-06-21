@@ -17,15 +17,19 @@ from ade.ops import (
     enu_to_navsat,
     estimate_normals,
     filter_topic,
+    FrameGraph,
     hillshade,
+    imu_to_trajectory,
     interpolate_timeseries,
     iter_chunks,
     knn_search,
     map_topic,
     mosaic_tiles,
     navsat_to_enu,
+    navsat_to_trajectory,
     normalize_image,
     normalize_quaternion,
+    odometry_to_trajectory,
     pad_image,
     radius_outlier_filter,
     reduce_topic,
@@ -37,6 +41,7 @@ from ade.ops import (
     segment_plane,
     select_indices,
     select_time_range,
+    sensor_to_trajectory,
     slerp,
     slope_aspect,
     statistical_outlier_filter,
@@ -469,6 +474,55 @@ def test_coordinate_frame_transforms_for_poses_navsat_odometry_and_dem():
     assert np.allclose(transformed_dem[0, 0], np.array([20.0, 40.0, 6.0]))
 
 
+def test_frame_graph_static_and_time_varying_transforms():
+    graph = FrameGraph()
+    base_to_odom = np.eye(4)
+    base_to_odom[:3, 3] = [1.0, 0.0, 0.0]
+    odom_to_map = np.eye(4)
+    odom_to_map[:3, 3] = [0.0, 2.0, 0.0]
+
+    graph.add_static_transform("base", "odom", base_to_odom)
+    graph.add_static_transform("odom", "map", odom_to_map)
+
+    base_to_map = graph.lookup_transform("base", "map")
+    assert np.allclose(base_to_map[:3, 3], np.array([1.0, 2.0, 0.0]))
+    assert np.allclose(graph.transform_points(np.array([[0.0, 0.0, 0.0]]), "base", "map"), np.array([[1.0, 2.0, 0.0]]))
+    assert np.allclose(graph.transform_points(np.array([[1.0, 2.0, 0.0]]), "map", "base"), np.array([[0.0, 0.0, 0.0]]))
+    assert graph.has_frame("odom")
+
+    theta = np.pi / 2.0
+    sensor_to_base_start = np.eye(4)
+    sensor_to_base_end = np.array([
+        [np.cos(theta), -np.sin(theta), 0.0, 10.0],
+        [np.sin(theta), np.cos(theta), 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    graph.add_time_varying_transform(
+        "sensor",
+        "base",
+        timestamps=np.array([0.0, 10.0]),
+        transforms=np.stack([sensor_to_base_start, sensor_to_base_end]),
+    )
+
+    midpoint = graph.lookup_transform("sensor", "base", timestamp=5.0)
+    assert np.allclose(midpoint[:3, 3], np.array([5.0, 0.0, 0.0]))
+    sensor_point = np.array([[1.0, 0.0, 0.0]])
+    base_point = graph.transform_points(sensor_point, "sensor", "base", timestamp=5.0)
+    assert np.allclose(base_point, np.array([[5.0 + np.sqrt(0.5), np.sqrt(0.5), 0.0]]))
+
+    map_point = graph.transform_points(sensor_point, "sensor", "map", timestamp=5.0)
+    assert np.allclose(map_point, np.array([[6.0 + np.sqrt(0.5), 2.0 + np.sqrt(0.5), 0.0]]))
+    assert np.allclose(graph.transform_points(base_point, "base", "sensor", timestamp=5.0), sensor_point)
+
+    try:
+        graph.lookup_transform("sensor", "base")
+    except ValueError as exc:
+        assert "timestamp is required" in str(exc)
+    else:
+        raise AssertionError("dynamic frame lookup should require timestamp")
+
+
 def test_image_depth_operations():
     image = np.array([[0, 5], [10, 15]], dtype=np.uint8)
     normalized = normalize_image(image)
@@ -517,6 +571,53 @@ def test_navigation_operations():
 
     speed = trajectory_speed(np.array([0.0, 1.0, 2.0]), np.array([[0.0, 0.0], [1.0, 0.0], [3.0, 0.0]]))
     assert np.allclose(speed, np.array([1.0, 1.5, 2.0]))
+
+
+def test_sensor_streams_convert_to_common_trajectory_arrays():
+    timestamps = np.array([0.0, 1.0])
+    imu = np.zeros((2, 6, 4), dtype=np.float64)
+    imu[:, 0] = np.array([0.0, 0.0, 0.0, 1.0])
+    imu[:, 1, :3] = np.array([0.1, 0.2, 0.3])
+    imu[:, 2, :3] = np.array([[0.0, 0.0, 0.1], [0.0, 0.0, 0.2]])
+    imu[:, 3, :3] = np.array([0.01, 0.02, 0.03])
+    imu[:, 4, :3] = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    imu[:, 5, :3] = np.array([0.4, 0.5, 0.6])
+
+    imu_traj = imu_to_trajectory({"ts": timestamps, "data": imu, "topic": "/imu", "frame_id": "base_link"})
+    assert imu_traj["source"] == "imu"
+    assert imu_traj["topic"] == "/imu"
+    assert imu_traj["frame_id"] == "base_link"
+    assert imu_traj["pose"].shape == (2, 7)
+    assert imu_traj["trajectory"].shape == (2, 13)
+    assert np.isnan(imu_traj["position"]).all()
+    assert np.allclose(imu_traj["orientation"], np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (2, 1)))
+    assert np.allclose(imu_traj["angular_velocity"][:, 2], np.array([0.1, 0.2]))
+    assert np.allclose(imu_traj["linear_acceleration"][1], np.array([4.0, 5.0, 6.0]))
+
+    odom = np.zeros((2, 8, 4), dtype=np.float64)
+    odom[:, 0, :3] = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
+    odom[:, 1, :3] = np.array([0.1, 0.2, 0.3])
+    odom[:, 2, :4] = np.array([0.0, 0.0, 0.0, 1.0])
+    odom[:, 4, :3] = np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+    odom[:, 6, :3] = np.array([[0.0, 0.0, 0.1], [0.0, 0.0, 0.2]])
+    odom_traj = odometry_to_trajectory(odom, timestamps=timestamps)
+    assert odom_traj["source"] == "odometry"
+    assert np.allclose(odom_traj["position"][1], np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(odom_traj["linear_velocity"][1], np.array([1.0, 1.0, 0.0]))
+    assert np.allclose(odom_traj["trajectory"][1, :7], odom_traj["pose"][1])
+
+    navsat = np.array([
+        [37.0, -122.0, 10.0],
+        [37.0 + np.rad2deg(20.0 / 6378137.0), -122.0, 12.0],
+    ])
+    nav_traj = navsat_to_trajectory({"ts": timestamps, "data": navsat}, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+    assert nav_traj["source"] == "navsat"
+    assert nav_traj["reference"] == {"lat": 37.0, "lon": -122.0, "alt": 10.0}
+    assert np.allclose(nav_traj["position"], np.array([[0.0, 0.0, 0.0], [0.0, 20.0, 2.0]]))
+    assert np.allclose(nav_traj["linear_velocity"], np.array([[0.0, 20.0, 2.0], [0.0, 20.0, 2.0]]))
+
+    dispatched = sensor_to_trajectory(odom, kind="odometry", timestamps=timestamps)
+    assert np.allclose(dispatched["pose"], odom_traj["pose"])
 
 
 def test_dem_raster_operations():

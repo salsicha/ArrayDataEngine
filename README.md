@@ -168,6 +168,33 @@ odom_in_map = transform_odometry(odom_message_array, odom_to_map)
 gps_in_map_frame = transform_navsat(gps_samples, enu_transform, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
 ```
 
+Use `FrameGraph` when transforms need to be composed by frame name. Static transforms are used directly; time-varying transforms are interpolated by timestamp, including rotation SLERP.
+
+```python
+from ade.ops import FrameGraph
+
+frames = FrameGraph()
+frames.add_static_transform("base_link", "odom", base_to_odom)
+frames.add_time_varying_transform(
+    "lidar",
+    "base_link",
+    timestamps=lidar_tf_timestamps,
+    transforms=lidar_to_base_samples,
+)
+
+points_in_odom = frames.transform_points(points_in_lidar, "lidar", "odom", timestamp=12.5)
+```
+
+IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity.
+
+```python
+from ade.ops import imu_to_trajectory, navsat_to_trajectory, odometry_to_trajectory
+
+imu_traj = imu_to_trajectory(window["/imu"])
+odom_traj = odometry_to_trajectory(window["/odom"])
+gps_traj = navsat_to_trajectory(window["/gps"], ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+```
+
 For large datasets, use the lazy topic pipeline. It records operations and only executes them when chunks, rows, reductions, windows, or explicit collection are requested.
 
 ```python
@@ -248,7 +275,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 

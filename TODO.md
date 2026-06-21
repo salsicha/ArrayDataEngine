@@ -22,8 +22,8 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 - [ ] Add geometry and coordinate-frame operations:
   - [x] Apply SE(3) transforms to point clouds, odometry poses, navsat-derived local coordinates, and DEM grids.
   - [x] Add SE(3) transform helpers for XYZ point arrays.
-  - [ ] Convert IMU, odometry, and navsat streams into common pose/trajectory arrays.
-  - [ ] Add frame graph support for static and time-varying transforms.
+  - [x] Convert IMU, odometry, and navsat streams into common pose/trajectory arrays.
+  - [x] Add frame graph support for static and time-varying transforms.
   - [ ] Add projection helpers between point clouds, depth images, RGB images, DEM tiles, and camera frames.
   - [ ] Add crop/select helpers for axis-aligned bounds, oriented bounds, masks, and geographic bounding boxes.
   - [x] Add axis-aligned XYZ bounds cropping with mask output.

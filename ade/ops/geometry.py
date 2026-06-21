@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
+
 import numpy as np
 
 from .nav import enu_to_navsat, navsat_to_enu
@@ -25,6 +28,134 @@ def _as_transform_matrix(transform: np.ndarray) -> np.ndarray:
     if matrix.shape == (4, 4):
         return matrix
     raise ValueError("transform must have shape (3, 3), (3, 4), or (4, 4)")
+
+
+@dataclass(frozen=True)
+class _FrameEdge:
+    source: str
+    target: str
+    transforms: np.ndarray
+    timestamps: np.ndarray | None = None
+    inverse: bool = False
+
+    @property
+    def is_static(self) -> bool:
+        return self.timestamps is None
+
+
+class FrameGraph:
+    """Graph of static and time-varying SE(3) transforms between named frames."""
+
+    def __init__(self):
+        self._edges: dict[str, list[_FrameEdge]] = {}
+
+    @property
+    def frames(self) -> tuple[str, ...]:
+        return tuple(sorted(self._edges))
+
+    def add_transform(
+        self,
+        source_frame: str,
+        target_frame: str,
+        transform: np.ndarray,
+        timestamps: np.ndarray | None = None,
+    ) -> "FrameGraph":
+        """Add a transform that maps coordinates from `source_frame` to `target_frame`."""
+
+        if source_frame == target_frame:
+            raise ValueError("source_frame and target_frame must differ")
+
+        transforms, ts = _normalize_frame_transform(transform, timestamps)
+        forward = _FrameEdge(source_frame, target_frame, transforms, ts)
+        inverse = _FrameEdge(target_frame, source_frame, transforms, ts, inverse=True)
+
+        self._add_edge(forward)
+        self._add_edge(inverse)
+        return self
+
+    def add_static_transform(self, source_frame: str, target_frame: str, transform: np.ndarray) -> "FrameGraph":
+        return self.add_transform(source_frame, target_frame, transform)
+
+    def add_time_varying_transform(
+        self,
+        source_frame: str,
+        target_frame: str,
+        timestamps: np.ndarray,
+        transforms: np.ndarray,
+    ) -> "FrameGraph":
+        return self.add_transform(source_frame, target_frame, transforms, timestamps=timestamps)
+
+    def has_frame(self, frame: str) -> bool:
+        return frame in self._edges
+
+    def lookup_transform(self, source_frame: str, target_frame: str, timestamp: float | None = None) -> np.ndarray:
+        """Return the composed transform from `source_frame` to `target_frame`."""
+
+        if source_frame == target_frame:
+            return np.eye(4, dtype=np.float64)
+        path = self._find_path(source_frame, target_frame)
+        if path is None:
+            raise KeyError(f"no transform path from {source_frame!r} to {target_frame!r}")
+
+        composed = np.eye(4, dtype=np.float64)
+        for edge in path:
+            composed = _edge_transform_at(edge, timestamp) @ composed
+        return composed
+
+    def transform_points(
+        self,
+        points: np.ndarray,
+        source_frame: str,
+        target_frame: str,
+        timestamp: float | None = None,
+    ) -> np.ndarray:
+        return apply_transform(points, self.lookup_transform(source_frame, target_frame, timestamp=timestamp))
+
+    def transform_vectors(
+        self,
+        vectors: np.ndarray,
+        source_frame: str,
+        target_frame: str,
+        timestamp: float | None = None,
+    ) -> np.ndarray:
+        return transform_vectors(vectors, self.lookup_transform(source_frame, target_frame, timestamp=timestamp))
+
+    def transform_poses(
+        self,
+        poses: np.ndarray,
+        source_frame: str,
+        target_frame: str,
+        timestamp: float | None = None,
+    ) -> np.ndarray:
+        return transform_poses(poses, self.lookup_transform(source_frame, target_frame, timestamp=timestamp))
+
+    def _add_edge(self, edge: _FrameEdge) -> None:
+        self._edges.setdefault(edge.source, [])
+        self._edges.setdefault(edge.target, [])
+        self._edges[edge.source] = [
+            candidate for candidate in self._edges[edge.source] if candidate.target != edge.target
+        ]
+        self._edges[edge.source].append(edge)
+
+    def _find_path(self, source_frame: str, target_frame: str) -> list[_FrameEdge] | None:
+        if source_frame not in self._edges:
+            raise KeyError(f"unknown source frame: {source_frame!r}")
+        if target_frame not in self._edges:
+            raise KeyError(f"unknown target frame: {target_frame!r}")
+
+        queue = deque([(source_frame, [])])
+        visited = {source_frame}
+        while queue:
+            frame, path = queue.popleft()
+            for edge in self._edges.get(frame, ()):
+                if edge.target in visited:
+                    continue
+                next_path = [*path, edge]
+                if edge.target == target_frame:
+                    return next_path
+                visited.add(edge.target)
+                queue.append((edge.target, next_path))
+        return None
 
 
 def _transform_xyz(xyz: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -196,6 +327,62 @@ def _transform_quaternions(quaternions: np.ndarray, transform: np.ndarray) -> np
     return _normalize_quaternions(_quaternion_multiply(rotation_q, q))
 
 
+def _normalize_frame_transform(transform: np.ndarray, timestamps: np.ndarray | None):
+    matrix = np.asarray(transform, dtype=np.float64)
+    if timestamps is None:
+        return _as_transform_matrix(matrix), None
+
+    ts = np.asarray(timestamps, dtype=np.float64)
+    if ts.ndim != 1:
+        raise ValueError("timestamps must be one-dimensional")
+    if ts.size == 0:
+        raise ValueError("timestamps cannot be empty")
+    if np.any(np.diff(ts) <= 0):
+        raise ValueError("timestamps must be strictly increasing")
+    if matrix.ndim != 3 or matrix.shape[0] != ts.size:
+        raise ValueError("time-varying transforms must have shape (N, 3, 3), (N, 3, 4), or (N, 4, 4)")
+    return np.stack([_as_transform_matrix(item) for item in matrix]), ts
+
+
+def _edge_transform_at(edge: _FrameEdge, timestamp: float | None) -> np.ndarray:
+    if edge.is_static:
+        transform = edge.transforms
+    else:
+        if timestamp is None:
+            raise ValueError(
+                f"timestamp is required for time-varying transform {edge.source!r}->{edge.target!r}"
+            )
+        transform = _interpolate_transform(edge.transforms, edge.timestamps, float(timestamp))
+    if edge.inverse:
+        return np.linalg.inv(transform)
+    return transform
+
+
+def _interpolate_transform(transforms: np.ndarray, timestamps: np.ndarray, timestamp: float) -> np.ndarray:
+    if timestamp < timestamps[0] or timestamp > timestamps[-1]:
+        raise ValueError("timestamp is outside the time-varying transform range")
+
+    right = int(np.searchsorted(timestamps, timestamp, side="left"))
+    if right < timestamps.size and timestamps[right] == timestamp:
+        return transforms[right]
+    if right == 0:
+        return transforms[0]
+    if right >= timestamps.size:
+        return transforms[-1]
+
+    left = right - 1
+    fraction = (timestamp - timestamps[left]) / (timestamps[right] - timestamps[left])
+    translation = (1.0 - fraction) * transforms[left, :3, 3] + fraction * transforms[right, :3, 3]
+    q0 = _rotation_matrix_to_quaternion(transforms[left, :3, :3])
+    q1 = _rotation_matrix_to_quaternion(transforms[right, :3, :3])
+    quaternion = _slerp_quaternion(q0, q1, fraction)
+
+    interpolated = np.eye(4, dtype=np.float64)
+    interpolated[:3, :3] = _quaternion_to_rotation_matrix(quaternion)
+    interpolated[:3, 3] = translation
+    return interpolated
+
+
 def _normalize_quaternions(quaternions: np.ndarray) -> np.ndarray:
     q = np.asarray(quaternions, dtype=np.float64)
     norm = np.linalg.norm(q, axis=-1, keepdims=True)
@@ -213,6 +400,34 @@ def _quaternion_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         lw * rz + lx * ry - ly * rx + lz * rw,
         lw * rw - lx * rx - ly * ry - lz * rz,
     ), axis=-1)
+
+
+def _slerp_quaternion(q0: np.ndarray, q1: np.ndarray, fraction: float) -> np.ndarray:
+    q0 = _normalize_quaternions(q0)
+    q1 = _normalize_quaternions(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = float(np.clip(dot, -1.0, 1.0))
+
+    if dot > 0.9995:
+        return _normalize_quaternions(q0 + fraction * (q1 - q0))
+
+    theta_0 = np.arccos(dot)
+    theta = theta_0 * fraction
+    sin_theta = np.sin(theta)
+    sin_theta_0 = np.sin(theta_0)
+    return np.cos(theta) * q0 + sin_theta * (q1 - q0 * dot) / sin_theta_0
+
+
+def _quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
+    x, y, z, w = _normalize_quaternions(quaternion)
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
 
 
 def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
