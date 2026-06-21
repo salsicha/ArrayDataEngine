@@ -13,6 +13,10 @@ from ade.ops import (
     align_topic,
     angular_velocity_from_quaternions,
     add_trajectory_quality_mask,
+    augment_dem_patch,
+    augment_image,
+    augment_point_cloud,
+    augment_trajectory,
     apply_image_mask,
     apply_transform,
     backproject_pixels,
@@ -23,6 +27,7 @@ from ade.ops import (
     CancellationToken,
     cluster_dbscan,
     close_mask,
+    collate_samples,
     connected_components,
     convert_color,
     convert_image_dtype,
@@ -43,6 +48,7 @@ from ade.ops import (
     dead_reckon_trajectory,
     dem_to_mesh,
     dem_to_point_cloud,
+    deterministic_split_indices,
     dem_grid_to_points,
     depth_to_normals,
     depth_to_point_grid,
@@ -85,6 +91,8 @@ from ade.ops import (
     integrate_timeseries,
     integrate_trajectory,
     iter_chunks,
+    IteratorDataset,
+    iter_ml_windows,
     knn_search,
     local_covariances,
     local_mean,
@@ -108,6 +116,7 @@ from ade.ops import (
     normalize_image,
     normalize_images,
     normalize_quaternion,
+    NumpyDataset,
     odometry_to_trajectory,
     odometry_seeded_icp,
     open_mask,
@@ -162,6 +171,7 @@ from ade.ops import (
     smooth_timeseries,
     smooth_trajectory,
     slope_aspect,
+    split_topic,
     statistical_outlier_filter,
     terrain_gradients,
     terrain_normals,
@@ -170,6 +180,8 @@ from ade.ops import (
     threshold_image,
     TopicPipeline,
     TopicView,
+    to_iterator_dataset,
+    to_numpy_dataset,
     to_open3d_point_cloud,
     topic_pipeline,
     topic_view,
@@ -452,6 +464,90 @@ def test_dataset_query_selects_topics_time_index_frame_and_bounds():
     assert list(parallel_selected) == ["/navsat", "/camera"]
     assert parallel_selected["/navsat"]["id"].tolist() == ["n0", "n1", "n2"]
     assert parallel_selected["/camera"]["id"].tolist() == ["c0", "c1"]
+
+
+def test_ml_ready_exports_splits_augmentations_and_collation():
+    topic = _topic()
+    windows = iter_ml_windows({"/points": topic}, size=2, chunk_size=2)
+    assert isinstance(windows, IteratorDataset)
+
+    samples = list(windows)
+    assert [sample["id"].tolist() for sample in samples] == [["a"], ["a", "b"], ["b", "c"], ["c", "d"]]
+    assert samples[0]["topic"] == "/points"
+
+    iterator = to_iterator_dataset(samples)
+    assert [sample["data"].shape for sample in iterator] == [(1, 2), (2, 2), (2, 2), (2, 2)]
+
+    numpy_dataset = to_numpy_dataset(samples)
+    assert isinstance(numpy_dataset, NumpyDataset)
+    arrays = numpy_dataset.as_arrays()
+    assert arrays["data"].shape == (4, 2, 2)
+    assert arrays["data_lengths"].tolist() == [1, 2, 2, 2]
+    assert arrays["data_mask"].tolist() == [[True, False], [True, True], [True, True], [True, True]]
+
+    split_indices = deterministic_split_indices(5, fractions=(0.4, 0.4, 0.2), names=("train", "val", "test"))
+    assert split_indices["train"].tolist() == [0, 1]
+    assert split_indices["val"].tolist() == [2, 3]
+    assert split_indices["test"].tolist() == [4]
+
+    topic_splits = split_topic(topic, fractions=(0.5, 0.5), names=("early", "late"))
+    assert topic_splits["early"]["id"].tolist() == ["a", "b"]
+    assert topic_splits["late"]["id"].tolist() == ["c", "d"]
+
+    source_topic = {
+        **topic,
+        "source_uri": np.array(["run_a", "run_a", "run_b", "run_b"], dtype=object),
+    }
+    source_splits = split_topic(source_topic, by="source", fractions=(0.5, 0.5), names=("a", "b"))
+    assert source_splits["a"]["id"].tolist() == ["a", "b"]
+    assert source_splits["b"]["id"].tolist() == ["c", "d"]
+
+    geo_topic = {
+        "id": np.array(["g0", "g1", "g2"], dtype=object),
+        "ts": np.array([0.0, 1.0, 2.0]),
+        "data": np.array([[0.1, 0.2, 5.0], [0.2, 0.3, 6.0], [1.2, 1.3, 7.0]]),
+    }
+    geo_splits = split_topic(
+        geo_topic,
+        by="geography",
+        fractions=(0.5, 0.5),
+        names=("near", "far"),
+        geography_cell_size=1.0,
+    )
+    assert geo_splits["near"]["id"].tolist() == ["g0", "g1"]
+    assert geo_splits["far"]["id"].tolist() == ["g2"]
+
+    image = np.arange(6, dtype=np.uint8).reshape((2, 3, 1))
+    flipped = augment_image(image, flip_horizontal=True)
+    assert np.array_equal(flipped[:, :, 0], np.array([[2, 1, 0], [5, 4, 3]], dtype=np.uint8))
+
+    dem_patch = augment_dem_patch(np.array([[1.0, 2.0], [3.0, 4.0]]), flip_vertical=True, z_offset=1.0)
+    assert np.allclose(dem_patch, np.array([[4.0, 5.0], [2.0, 3.0]]))
+
+    points = np.array([[0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0]])
+    moved_points = augment_point_cloud(points, scale=2.0, translation=np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(moved_points[:, :3], np.array([[1.0, 2.0, 3.0], [3.0, 2.0, 3.0]]))
+    assert np.allclose(moved_points[:, 3], points[:, 3])
+
+    trajectory = {
+        "ts": np.array([0.0, 1.0]),
+        "position": np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
+        "orientation": np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (2, 1)),
+        "trajectory": np.zeros((2, 13), dtype=np.float64),
+    }
+    moved_trajectory = augment_trajectory(trajectory, translation=np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(moved_trajectory["position"][0], np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(moved_trajectory["pose"][1, :3], np.array([2.0, 3.0, 4.0]))
+    assert np.allclose(moved_trajectory["trajectory"][1, :3], np.array([2.0, 3.0, 4.0]))
+
+    batch = collate_samples([
+        {"points": np.ones((2, 3)), "label": 0},
+        {"points": np.full((3, 3), 2.0), "label": 1},
+    ])
+    assert batch["points"].shape == (2, 3, 3)
+    assert batch["points_lengths"].tolist() == [2, 3]
+    assert batch["points_mask"].tolist() == [[True, True, False], [True, True, True]]
+    assert batch["label"].tolist() == [0, 1]
 
 
 class _SmallSource:

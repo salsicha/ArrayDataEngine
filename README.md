@@ -400,6 +400,32 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
+ML-ready helpers turn lazy topic windows into plain iterator datasets, materialized NumPy datasets, or optional PyTorch datasets. They also provide deterministic split helpers, lightweight augmentations, and padding collation for mixed-rate windows and variable-size point clouds.
+
+```python
+from ade.ops import (
+    augment_image,
+    augment_point_cloud,
+    collate_samples,
+    iter_ml_windows,
+    split_topic,
+    to_numpy_dataset,
+    to_torch_dataset,
+)
+
+image_windows = iter_ml_windows(buffer.dataset(["images"]), size=4, chunk_size=32)
+numpy_windows = to_numpy_dataset(image_windows)
+batch = numpy_windows.as_arrays(pad=True)
+
+splits = split_topic(window["/gps"], by="time", fractions=(0.8, 0.1, 0.1))
+augmented_image = augment_image(batch["data"][0], flip_horizontal=True)
+point_window = next(iter(iter_ml_windows(buffer.dataset(["/points"]), size=1)))
+augmented_points = augment_point_cloud(point_window["data"][0], jitter_std=0.01, seed=7)
+collated = collate_samples([{"points": augmented_points}, {"points": augmented_points[:128]}])
+
+torch_dataset = to_torch_dataset(iter_ml_windows(buffer.dataset(["images"]), size=2), iterable=True)
+```
+
 Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist directly to TileDB. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row.
 
 ```python
@@ -441,7 +467,7 @@ tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/", check
 
 TileDB persistence uses `source.get_count(topic)` to size the destination arrays, then records the actual filtered message count as metadata.
 
-Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
+Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, ML-ready iterators/NumPy/PyTorch adapters/splits/augmentations/collation, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
 
 ## TileDB Persistence
 

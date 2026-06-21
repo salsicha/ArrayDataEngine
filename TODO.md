@@ -14,7 +14,9 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 4. [x] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
 5. [x] P2 - Add optional parallel execution for independent chunks/topics.
 6. [x] P2 - Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
-7. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
+7. [x] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
+8. [ ] P3 - Finish DEM tile reprojection, resampling, and cache support.
+9. [ ] P3 - Work through the package-and-publish checklist for TestPyPI and PyPI.
 
 ## Backlog
 
@@ -87,11 +89,11 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add optional parallel execution for independent chunks/topics.
   - [x] Add progress reporting, cancellation, and resumable operation checkpoints.
   - [x] Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
-- [ ] Add ML-ready dataset operations:
-  - [ ] Export topic windows to PyTorch, NumPy, and plain iterator datasets.
-  - [ ] Add deterministic train/validation/test splits by time, sequence, geography, or source file.
-  - [ ] Add augmentation operations for images, point clouds, trajectories, and DEM patches.
-  - [ ] Add batch collation for variable-size point clouds and mixed-rate sensor windows.
+- [x] Add ML-ready dataset operations:
+  - [x] Export topic windows to PyTorch, NumPy, and plain iterator datasets.
+  - [x] Add deterministic train/validation/test splits by time, sequence, geography, or source file.
+  - [x] Add augmentation operations for images, point clouds, trajectories, and DEM patches.
+  - [x] Add batch collation for variable-size point clouds and mixed-rate sensor windows.
 
 ## Package And Publish To Python Registries
 
