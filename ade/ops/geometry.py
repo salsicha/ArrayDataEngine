@@ -308,6 +308,329 @@ def transform_dem_grid(
     )
 
 
+def camera_matrix(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
+    """Return a 3x3 pinhole camera intrinsic matrix."""
+
+    if fx == 0 or fy == 0:
+        raise ValueError("fx and fy must be non-zero")
+    return np.array([
+        [float(fx), 0.0, float(cx)],
+        [0.0, float(fy), float(cy)],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+
+def project_points_to_image(
+    points: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    image_shape: tuple[int, int] | None = None,
+    transform: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+    return_depth: bool = False,
+):
+    """Project XYZ points into image pixels as `(col, row)` coordinates."""
+
+    intrinsics = _camera_intrinsics(fx, fy, cx, cy, camera_matrix)
+    arr = _as_points(points)
+    xyz = (
+        _transform_xyz(arr[:, :3], transform)
+        if transform is not None
+        else np.asarray(arr[:, :3], dtype=np.float64)
+    )
+    depth = xyz[:, 2]
+
+    valid = np.isfinite(xyz).all(axis=1) & (depth > 0.0)
+    pixels = np.full((arr.shape[0], 2), np.nan, dtype=np.float64)
+    if np.any(valid):
+        pixels[valid, 0] = intrinsics[0] * xyz[valid, 0] / depth[valid] + intrinsics[2]
+        pixels[valid, 1] = intrinsics[1] * xyz[valid, 1] / depth[valid] + intrinsics[3]
+
+    if image_shape is not None:
+        height, width = _image_height_width(image_shape)
+        valid &= (
+            (pixels[:, 0] >= 0.0)
+            & (pixels[:, 0] <= width - 1)
+            & (pixels[:, 1] >= 0.0)
+            & (pixels[:, 1] <= height - 1)
+        )
+
+    if return_depth:
+        return pixels, depth.copy(), valid
+    return pixels, valid
+
+
+def sample_image_at_pixels(
+    image: np.ndarray,
+    pixels: np.ndarray,
+    bilinear: bool = True,
+    fill_value=np.nan,
+    return_mask: bool = False,
+):
+    """Sample an image at floating-point `(col, row)` pixel coordinates."""
+
+    arr = np.asarray(image)
+    if arr.ndim not in (2, 3):
+        raise ValueError("image must have shape (H, W) or (H, W, C)")
+    coords = np.asarray(pixels, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError("pixels must have shape (N, 2) with `(col, row)` coordinates")
+
+    height, width = arr.shape[:2]
+    valid = (
+        np.isfinite(coords).all(axis=1)
+        & (coords[:, 0] >= 0.0)
+        & (coords[:, 0] <= width - 1)
+        & (coords[:, 1] >= 0.0)
+        & (coords[:, 1] <= height - 1)
+    )
+
+    dtype = np.result_type(
+        arr.dtype,
+        np.asarray(fill_value).dtype,
+        np.float64 if bilinear else arr.dtype,
+    )
+    samples = np.full((coords.shape[0], *arr.shape[2:]), fill_value, dtype=dtype)
+    if not np.any(valid):
+        return (samples, valid) if return_mask else samples
+
+    cols = coords[valid, 0]
+    rows = coords[valid, 1]
+    if not bilinear:
+        samples[valid] = arr[np.rint(rows).astype(int), np.rint(cols).astype(int)]
+        return (samples, valid) if return_mask else samples
+
+    c0 = np.floor(cols).astype(int)
+    r0 = np.floor(rows).astype(int)
+    c1 = np.clip(c0 + 1, 0, width - 1)
+    r1 = np.clip(r0 + 1, 0, height - 1)
+    wc = cols - c0
+    wr = rows - r0
+
+    w00 = (1.0 - wr) * (1.0 - wc)
+    w10 = wr * (1.0 - wc)
+    w01 = (1.0 - wr) * wc
+    w11 = wr * wc
+    if arr.ndim == 3:
+        w00 = w00[:, None]
+        w10 = w10[:, None]
+        w01 = w01[:, None]
+        w11 = w11[:, None]
+
+    samples[valid] = (
+        arr[r0, c0] * w00
+        + arr[r1, c0] * w10
+        + arr[r0, c1] * w01
+        + arr[r1, c1] * w11
+    )
+    return (samples, valid) if return_mask else samples
+
+
+def sample_image_at_points(
+    image: np.ndarray,
+    points: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    transform: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+    bilinear: bool = True,
+    fill_value=np.nan,
+    return_mask: bool = False,
+):
+    """Project points into an image and sample pixel values at their projected locations."""
+
+    pixels, projected = project_points_to_image(
+        points,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        image_shape=np.asarray(image).shape[:2],
+        transform=transform,
+        camera_matrix=camera_matrix,
+    )
+    samples, sampled = sample_image_at_pixels(
+        image,
+        pixels,
+        bilinear=bilinear,
+        fill_value=fill_value,
+        return_mask=True,
+    )
+    valid = projected & sampled
+    return (samples, valid) if return_mask else samples
+
+
+def colorize_points(
+    points: np.ndarray,
+    image: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    transform: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+    bilinear: bool = True,
+    fill_value=np.nan,
+    return_mask: bool = False,
+):
+    """Append sampled image channels to a point cloud projected into the camera frame."""
+
+    arr = _as_points(points)
+    colors, mask = sample_image_at_points(
+        image,
+        arr,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        transform=transform,
+        camera_matrix=camera_matrix,
+        bilinear=bilinear,
+        fill_value=fill_value,
+        return_mask=True,
+    )
+    if colors.ndim == 1:
+        colors = colors[:, None]
+    result = np.concatenate((
+        arr.astype(np.result_type(arr.dtype, colors.dtype), copy=False),
+        colors,
+    ), axis=1)
+    return (result, mask) if return_mask else result
+
+
+def points_to_depth_image(
+    points: np.ndarray,
+    image_shape: tuple[int, int],
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    transform: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+    fill_value: float = 0.0,
+    return_indices: bool = False,
+):
+    """Rasterize a point cloud into a depth image using nearest-depth z-buffering."""
+
+    height, width = _image_height_width(image_shape)
+    pixels, depth_values, valid = project_points_to_image(
+        points,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        image_shape=None,
+        transform=transform,
+        camera_matrix=camera_matrix,
+        return_depth=True,
+    )
+
+    valid_idx = np.flatnonzero(valid)
+    cols = np.rint(pixels[valid_idx, 0]).astype(int)
+    rows = np.rint(pixels[valid_idx, 1]).astype(int)
+    in_bounds = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
+    valid_idx = valid_idx[in_bounds]
+    cols = cols[in_bounds]
+    rows = rows[in_bounds]
+
+    depth = np.full((height, width), np.inf, dtype=np.float64)
+    if valid_idx.size:
+        np.minimum.at(depth, (rows, cols), depth_values[valid_idx])
+
+    if return_indices:
+        indices = np.full((height, width), -1, dtype=np.int64)
+        if valid_idx.size:
+            order = np.argsort(depth_values[valid_idx])[::-1]
+            ordered_idx = valid_idx[order]
+            ordered_cols = cols[order]
+            ordered_rows = rows[order]
+            for point_index, row, col in zip(ordered_idx, ordered_rows, ordered_cols):
+                indices[row, col] = point_index
+
+    depth[~np.isfinite(depth)] = fill_value
+    return (depth, indices) if return_indices else depth
+
+
+def rgbd_to_points(
+    depth: np.ndarray,
+    image: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    scale: float = 1.0,
+    mask: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+) -> np.ndarray:
+    """Backproject a depth image to XYZ and append aligned image channels."""
+
+    if scale == 0:
+        raise ValueError("scale must be non-zero")
+    intrinsics = _camera_intrinsics(fx, fy, cx, cy, camera_matrix)
+    depth_arr = np.asarray(depth, dtype=np.float64)
+    image_arr = np.asarray(image)
+    if depth_arr.ndim != 2:
+        raise ValueError("depth must have shape (H, W)")
+    if image_arr.shape[:2] != depth_arr.shape:
+        raise ValueError("image and depth must have matching height and width")
+
+    z = depth_arr / scale
+    valid = np.isfinite(z) & (z > 0.0)
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+
+    rows, cols = np.nonzero(valid)
+    z_valid = z[rows, cols]
+    x = (cols - intrinsics[2]) * z_valid / intrinsics[0]
+    y = (rows - intrinsics[3]) * z_valid / intrinsics[1]
+    colors = image_arr[rows, cols]
+    if colors.ndim == 1:
+        colors = colors[:, None]
+    return np.column_stack((x, y, z_valid, colors))
+
+
+def project_dem_to_image(
+    elevation: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    x: np.ndarray | None = None,
+    y: np.ndarray | None = None,
+    resolution: float = 1.0,
+    origin: tuple[float, float] = (0.0, 0.0),
+    image_shape: tuple[int, int] | None = None,
+    transform: np.ndarray | None = None,
+    camera_matrix: np.ndarray | None = None,
+    return_depth: bool = False,
+):
+    """Project DEM grid points into image pixels, preserving the DEM grid shape."""
+
+    points = dem_grid_to_points(elevation, x=x, y=y, resolution=resolution, origin=origin)
+    pixels, depth, valid = project_points_to_image(
+        points.reshape(-1, 3),
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        image_shape=image_shape,
+        transform=transform,
+        camera_matrix=camera_matrix,
+        return_depth=True,
+    )
+
+    grid_shape = points.shape[:2]
+    pixels = pixels.reshape((*grid_shape, 2))
+    valid = valid.reshape(grid_shape)
+    if return_depth:
+        return pixels, depth.reshape(grid_shape), valid
+    return pixels, valid
+
+
 def crop_bounds(points: np.ndarray, min_bound=None, max_bound=None, return_mask: bool = False):
     """Select points inside axis-aligned XYZ bounds."""
 
@@ -325,6 +648,39 @@ def _transform_quaternions(quaternions: np.ndarray, transform: np.ndarray) -> np
     q = _normalize_quaternions(np.asarray(quaternions, dtype=np.float64))
     rotation_q = _rotation_matrix_to_quaternion(_as_transform_matrix(transform)[:3, :3])
     return _normalize_quaternions(_quaternion_multiply(rotation_q, q))
+
+
+def _camera_intrinsics(
+    fx: float | None,
+    fy: float | None,
+    cx: float | None,
+    cy: float | None,
+    matrix: np.ndarray | None,
+) -> np.ndarray:
+    if matrix is not None:
+        intrinsics = np.asarray(matrix, dtype=np.float64)
+        if intrinsics.shape != (3, 3):
+            raise ValueError("camera_matrix must have shape (3, 3)")
+        fx = intrinsics[0, 0]
+        fy = intrinsics[1, 1]
+        cx = intrinsics[0, 2]
+        cy = intrinsics[1, 2]
+    elif fx is None or fy is None or cx is None or cy is None:
+        raise ValueError("provide fx, fy, cx, and cy or camera_matrix")
+
+    if fx == 0 or fy == 0:
+        raise ValueError("fx and fy must be non-zero")
+    return np.array([fx, fy, cx, cy], dtype=np.float64)
+
+
+def _image_height_width(image_shape: tuple[int, int]) -> tuple[int, int]:
+    if len(image_shape) < 2:
+        raise ValueError("image_shape must contain at least height and width")
+    height = int(image_shape[0])
+    width = int(image_shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("image_shape must contain positive height and width")
+    return height, width
 
 
 def _normalize_frame_transform(transform: np.ndarray, timestamps: np.ndarray | None):

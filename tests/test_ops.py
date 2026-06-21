@@ -7,7 +7,9 @@ from ade.ops import (
     align_nearest,
     align_topic,
     apply_transform,
+    camera_matrix,
     cluster_dbscan,
+    colorize_points,
     crop_bounds,
     crop_raster,
     dataset_query,
@@ -31,13 +33,19 @@ from ade.ops import (
     normalize_quaternion,
     odometry_to_trajectory,
     pad_image,
+    points_to_depth_image,
+    project_dem_to_image,
+    project_points_to_image,
     radius_outlier_filter,
     reduce_topic,
     resample_topic,
     rolling_window_join,
     resize_nearest,
+    rgbd_to_points,
     rgb_to_gray,
     sample_grid,
+    sample_image_at_pixels,
+    sample_image_at_points,
     segment_plane,
     select_indices,
     select_time_range,
@@ -548,6 +556,86 @@ def test_image_depth_operations():
 
     points = depth_to_points(depth, fx=1.0, fy=1.0, cx=0.0, cy=0.0)
     assert np.allclose(points, np.array([[0.0, 0.0, 1.0], [0.0, 2.0, 2.0]]))
+
+
+def test_projection_helpers_between_sensor_arrays():
+    intrinsics = camera_matrix(fx=2.0, fy=2.0, cx=1.0, cy=1.0)
+    points = np.array([
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 1.0],
+        [0.0, 1.0, 2.0],
+        [0.0, 0.0, -1.0],
+    ])
+
+    pixels, depth, mask = project_points_to_image(
+        points,
+        image_shape=(3, 3),
+        camera_matrix=intrinsics,
+        return_depth=True,
+    )
+    assert np.allclose(pixels[:3], np.array([[1.0, 1.0], [2.0, 1.0], [1.0, 2.0]]))
+    assert np.allclose(depth, np.array([1.0, 1.0, 2.0, -1.0]))
+    assert mask.tolist() == [True, True, True, False]
+
+    gray = np.array([[0.0, 10.0], [20.0, 30.0]])
+    interpolated = sample_image_at_pixels(gray, np.array([[0.5, 0.5]]))
+    assert np.allclose(interpolated, np.array([15.0]))
+
+    rgb = np.arange(27, dtype=np.float64).reshape(3, 3, 3)
+    sampled, sampled_mask = sample_image_at_points(
+        rgb,
+        points,
+        camera_matrix=intrinsics,
+        bilinear=False,
+        return_mask=True,
+    )
+    assert sampled_mask.tolist() == [True, True, True, False]
+    assert np.allclose(sampled[0], rgb[1, 1])
+    assert np.allclose(sampled[1], rgb[1, 2])
+    assert np.allclose(sampled[2], rgb[2, 1])
+
+    colorized, color_mask = colorize_points(
+        points,
+        rgb,
+        camera_matrix=intrinsics,
+        bilinear=False,
+        return_mask=True,
+    )
+    assert color_mask.tolist() == [True, True, True, False]
+    assert colorized.shape == (4, 6)
+    assert np.allclose(colorized[1, :3], points[1])
+    assert np.allclose(colorized[1, 3:], rgb[1, 2])
+    assert np.isnan(colorized[3, 3:]).all()
+
+    depth_image, index_image = points_to_depth_image(
+        np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 1.0], [0.5, 0.0, 1.0]]),
+        image_shape=(3, 3),
+        camera_matrix=intrinsics,
+        return_indices=True,
+    )
+    assert np.allclose(depth_image[1, 1], 1.0)
+    assert index_image[1, 1] == 1
+    assert np.allclose(depth_image[1, 2], 1.0)
+
+    aligned_depth = np.array([[1.0, 0.0], [2.0, 3.0]])
+    aligned_rgb = np.arange(12, dtype=np.float64).reshape(2, 2, 3)
+    rgbd_points = rgbd_to_points(aligned_depth, aligned_rgb, fx=1.0, fy=1.0, cx=0.0, cy=0.0)
+    assert np.allclose(rgbd_points[:, :3], np.array([[0.0, 0.0, 1.0], [0.0, 2.0, 2.0], [3.0, 3.0, 3.0]]))
+    assert np.allclose(rgbd_points[2, 3:], aligned_rgb[1, 1])
+
+    dem_pixels, dem_depth, dem_mask = project_dem_to_image(
+        np.ones((2, 2), dtype=np.float64),
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        image_shape=(3, 3),
+        return_depth=True,
+    )
+    assert dem_pixels.shape == (2, 2, 2)
+    assert np.allclose(dem_pixels[1, 1], np.array([1.0, 1.0]))
+    assert np.allclose(dem_depth, np.ones((2, 2)))
+    assert dem_mask.all()
 
 
 def test_navigation_operations():

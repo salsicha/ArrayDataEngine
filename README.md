@@ -185,6 +185,17 @@ frames.add_time_varying_transform(
 points_in_odom = frames.transform_points(points_in_lidar, "lidar", "odom", timestamp=12.5)
 ```
 
+Projection helpers connect point clouds, depth images, RGB images, DEM grids, and camera frames with pinhole intrinsics.
+
+```python
+from ade.ops import colorize_points, points_to_depth_image, project_dem_to_image, rgbd_to_points
+
+rgbd_cloud = rgbd_to_points(depth_image, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+colored_lidar = colorize_points(points_in_camera, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+rendered_depth = points_to_depth_image(points_in_camera, image_shape=rgb_image.shape[:2], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+dem_pixels, dem_mask = project_dem_to_image(elevation, fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2])
+```
+
 IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity.
 
 ```python
@@ -275,7 +286,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, bounds cropping, point cloud downsampling/search/normals/outlier filters/clustering/plane segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 
