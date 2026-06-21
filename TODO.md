@@ -28,9 +28,9 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add crop/select helpers for axis-aligned bounds, oriented bounds, masks, and geographic bounding boxes.
   - [x] Add axis-aligned XYZ bounds cropping with mask output.
 - [ ] Add point cloud operations:
-  - [ ] Downsample by voxel grid, uniform sampling, random sampling, and farthest-point sampling.
+  - [x] Downsample by voxel grid, uniform sampling, random sampling, and farthest-point sampling.
   - [x] Add voxel-grid downsampling.
-  - [ ] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
+  - [x] Estimate normals, local covariance, curvature-like descriptors, and nearest-neighbor distance statistics.
   - [x] Add normal estimation.
   - [x] Remove outliers with statistical and radius-based filters.
   - [ ] Cluster and segment with DBSCAN, plane fitting, connected components, and ground/non-ground separation.

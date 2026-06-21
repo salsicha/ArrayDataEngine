@@ -15,12 +15,14 @@ from ade.ops import (
     crop_geographic_bounds,
     crop_oriented_bounds,
     crop_raster,
+    curvature_descriptors,
     dataset_query,
     dem_grid_to_points,
     depth_to_points,
     DatasetQuery,
     enu_to_navsat,
     estimate_normals,
+    farthest_point_downsample,
     filter_topic,
     FrameGraph,
     geographic_bounds_mask,
@@ -29,10 +31,13 @@ from ade.ops import (
     interpolate_timeseries,
     iter_chunks,
     knn_search,
+    local_covariances,
     map_topic,
     mosaic_tiles,
     navsat_to_enu,
     navsat_to_trajectory,
+    nearest_neighbor_distance_stats,
+    nearest_neighbor_distances,
     normalize_image,
     normalize_quaternion,
     odometry_to_trajectory,
@@ -41,6 +46,7 @@ from ade.ops import (
     points_to_depth_image,
     project_dem_to_image,
     project_points_to_image,
+    random_downsample,
     radius_outlier_filter,
     reduce_topic,
     resample_topic,
@@ -69,6 +75,7 @@ from ade.ops import (
     transform_poses,
     transform_vectors,
     trajectory_speed,
+    uniform_downsample,
     valid_depth_mask,
     voxel_downsample,
     window_topic,
@@ -454,12 +461,53 @@ def test_geometry_and_point_cloud_operations():
     assert downsampled.shape == (2, 3)
     assert np.allclose(downsampled, np.array([[0.05, 0.0, 0.0], [1.05, 1.0, 0.0]]))
 
+    attributed_points = np.column_stack((np.arange(6, dtype=np.float64), np.zeros((6, 2)), np.arange(100, 106)))
+    uniform, uniform_indices = uniform_downsample(attributed_points, every_k=2, return_indices=True)
+    assert uniform_indices.tolist() == [0, 2, 4]
+    assert np.allclose(uniform[:, 3], np.array([100.0, 102.0, 104.0]))
+
+    random_sample, random_indices = random_downsample(attributed_points, count=3, seed=4, return_indices=True)
+    expected_random = np.sort(np.random.default_rng(4).choice(attributed_points.shape[0], size=3, replace=False))
+    assert random_indices.tolist() == expected_random.tolist()
+    assert np.allclose(random_sample, attributed_points[expected_random])
+
+    ratio_sample = random_downsample(attributed_points, ratio=0.5, seed=1)
+    assert ratio_sample.shape == (3, 4)
+
+    line = np.column_stack((np.arange(5, dtype=np.float64), np.zeros((5, 2))))
+    farthest, farthest_indices = farthest_point_downsample(line, count=3, start_index=0, return_indices=True)
+    assert farthest_indices.tolist() == [0, 4, 2]
+    assert np.allclose(farthest[:, 0], np.array([0.0, 4.0, 2.0]))
+
     distances, indices = knn_search(points, np.array([0.0, 0.0, 0.0]), k=2)
     assert indices.shape == (1, 2)
     assert np.allclose(distances[0, 0], 0.0)
 
     normals = estimate_normals(points[:4], k=3, orient_toward=np.array([0.0, 0.0, 1.0]))
     assert np.allclose(normals[:, 2], np.ones(4))
+
+    covariances, covariance_indices = local_covariances(points[:4], k=3, return_indices=True)
+    assert covariances.shape == (4, 3, 3)
+    assert covariance_indices.shape == (4, 3)
+    assert np.allclose(covariances[:, 2, :], 0.0)
+    assert np.allclose(covariances[:, :, 2], 0.0)
+
+    descriptors = curvature_descriptors(points[:4], k=3)
+    assert descriptors["eigenvalues"].shape == (4, 3)
+    assert np.allclose(descriptors["curvature"], np.zeros(4))
+    assert np.all(descriptors["linearity"] >= 0.0)
+    assert np.all(descriptors["planarity"] >= 0.0)
+
+    neighbor_distances = nearest_neighbor_distances(line, k=2)
+    assert neighbor_distances.shape == (5, 2)
+    assert np.allclose(neighbor_distances[0], np.array([1.0, 2.0]))
+    assert np.allclose(neighbor_distances[2], np.array([1.0, 1.0]))
+
+    distance_stats = nearest_neighbor_distance_stats(line, k=2)
+    assert np.allclose(distance_stats["per_point_mean"][0], 1.5)
+    assert np.allclose(distance_stats["per_point_mean"][2], 1.0)
+    assert np.isclose(distance_stats["global_min"], 1.0)
+    assert np.isclose(distance_stats["global_max"], 2.0)
 
     filtered, stat_mask = statistical_outlier_filter(points, k=2, std_ratio=1.0, return_mask=True)
     assert filtered.shape[0] == 4
