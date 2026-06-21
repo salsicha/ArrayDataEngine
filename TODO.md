@@ -37,13 +37,13 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add DBSCAN clustering and RANSAC-style plane fitting.
   - [x] Add nearest-neighbor search with KNN, radius search, and hybrid search.
   - [x] Add KNN and radius search.
-  - [ ] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
-  - [ ] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
+  - [x] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
+  - [x] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
 - [ ] Add image and depth operations:
-  - [ ] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
+  - [x] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
   - [x] Add resize-nearest, pad, normalize, and RGB-to-gray helpers.
-  - [ ] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
-  - [ ] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
+  - [x] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
+  - [x] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
   - [x] Add valid-depth masks and depth backprojection to point clouds.
   - [ ] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
   - [ ] Add camera model utilities for intrinsics, distortion, rectification, and projection.

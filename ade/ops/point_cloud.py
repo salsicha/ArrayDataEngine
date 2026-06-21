@@ -5,7 +5,7 @@ from itertools import product
 
 import numpy as np
 
-from .geometry import _as_points, apply_transform, crop_bounds
+from .geometry import _as_points, _as_transform_matrix, apply_transform, crop_bounds
 
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -582,6 +582,547 @@ def segment_ground(
     return ground, non_ground, ground_mask
 
 
+def point_to_point_icp(
+    source: np.ndarray,
+    target: np.ndarray,
+    initial_transform: np.ndarray | None = None,
+    max_iterations: int = 20,
+    max_correspondence_distance: float | None = None,
+    relative_rmse_tolerance: float = 1.0e-6,
+    relative_fitness_tolerance: float = 1.0e-6,
+    min_correspondences: int = 3,
+    return_correspondences: bool = False,
+) -> dict:
+    """Register `source` to `target` with point-to-point ICP."""
+
+    source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
+    previous_rmse = np.inf
+    previous_fitness = 0.0
+    converged = False
+    correspondences = _empty_correspondences()
+    iteration = 0
+
+    for iteration in range(1, max(int(max_iterations), 0) + 1):
+        transformed = _transform_points_xyz(source_arr[:, :3], transform)
+        correspondences = _nearest_correspondences(
+            transformed,
+            target_arr,
+            max_correspondence_distance=max_correspondence_distance,
+        )
+        if correspondences["source_indices"].size < min_correspondences:
+            break
+
+        source_matches = transformed[correspondences["source_indices"]]
+        target_matches = target_arr[correspondences["target_indices"], :3]
+        delta = _best_fit_transform(source_matches, target_matches)
+        transform = delta @ transform
+
+        metrics = _registration_metrics(
+            source_arr,
+            target_arr,
+            transform,
+            max_correspondence_distance=max_correspondence_distance,
+        )
+        rmse = metrics["inlier_rmse"]
+        fitness = metrics["fitness"]
+        if (
+            abs(previous_rmse - rmse) <= relative_rmse_tolerance
+            and abs(previous_fitness - fitness) <= relative_fitness_tolerance
+        ):
+            correspondences = metrics["correspondences"]
+            converged = True
+            break
+        previous_rmse = rmse
+        previous_fitness = fitness
+        correspondences = metrics["correspondences"]
+
+    return _registration_result(
+        transform,
+        source_arr,
+        target_arr,
+        correspondences,
+        iteration,
+        converged,
+        "point_to_point",
+        return_correspondences=return_correspondences,
+    )
+
+
+def point_to_plane_icp(
+    source: np.ndarray,
+    target: np.ndarray,
+    target_normals: np.ndarray | None = None,
+    initial_transform: np.ndarray | None = None,
+    max_iterations: int = 20,
+    max_correspondence_distance: float | None = None,
+    relative_rmse_tolerance: float = 1.0e-6,
+    min_correspondences: int = 6,
+    normal_k: int = 8,
+    return_correspondences: bool = False,
+) -> dict:
+    """Register `source` to `target` with linearized point-to-plane ICP."""
+
+    source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
+    normals = _registration_normals(target_arr, target_normals, normal_k)
+    previous_rmse = np.inf
+    converged = False
+    correspondences = _empty_correspondences()
+    iteration = 0
+
+    for iteration in range(1, max(int(max_iterations), 0) + 1):
+        transformed = _transform_points_xyz(source_arr[:, :3], transform)
+        correspondences = _nearest_correspondences(
+            transformed,
+            target_arr,
+            max_correspondence_distance=max_correspondence_distance,
+        )
+        if correspondences["source_indices"].size < min_correspondences:
+            break
+
+        source_matches = transformed[correspondences["source_indices"]]
+        target_matches = target_arr[correspondences["target_indices"], :3]
+        normal_matches = normals[correspondences["target_indices"]]
+        delta = _point_to_plane_delta(source_matches, target_matches, normal_matches)
+        transform = delta @ transform
+
+        metrics = _registration_metrics(
+            source_arr,
+            target_arr,
+            transform,
+            target_normals=normals,
+            max_correspondence_distance=max_correspondence_distance,
+        )
+        rmse = metrics["inlier_rmse"]
+        if abs(previous_rmse - rmse) <= relative_rmse_tolerance:
+            correspondences = metrics["correspondences"]
+            converged = True
+            break
+        previous_rmse = rmse
+        correspondences = metrics["correspondences"]
+
+    return _registration_result(
+        transform,
+        source_arr,
+        target_arr,
+        correspondences,
+        iteration,
+        converged,
+        "point_to_plane",
+        target_normals=normals,
+        return_correspondences=return_correspondences,
+    )
+
+
+def multi_scale_icp(
+    source: np.ndarray,
+    target: np.ndarray,
+    voxel_sizes=(1.0, 0.5, 0.25),
+    method: str = "point_to_point",
+    initial_transform: np.ndarray | None = None,
+    max_iterations: int | tuple[int, ...] | list[int] = 20,
+    max_correspondence_distances: float | tuple[float, ...] | list[float] | None = None,
+    **kwargs,
+) -> dict:
+    """Run ICP from coarse to fine voxel scales."""
+
+    source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
+    scales = tuple(float(size) for size in voxel_sizes)
+    if not scales:
+        scales = (0.0,)
+    if any(size < 0.0 for size in scales):
+        raise ValueError("voxel_sizes must be non-negative")
+
+    iterations = _scale_parameter(max_iterations, len(scales), "max_iterations")
+    distances = _scale_parameter(max_correspondence_distances, len(scales), "max_correspondence_distances")
+    levels = []
+    for level, voxel_size in enumerate(scales):
+        level_source = source_arr if voxel_size == 0.0 else voxel_downsample(source_arr, voxel_size)
+        level_target = target_arr if voxel_size == 0.0 else voxel_downsample(target_arr, voxel_size)
+        max_distance = distances[level]
+        if max_distance is None and voxel_size > 0.0:
+            max_distance = voxel_size * 2.0
+
+        icp_kwargs = dict(kwargs)
+        icp_kwargs.pop("return_correspondences", None)
+        if method == "point_to_point":
+            result = point_to_point_icp(
+                level_source,
+                level_target,
+                initial_transform=transform,
+                max_iterations=int(iterations[level]),
+                max_correspondence_distance=max_distance,
+                return_correspondences=False,
+                **icp_kwargs,
+            )
+        elif method == "point_to_plane":
+            result = point_to_plane_icp(
+                level_source,
+                level_target,
+                initial_transform=transform,
+                max_iterations=int(iterations[level]),
+                max_correspondence_distance=max_distance,
+                return_correspondences=False,
+                **icp_kwargs,
+            )
+        else:
+            raise ValueError("method must be 'point_to_point' or 'point_to_plane'")
+
+        transform = result["transform"]
+        levels.append({
+            "voxel_size": voxel_size,
+            "result": result,
+        })
+
+    final_metrics = _registration_metrics(source_arr, target_arr, transform)
+    final = _registration_result(
+        transform,
+        source_arr,
+        target_arr,
+        final_metrics["correspondences"],
+        int(sum(int(value) for value in iterations)),
+        bool(levels and levels[-1]["result"]["converged"]),
+        f"multi_scale_{method}",
+    )
+    final["levels"] = levels
+    return final
+
+
+def odometry_seeded_icp(
+    source: np.ndarray,
+    target: np.ndarray,
+    odometry_transform: np.ndarray | None = None,
+    source_pose: np.ndarray | None = None,
+    target_pose: np.ndarray | None = None,
+    method: str = "point_to_point",
+    **kwargs,
+) -> dict:
+    """Run ICP with an odometry-derived initial source-to-target transform."""
+
+    if odometry_transform is not None:
+        seed = _as_transform_matrix(odometry_transform)
+    elif source_pose is not None and target_pose is not None:
+        seed = np.linalg.inv(_as_transform_matrix(target_pose)) @ _as_transform_matrix(source_pose)
+    else:
+        raise ValueError("provide odometry_transform or both source_pose and target_pose")
+
+    if method == "point_to_point":
+        result = point_to_point_icp(source, target, initial_transform=seed, **kwargs)
+    elif method == "point_to_plane":
+        result = point_to_plane_icp(source, target, initial_transform=seed, **kwargs)
+    elif method == "multi_scale":
+        result = multi_scale_icp(source, target, initial_transform=seed, **kwargs)
+    else:
+        raise ValueError("method must be 'point_to_point', 'point_to_plane', or 'multi_scale'")
+
+    result["odometry_seed"] = seed
+    return result
+
+
+def to_open3d_point_cloud(
+    points: np.ndarray,
+    colors: np.ndarray | None = None,
+    normals: np.ndarray | None = None,
+    color_columns: tuple[int, int, int] | None = None,
+    normal_columns: tuple[int, int, int] | None = None,
+    normalize_colors: bool = True,
+):
+    """Convert an ADE/NumPy point array to an Open3D `PointCloud`."""
+
+    o3d = _import_open3d()
+    arr = _as_points(points)
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(np.asarray(arr[:, :3], dtype=np.float64))
+
+    color_values = _optional_columns(arr, colors, color_columns, "colors")
+    if color_values is not None:
+        point_cloud.colors = o3d.utility.Vector3dVector(
+            _normalize_open3d_colors(color_values, normalize=normalize_colors)
+        )
+
+    normal_values = _optional_columns(arr, normals, normal_columns, "normals")
+    if normal_values is not None:
+        point_cloud.normals = o3d.utility.Vector3dVector(_normalize_vector3_array(normal_values, "normals"))
+
+    return point_cloud
+
+
+def from_open3d_point_cloud(
+    point_cloud,
+    include_colors: bool = True,
+    include_normals: bool = True,
+    as_dict: bool = False,
+) -> np.ndarray | dict[str, np.ndarray]:
+    """Convert an Open3D `PointCloud` to NumPy arrays."""
+
+    _import_open3d()
+    points = np.asarray(point_cloud.points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Open3D point cloud points must have shape (N, 3)")
+
+    colors = _open3d_optional_array(point_cloud, "colors", points.shape[0]) if include_colors else None
+    normals = _open3d_optional_array(point_cloud, "normals", points.shape[0]) if include_normals else None
+
+    if as_dict:
+        result = {"points": points.copy()}
+        if colors is not None:
+            result["colors"] = colors.copy()
+        if normals is not None:
+            result["normals"] = normals.copy()
+        return result
+
+    arrays = [points]
+    if colors is not None:
+        arrays.append(colors)
+    if normals is not None:
+        arrays.append(normals)
+    return np.column_stack(arrays)
+
+
+def _registration_inputs(source: np.ndarray, target: np.ndarray, initial_transform: np.ndarray | None):
+    source_arr = _as_points(source)
+    target_arr = _as_points(target)
+    if source_arr.shape[0] == 0 or target_arr.shape[0] == 0:
+        raise ValueError("source and target must contain at least one point")
+    transform = np.eye(4, dtype=np.float64) if initial_transform is None else _as_transform_matrix(initial_transform)
+    return source_arr, target_arr, transform.copy()
+
+
+def _transform_points_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    matrix = _as_transform_matrix(transform)
+    arr = np.asarray(points, dtype=np.float64)
+    return arr[:, :3] @ matrix[:3, :3].T + matrix[:3, 3]
+
+
+def _nearest_correspondences(
+    transformed_source_xyz: np.ndarray,
+    target: np.ndarray,
+    max_correspondence_distance: float | None,
+) -> dict[str, np.ndarray]:
+    if max_correspondence_distance is not None:
+        distances, target_indices, counts = hybrid_search(
+            target,
+            transformed_source_xyz,
+            radius=float(max_correspondence_distance),
+            max_neighbors=1,
+        )
+        mask = counts > 0
+        source_indices = np.flatnonzero(mask).astype(np.int64, copy=False)
+        return {
+            "source_indices": source_indices,
+            "target_indices": target_indices[mask, 0],
+            "distances": distances[mask, 0],
+        }
+
+    distances, target_indices = knn_search(target, transformed_source_xyz, k=1)
+    return {
+        "source_indices": np.arange(transformed_source_xyz.shape[0], dtype=np.int64),
+        "target_indices": target_indices[:, 0],
+        "distances": distances[:, 0],
+    }
+
+
+def _best_fit_transform(source_xyz: np.ndarray, target_xyz: np.ndarray) -> np.ndarray:
+    source_centroid = source_xyz.mean(axis=0)
+    target_centroid = target_xyz.mean(axis=0)
+    source_centered = source_xyz - source_centroid
+    target_centered = target_xyz - target_centroid
+    covariance = source_centered.T @ target_centered
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    translation = target_centroid - rotation @ source_centroid
+
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = translation
+    return transform
+
+
+def _registration_normals(target: np.ndarray, target_normals: np.ndarray | None, normal_k: int) -> np.ndarray:
+    if target_normals is None:
+        return estimate_normals(target, k=normal_k)
+
+    normals = np.asarray(target_normals, dtype=np.float64)
+    if normals.shape != (target.shape[0], 3):
+        raise ValueError("target_normals must have shape (N, 3)")
+    norm = np.linalg.norm(normals, axis=1, keepdims=True)
+    if np.any(norm == 0.0):
+        raise ValueError("target_normals cannot contain zero-length normals")
+    return normals / norm
+
+
+def _point_to_plane_delta(source_xyz: np.ndarray, target_xyz: np.ndarray, normals: np.ndarray) -> np.ndarray:
+    cross_terms = np.cross(source_xyz, normals)
+    a = np.column_stack((cross_terms, normals))
+    b = -np.einsum("ij,ij->i", normals, source_xyz - target_xyz)
+    twist, *_ = np.linalg.lstsq(a, b, rcond=None)
+    return _se3_from_twist(twist)
+
+
+def _se3_from_twist(twist: np.ndarray) -> np.ndarray:
+    omega = np.asarray(twist[:3], dtype=np.float64)
+    translation = np.asarray(twist[3:6], dtype=np.float64)
+    theta = float(np.linalg.norm(omega))
+    if theta <= np.finfo(np.float64).eps:
+        rotation = np.eye(3, dtype=np.float64)
+    else:
+        axis = omega / theta
+        skew = np.array([
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ], dtype=np.float64)
+        rotation = np.eye(3, dtype=np.float64) + np.sin(theta) * skew + (1.0 - np.cos(theta)) * (skew @ skew)
+
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = translation
+    return transform
+
+
+def _registration_metrics(
+    source: np.ndarray,
+    target: np.ndarray,
+    transform: np.ndarray,
+    target_normals: np.ndarray | None = None,
+    max_correspondence_distance: float | None = None,
+) -> dict:
+    transformed = _transform_points_xyz(source[:, :3], transform)
+    correspondences = _nearest_correspondences(
+        transformed,
+        target,
+        max_correspondence_distance=max_correspondence_distance,
+    )
+    return _metrics_from_correspondences(source, target, transform, correspondences, target_normals)
+
+
+def _metrics_from_correspondences(
+    source: np.ndarray,
+    target: np.ndarray,
+    transform: np.ndarray,
+    correspondences: dict[str, np.ndarray],
+    target_normals: np.ndarray | None = None,
+) -> dict:
+    if correspondences["source_indices"].size == 0:
+        return {
+            "fitness": 0.0,
+            "inlier_rmse": np.inf,
+            "correspondences": correspondences,
+        }
+
+    transformed = _transform_points_xyz(source[:, :3], transform)
+    source_matches = transformed[correspondences["source_indices"]]
+    target_matches = target[correspondences["target_indices"], :3]
+    if target_normals is None:
+        residuals = np.linalg.norm(source_matches - target_matches, axis=1)
+    else:
+        normals = target_normals[correspondences["target_indices"]]
+        residuals = np.abs(np.einsum("ij,ij->i", normals, source_matches - target_matches))
+
+    return {
+        "fitness": float(correspondences["source_indices"].size / source.shape[0]),
+        "inlier_rmse": float(np.sqrt(np.mean(residuals ** 2))),
+        "correspondences": correspondences,
+    }
+
+
+def _registration_result(
+    transform: np.ndarray,
+    source: np.ndarray,
+    target: np.ndarray,
+    correspondences: dict[str, np.ndarray],
+    iterations: int,
+    converged: bool,
+    method: str,
+    target_normals: np.ndarray | None = None,
+    return_correspondences: bool = False,
+) -> dict:
+    metrics = _metrics_from_correspondences(source, target, transform, correspondences, target_normals)
+    result = {
+        "transform": transform,
+        "fitness": metrics["fitness"],
+        "inlier_rmse": metrics["inlier_rmse"],
+        "correspondence_count": int(metrics["correspondences"]["source_indices"].size),
+        "iterations": int(iterations),
+        "converged": bool(converged),
+        "method": method,
+    }
+    if return_correspondences:
+        result["correspondences"] = metrics["correspondences"]
+    return result
+
+
+def _empty_correspondences() -> dict[str, np.ndarray]:
+    return {
+        "source_indices": np.empty((0,), dtype=np.int64),
+        "target_indices": np.empty((0,), dtype=np.int64),
+        "distances": np.empty((0,), dtype=np.float64),
+    }
+
+
+def _scale_parameter(value, count: int, name: str):
+    if isinstance(value, (tuple, list)):
+        if len(value) != count:
+            raise ValueError(f"{name} length must match voxel_sizes length")
+        return tuple(value)
+    return tuple(value for _ in range(count))
+
+
+def _import_open3d():
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise ImportError(
+            "Open3D point cloud adapters require the optional `open3d` dependency. "
+            "Install it directly or use the `visualization` extra."
+        ) from exc
+    return o3d
+
+
+def _optional_columns(
+    points: np.ndarray,
+    values: np.ndarray | None,
+    columns: tuple[int, int, int] | None,
+    name: str,
+) -> np.ndarray | None:
+    if values is not None and columns is not None:
+        raise ValueError(f"provide either {name} or {name[:-1]}_columns, not both")
+    if values is not None:
+        return _normalize_vector3_array(values, name)
+    if columns is None:
+        return None
+    if len(columns) != 3:
+        raise ValueError(f"{name[:-1]}_columns must contain three column indices")
+    if any(column < 0 or column >= points.shape[1] for column in columns):
+        raise ValueError(f"{name[:-1]}_columns must refer to valid point-array columns")
+    return np.asarray(points[:, columns], dtype=np.float64)
+
+
+def _normalize_vector3_array(values: np.ndarray, name: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"{name} must have shape (N, 3)")
+    return arr
+
+
+def _normalize_open3d_colors(colors: np.ndarray, normalize: bool) -> np.ndarray:
+    arr = _normalize_vector3_array(colors, "colors")
+    if normalize and arr.size and (np.issubdtype(np.asarray(colors).dtype, np.integer) or np.nanmax(arr) > 1.0):
+        arr = arr / 255.0
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _open3d_optional_array(point_cloud, attribute: str, count: int) -> np.ndarray | None:
+    values = np.asarray(getattr(point_cloud, attribute), dtype=np.float64)
+    if values.size == 0:
+        return None
+    if values.shape != (count, 3):
+        raise ValueError(f"Open3D point cloud {attribute} must have shape (N, 3)")
+    return values
+
+
 __all__ = [
     "apply_transform",
     "cluster_dbscan",
@@ -590,17 +1131,23 @@ __all__ = [
     "curvature_descriptors",
     "estimate_normals",
     "farthest_point_downsample",
+    "from_open3d_point_cloud",
     "hybrid_search",
     "knn_search",
     "local_covariances",
     "nearest_neighbor_distance_stats",
     "nearest_neighbor_distances",
+    "multi_scale_icp",
+    "odometry_seeded_icp",
+    "point_to_plane_icp",
+    "point_to_point_icp",
     "radius_outlier_filter",
     "radius_search",
     "random_downsample",
     "segment_ground",
     "segment_plane",
     "statistical_outlier_filter",
+    "to_open3d_point_cloud",
     "uniform_downsample",
     "voxel_downsample",
 ]

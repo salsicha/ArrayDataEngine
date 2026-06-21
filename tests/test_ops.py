@@ -1,3 +1,6 @@
+import sys
+import types
+
 import numpy as np
 
 from ade.buffer import DataBuffer
@@ -6,46 +9,72 @@ from ade.ops import (
     align_exact,
     align_nearest,
     align_topic,
+    apply_image_mask,
     apply_transform,
     bounds_mask,
     camera_matrix,
     cluster_dbscan,
+    close_mask,
     connected_components,
+    convert_color,
+    convert_image_dtype,
     colorize_points,
     crop_bounds,
     crop_geographic_bounds,
+    crop_image,
+    crop_images,
     crop_oriented_bounds,
     crop_raster,
     curvature_descriptors,
     dataset_query,
     dem_grid_to_points,
+    depth_to_normals,
+    depth_to_point_grid,
     depth_to_points,
     DatasetQuery,
+    dilate_mask,
     enu_to_navsat,
+    erode_mask,
     estimate_normals,
     farthest_point_downsample,
     filter_topic,
     FrameGraph,
+    from_open3d_point_cloud,
+    fuse_rgbd_frames,
     geographic_bounds_mask,
     hillshade,
     hybrid_search,
+    image_gradients,
+    image_mask,
+    image_pyramid,
+    iter_rgbd_frame_points,
     imu_to_trajectory,
     interpolate_timeseries,
     iter_chunks,
     knn_search,
     local_covariances,
+    local_mean,
+    local_statistics,
+    local_std,
     map_topic,
     mosaic_tiles,
+    multi_scale_icp,
     navsat_to_enu,
     navsat_to_trajectory,
     nearest_neighbor_distance_stats,
     nearest_neighbor_distances,
     normalize_image,
+    normalize_images,
     normalize_quaternion,
     odometry_to_trajectory,
+    odometry_seeded_icp,
+    open_mask,
     oriented_bounds_mask,
     pad_image,
+    pad_images,
     points_to_depth_image,
+    point_to_plane_icp,
+    point_to_point_icp,
     project_dem_to_image,
     project_points_to_image,
     random_downsample,
@@ -53,6 +82,8 @@ from ade.ops import (
     reduce_topic,
     resample_topic,
     rolling_window_join,
+    resize_images,
+    resize_images_nearest,
     resize_nearest,
     rgbd_to_points,
     rgb_to_gray,
@@ -68,8 +99,10 @@ from ade.ops import (
     slerp,
     slope_aspect,
     statistical_outlier_filter,
+    threshold_image,
     TopicPipeline,
     TopicView,
+    to_open3d_point_cloud,
     topic_pipeline,
     topic_view,
     transform_dem_grid,
@@ -576,6 +609,122 @@ def test_geometry_and_point_cloud_operations():
     assert ground_plane[2] > 0.0
 
 
+def test_point_cloud_registration_helpers():
+    source = np.array([
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 2.0],
+        [2.0, 2.0, 0.0],
+        [2.0, 0.0, 2.0],
+    ])
+    translation = np.array([0.25, -0.2, 0.1])
+    target = source + translation
+
+    point_result = point_to_point_icp(
+        source,
+        target,
+        max_iterations=10,
+        max_correspondence_distance=1.0,
+        return_correspondences=True,
+    )
+    assert np.allclose(point_result["transform"][:3, 3], translation)
+    assert np.allclose(point_result["transform"][:3, :3], np.eye(3))
+    assert point_result["correspondence_count"] == source.shape[0]
+    assert point_result["inlier_rmse"] < 1.0e-12
+    assert point_result["correspondences"]["source_indices"].shape == (source.shape[0],)
+
+    plane_target = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+    ])
+    plane_source = plane_target + np.array([0.0, 0.0, 0.25])
+    normals = np.tile(np.array([0.0, 0.0, 1.0]), (plane_target.shape[0], 1))
+    plane_result = point_to_plane_icp(
+        plane_source,
+        plane_target,
+        target_normals=normals,
+        max_iterations=10,
+        max_correspondence_distance=1.0,
+        min_correspondences=3,
+    )
+    assert np.allclose(plane_result["transform"][:3, 3], np.array([0.0, 0.0, -0.25]))
+    assert plane_result["inlier_rmse"] < 1.0e-12
+
+    multi_result = multi_scale_icp(
+        source,
+        target,
+        voxel_sizes=(0.5, 0.0),
+        max_iterations=(5, 5),
+        max_correspondence_distances=(1.0, 1.0),
+    )
+    assert np.allclose(multi_result["transform"][:3, 3], translation)
+    assert len(multi_result["levels"]) == 2
+
+    source_pose = np.eye(4)
+    source_pose[:3, 3] = translation
+    target_pose = np.eye(4)
+    odom_result = odometry_seeded_icp(
+        source,
+        target,
+        source_pose=source_pose,
+        target_pose=target_pose,
+        max_iterations=3,
+        max_correspondence_distance=1.0,
+    )
+    assert np.allclose(odom_result["odometry_seed"], source_pose)
+    assert np.allclose(odom_result["transform"][:3, 3], translation)
+
+
+def test_open3d_point_cloud_adapters_use_optional_dependency():
+    class FakePointCloud:
+        def __init__(self):
+            self.points = np.empty((0, 3), dtype=np.float64)
+            self.colors = np.empty((0, 3), dtype=np.float64)
+            self.normals = np.empty((0, 3), dtype=np.float64)
+
+    fake_open3d = types.SimpleNamespace(
+        geometry=types.SimpleNamespace(PointCloud=FakePointCloud),
+        utility=types.SimpleNamespace(Vector3dVector=lambda values: np.asarray(values, dtype=np.float64).copy()),
+    )
+    sentinel = object()
+    previous = sys.modules.get("open3d", sentinel)
+    sys.modules["open3d"] = fake_open3d
+    try:
+        points = np.array([
+            [0.0, 0.0, 0.0, 255.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 2.0, 3.0, 0.0, 128.0, 255.0, 0.0, 1.0, 0.0],
+        ])
+        point_cloud = to_open3d_point_cloud(
+            points,
+            color_columns=(3, 4, 5),
+            normal_columns=(6, 7, 8),
+        )
+
+        assert np.allclose(point_cloud.points, points[:, :3])
+        assert np.allclose(point_cloud.colors, np.array([[1.0, 0.0, 0.0], [0.0, 128.0 / 255.0, 1.0]]))
+        assert np.allclose(point_cloud.normals, points[:, 6:9])
+
+        combined = from_open3d_point_cloud(point_cloud)
+        assert combined.shape == (2, 9)
+        assert np.allclose(combined[:, :3], points[:, :3])
+        assert np.allclose(combined[:, 3:6], point_cloud.colors)
+        assert np.allclose(combined[:, 6:9], point_cloud.normals)
+
+        separated = from_open3d_point_cloud(point_cloud, as_dict=True)
+        assert set(separated) == {"points", "colors", "normals"}
+        assert np.allclose(separated["points"], points[:, :3])
+    finally:
+        if previous is sentinel:
+            sys.modules.pop("open3d", None)
+        else:
+            sys.modules["open3d"] = previous
+
+
 def test_geographic_crop_and_bounds_masks():
     navsat = np.array([
         [37.0, -122.0, 10.0],
@@ -718,9 +867,90 @@ def test_image_depth_operations():
     assert resized[0, 0] == 0
     assert resized[-1, -1] == 15
 
+    assert np.allclose(crop_image(image, 0, 2, 1, 2), np.array([[5], [15]], dtype=np.uint8))
+
+    sequence = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    resized_sequence = resize_images_nearest(sequence, (3, 2))
+    assert resized_sequence.shape == (2, 3, 2)
+    assert np.allclose(resized_sequence[:, -1], sequence[:, -1][:, [0, 2]])
+    assert np.allclose(resize_images(sequence, (3, 2)), resized_sequence)
+
+    cropped_sequence = crop_images(sequence, 0, 2, 1, 3)
+    assert np.allclose(cropped_sequence, sequence[:, :, 1:3])
+
+    padded_sequence = pad_images(sequence, ((1, 0), (0, 1)), value=99)
+    assert padded_sequence.shape == (2, 3, 4)
+    assert np.all(padded_sequence[:, 0, :] == 99)
+    assert np.all(padded_sequence[:, :, -1] == 99)
+
+    normalized_sequence = normalize_images(sequence, per_image=True)
+    assert normalized_sequence.dtype == np.float32
+    assert np.isclose(normalized_sequence[0].min(), 0.0)
+    assert np.isclose(normalized_sequence[0].max(), 1.0)
+    assert np.isclose(normalized_sequence[1].min(), 0.0)
+    assert np.isclose(normalized_sequence[1].max(), 1.0)
+
     rgb = np.dstack([image, image, image])
     gray = rgb_to_gray(rgb)
     assert np.allclose(gray, image)
+
+    rgb_sequence = np.stack((rgb, rgb + 1), axis=0)
+    gray_sequence = convert_color(rgb_sequence, "rgb_to_gray")
+    assert gray_sequence.shape == (2, 2, 2)
+    assert np.allclose(gray_sequence[0], image)
+
+    bgr_sequence = convert_color(rgb_sequence, "rgb_to_bgr")
+    assert np.allclose(bgr_sequence[..., 0], rgb_sequence[..., 2])
+    assert np.allclose(bgr_sequence[..., 2], rgb_sequence[..., 0])
+
+    rgba_sequence = convert_color(rgb_sequence, "rgb_to_rgba")
+    assert rgba_sequence.shape == (2, 2, 2, 4)
+    assert np.all(rgba_sequence[..., 3] == 255)
+
+    gray_rgb = convert_color(image, "gray_to_rgb")
+    assert gray_rgb.shape == (2, 2, 3)
+    assert np.allclose(gray_rgb[..., 0], image)
+
+    float_image = convert_image_dtype(image, np.float32)
+    assert float_image.dtype == np.float32
+    assert np.allclose(float_image, image.astype(np.float32) / 255.0)
+    assert np.array_equal(convert_image_dtype(float_image, np.uint8), image)
+
+    bounded_mask = image_mask(image, min_value=5, max_value=10)
+    assert bounded_mask.tolist() == [[False, True], [True, False]]
+    masked_image = apply_image_mask(image, bounded_mask, fill_value=99)
+    assert np.array_equal(masked_image, np.array([[99, 5], [10, 99]], dtype=np.uint8))
+
+    thresholded = threshold_image(image, threshold=5, high=255, low=0, dtype=np.uint8)
+    assert np.array_equal(thresholded, np.array([[0, 255], [255, 255]], dtype=np.uint8))
+
+    single_pixel = np.zeros((3, 3), dtype=bool)
+    single_pixel[1, 1] = True
+    assert dilate_mask(single_pixel, size=3).sum() == 9
+    assert not open_mask(single_pixel, size=3).any()
+
+    hole = np.ones((5, 5), dtype=bool)
+    hole[2, 2] = False
+    assert close_mask(hole, size=3)[2, 2]
+    assert erode_mask(np.ones((3, 3), dtype=bool), size=3).sum() == 1
+
+    ramp = np.tile(np.arange(5, dtype=np.float64), (5, 1))
+    gradients = image_gradients(ramp, method="sobel")
+    assert np.isclose(gradients["dx"][2, 2], 1.0)
+    assert np.isclose(gradients["dy"][2, 2], 0.0)
+    assert np.isclose(gradients["magnitude"][2, 2], 1.0)
+
+    pyramid = image_pyramid(np.arange(16).reshape(4, 4), levels=3)
+    assert [level.shape for level in pyramid] == [(4, 4), (2, 2), (1, 1)]
+
+    stats_image = np.arange(9, dtype=np.float64).reshape(3, 3)
+    stats = local_statistics(stats_image, size=3, statistics=("mean", "std", "min", "max"))
+    assert np.isclose(stats["mean"][1, 1], 4.0)
+    assert np.isclose(stats["std"][1, 1], np.std(stats_image))
+    assert stats["min"][1, 1] == 0.0
+    assert stats["max"][1, 1] == 8.0
+    assert np.allclose(local_mean(stats_image, size=3), stats["mean"])
+    assert np.allclose(local_std(stats_image, size=3), stats["std"])
 
     depth = np.array([[1.0, 0.0], [2.0, np.nan]])
     mask = valid_depth_mask(depth)
@@ -728,6 +958,20 @@ def test_image_depth_operations():
 
     points = depth_to_points(depth, fx=1.0, fy=1.0, cx=0.0, cy=0.0)
     assert np.allclose(points, np.array([[0.0, 0.0, 1.0], [0.0, 2.0, 2.0]]))
+
+    grid = depth_to_point_grid(np.ones((3, 3)), fx=1.0, fy=1.0, cx=1.0, cy=1.0)
+    assert grid.shape == (3, 3, 3)
+    assert np.allclose(grid[1, 1], np.array([0.0, 0.0, 1.0]))
+
+    normals = depth_to_normals(np.ones((3, 3)), fx=1.0, fy=1.0, cx=1.0, cy=1.0)
+    assert normals.shape == (3, 3, 3)
+    assert np.allclose(normals[1, 1], np.array([0.0, 0.0, -1.0]))
+    assert np.isnan(normals[0, 0]).all()
+
+    invalid_center = np.ones((3, 3))
+    invalid_center[1, 1] = 0.0
+    invalid_normals = depth_to_normals(invalid_center, fx=1.0, fy=1.0, cx=1.0, cy=1.0)
+    assert np.isnan(invalid_normals[1, 1]).all()
 
 
 def test_projection_helpers_between_sensor_arrays():
@@ -794,6 +1038,37 @@ def test_projection_helpers_between_sensor_arrays():
     rgbd_points = rgbd_to_points(aligned_depth, aligned_rgb, fx=1.0, fy=1.0, cx=0.0, cy=0.0)
     assert np.allclose(rgbd_points[:, :3], np.array([[0.0, 0.0, 1.0], [0.0, 2.0, 2.0], [3.0, 3.0, 3.0]]))
     assert np.allclose(rgbd_points[2, 3:], aligned_rgb[1, 1])
+
+    depth_stack = np.stack([np.ones((2, 2)), np.full((2, 2), 2.0)])
+    rgb_stack = np.stack([np.zeros((2, 2, 3)), np.full((2, 2, 3), 10.0)])
+    translation = np.eye(4)
+    translation[:3, 3] = np.array([10.0, 0.0, 0.0])
+    fused_chunks = list(iter_rgbd_frame_points(
+        depth_stack,
+        rgb_stack,
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        transforms=np.stack([np.eye(4), translation]),
+    ))
+    assert [chunk.shape for chunk in fused_chunks] == [(4, 6), (4, 6)]
+    assert np.allclose(fused_chunks[1][0, :3], np.array([10.0, 0.0, 2.0]))
+
+    fused = fuse_rgbd_frames(
+        depth_stack,
+        rgb_stack,
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        transforms=np.stack([np.eye(4), translation]),
+    )
+    assert fused.shape == (8, 6)
+    assert np.allclose(fused[0, :3], np.array([0.0, 0.0, 1.0]))
+    assert np.allclose(fused[4, :3], np.array([10.0, 0.0, 2.0]))
+    assert np.allclose(fused[:4, 3:], 0.0)
+    assert np.allclose(fused[4:, 3:], 10.0)
 
     dem_pixels, dem_depth, dem_mask = project_dem_to_image(
         np.ones((2, 2), dtype=np.float64),

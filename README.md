@@ -159,10 +159,33 @@ reduced_points = voxel_downsample(points, voxel_size=0.25)
 preview_points = random_downsample(points, count=10_000, seed=42)
 ```
 
+Image and depth sequences can be resized, cropped, padded, normalized, color-converted, dtype-converted, backprojected, converted to normals, and fused as NumPy stacks.
+
+```python
+import numpy as np
+
+from ade.ops import convert_color, convert_image_dtype, crop_images, depth_to_normals, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, normalize_images, open_mask, resize_images
+
+frames = window["images"]["data"]
+depth_frames = window["depth"]["data"]
+small = resize_images(frames, shape=(240, 320))
+roi = crop_images(small, row_start=40, row_stop=200, col_start=80, col_stop=260)
+float_roi = normalize_images(convert_image_dtype(roi, np.float32), per_image=True)
+gray_roi = convert_color(roi, "rgb_to_gray")
+foreground = open_mask(image_mask(gray_roi, min_value=32), size=3)
+edges = image_gradients(gray_roi, method="sobel")
+pyramid = image_pyramid(gray_roi[0], levels=4)
+local = local_statistics(gray_roi, size=5, statistics=("mean", "std"))
+normals = depth_to_normals(depth_frames[0], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+for rgbd_chunk in iter_rgbd_frame_points(depth_frames, frames, fx=525.0, fy=525.0, cx=319.5, cy=239.5):
+    process(rgbd_chunk)
+rgbd_cloud = fuse_rgbd_frames(depth_frames[:10], frames[:10], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+```
+
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
-from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, nearest_neighbor_distance_stats, segment_ground, uniform_downsample
+from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample
 
 uniform_points = uniform_downsample(points, every_k=4)
 keypoints = farthest_point_downsample(points, count=2_048)
@@ -171,6 +194,8 @@ spacing = nearest_neighbor_distance_stats(points, k=4)
 distances, indices, counts = hybrid_search(points, query_points, radius=0.5, max_neighbors=32)
 components = connected_components(points, radius=0.5, min_component_size=20)
 ground, obstacles, ground_mask = segment_ground(points, distance_threshold=0.15)
+registration = multi_scale_icp(scan_a, scan_b, voxel_sizes=(1.0, 0.5, 0.25))
+open3d_cloud = to_open3d_point_cloud(points, color_columns=(3, 4, 5))
 ```
 
 SE(3) coordinate-frame helpers work across common robotics arrays:
@@ -203,8 +228,9 @@ points_in_odom = frames.transform_points(points_in_lidar, "lidar", "odom", times
 Projection helpers connect point clouds, depth images, RGB images, DEM grids, and camera frames with pinhole intrinsics.
 
 ```python
-from ade.ops import colorize_points, points_to_depth_image, project_dem_to_image, rgbd_to_points
+from ade.ops import colorize_points, depth_to_point_grid, points_to_depth_image, project_dem_to_image, rgbd_to_points
 
+organized_depth_points = depth_to_point_grid(depth_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 rgbd_cloud = rgbd_to_points(depth_image, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 colored_lidar = colorize_points(points_in_camera, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 rendered_depth = points_to_depth_image(points_in_camera, image_shape=rgb_image.shape[:2], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
@@ -312,7 +338,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation, image/depth utilities, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 
