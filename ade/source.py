@@ -11,7 +11,15 @@ class DataSources:
     """
 
 
-    def __init__(self, data_path, period=0.1, bounds=None):
+    def __init__(
+        self,
+        data_path,
+        period=0.1,
+        bounds=None,
+        cache_dir=None,
+        refresh_cache: bool = False,
+        timeout: float = 30.0,
+    ):
         """Constructor
 
         """
@@ -38,7 +46,13 @@ class DataSources:
         elif data_path == "DEM":
             from .sources.dem_source import DEMSource
 
-            self.source = DEMSource(bounds[0], bounds[1])
+            self.source = DEMSource(
+                bounds[0],
+                bounds[1],
+                timeout=timeout,
+                cache_dir=cache_dir,
+                refresh_cache=refresh_cache,
+            )
         else:
             raise ValueError(
                 f"{self.file_type} is not supported file type: [.bag, .db3, rosbag2 directory, .png, .jpg, .jpeg, .tiff]"

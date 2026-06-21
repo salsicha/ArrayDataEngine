@@ -138,9 +138,12 @@ from ade.ops import (
     random_downsample,
     radius_outlier_filter,
     reduce_topic,
+    read_dem_cache,
+    reproject_raster,
     resample_imu,
     resample_navsat,
     resample_odometry,
+    resample_raster,
     resample_topic,
     resample_trajectory,
     rectification_map,
@@ -200,6 +203,7 @@ from ade.ops import (
     valid_depth_mask,
     voxel_downsample,
     window_topic,
+    write_dem_cache,
 )
 
 
@@ -1809,7 +1813,7 @@ def test_sensor_streams_convert_to_common_trajectory_arrays():
     assert np.allclose(nav_resampled["navsat"][0, 2], 11.0)
 
 
-def test_dem_raster_operations():
+def test_dem_raster_operations(tmp_path):
     tile_a = np.array([[1, 2], [3, 4]])
     tile_b = np.array([[5, 6], [7, 8]])
     mosaic = mosaic_tiles({(0, 0): tile_a, (0, 1): tile_b})
@@ -1817,6 +1821,37 @@ def test_dem_raster_operations():
 
     cropped = crop_raster(mosaic, 0, 2, 1, 3)
     assert np.array_equal(cropped, np.array([[2, 5], [4, 7]]))
+
+    base = np.array([[0.0, 10.0], [20.0, 30.0]])
+    resampled = resample_raster(base, (3, 3))
+    assert np.allclose(resampled, np.array([[0.0, 5.0, 10.0], [10.0, 15.0, 20.0], [20.0, 25.0, 30.0]]))
+
+    reprojected = reproject_raster(base, src_bounds=(0.0, 0.0, 1.0, 1.0), shape=(3, 3))
+    assert np.allclose(reprojected, resampled)
+
+    shifted = reproject_raster(
+        base,
+        src_bounds=(0.0, 0.0, 1.0, 1.0),
+        dst_bounds=(-1.0, -1.0, 1.0, 1.0),
+        shape=(3, 3),
+        fill_value=-1.0,
+    )
+    assert np.allclose(shifted, np.array([[-1.0, -1.0, -1.0], [-1.0, 0.0, 10.0], [-1.0, 20.0, 30.0]]))
+
+    translated = reproject_raster(
+        base,
+        src_bounds=(0.0, 0.0, 1.0, 1.0),
+        dst_bounds=(0.0, 0.0, 1.0, 1.0),
+        shape=(2, 2),
+        transform=lambda x, y: (x * 0.0 + 1.0, y),
+    )
+    assert np.allclose(translated, np.array([[10.0, 10.0], [30.0, 30.0]]))
+
+    cache_path = write_dem_cache(tmp_path, "tile/name", base, metadata={"bounds": [0.0, 0.0, 1.0, 1.0]})
+    cached, metadata = read_dem_cache(tmp_path, "tile/name", return_metadata=True)
+    assert cache_path.exists()
+    assert np.allclose(cached, base)
+    assert metadata == {"bounds": [0.0, 0.0, 1.0, 1.0]}
 
     elevation = np.array([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
     slope, aspect = slope_aspect(elevation, resolution=1.0)

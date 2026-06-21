@@ -280,6 +280,10 @@ def _dem_zip_bytes(tile_name, side=4):
     return buffer.getvalue()
 
 
+def _dem_hgt_bytes(side=4):
+    return np.arange(side * side, dtype=">i2").reshape((side, side)).tobytes()
+
+
 class _FakeResponse:
     def __init__(self, url, content):
         self.url = url
@@ -313,17 +317,38 @@ class _FakeSession:
         return _FakeResponse(url, _dem_zip_bytes(tile_name))
 
 
-def test_synthetic_dem_source_reuses_session_and_decodes_tiles(monkeypatch):
+def test_synthetic_dem_source_reuses_session_decodes_and_caches_tiles(monkeypatch, tmp_path):
     _FakeSession.created = 0
     _FakeSession.calls = []
     monkeypatch.setenv("earthdata_username", "user")
     monkeypatch.setenv("earthdata_password", "password")
     monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(Session=_FakeSession))
 
-    source = DEMSource([1, 2], [1, 3], timeout=7.0)
+    source = DEMSource([1, 2], [1, 3], timeout=7.0, cache_dir=tmp_path)
     messages = list(source.messages())
 
     assert _FakeSession.created == 1
     assert [msg["name"] for msg in messages] == ["N1W1", "N1W2"]
     assert [msg["data"].shape for msg in messages] == [(4, 4), (4, 4)]
     assert all(call[3] == 7.0 for call in _FakeSession.calls)
+    assert (tmp_path / "N1W1.hgt").exists()
+    assert (tmp_path / "N1W2.hgt").exists()
+
+
+def test_synthetic_dem_source_reads_cached_tile_without_credentials(monkeypatch, tmp_path):
+    (tmp_path / "N1W1.hgt").write_bytes(_dem_hgt_bytes())
+    monkeypatch.delenv("earthdata_username", raising=False)
+    monkeypatch.delenv("earthdata_password", raising=False)
+
+    class FailingSession:
+        def __init__(self):
+            raise AssertionError("cached DEM tile should not open a requests session")
+
+    monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(Session=FailingSession))
+
+    source = DEMSource([1, 2], [1, 2], cache_dir=tmp_path)
+    messages = list(source.messages())
+
+    assert [msg["name"] for msg in messages] == ["N1W1"]
+    assert np.array_equal(messages[0]["data"], np.arange(16, dtype=np.int16).reshape(4, 4))
+    assert messages[0]["source_uri"] == str(tmp_path / "N1W1.hgt")

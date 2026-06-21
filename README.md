@@ -533,17 +533,27 @@ for tile in source.get_message():
     print(tile["name"], tile["data"].shape)
 ```
 
+Pass `cache_dir` to reuse downloaded HGT payloads. Cached tiles can be read without Earthdata credentials:
+
+```python
+source = DataSources("DEM", bounds=[north, west], cache_dir="/tmp/ade-dem-cache")
+```
+
 DEM helper functions operate on NumPy windows, so they can be used on individual tiles, cropped patches, or lazy pipeline chunks:
 
 ```python
 from ade.ops import (
     dem_to_mesh,
     dem_to_point_cloud,
+    read_dem_cache,
+    reproject_raster,
+    resample_raster,
     roughness_map,
     sample_elevation,
     terrain_normals,
     terrain_patch,
     traversability_map,
+    write_dem_cache,
 )
 
 tile = next(source.get_message())
@@ -562,6 +572,17 @@ vehicle_patch = terrain_patch(elevation, center=(150.0, 240.0), size=(64, 64), r
 vehicle_elevation = sample_elevation(elevation, x=[150.0], y=[240.0], resolution=30.0)
 terrain_points = dem_to_point_cloud(vehicle_patch, resolution=30.0)
 terrain_mesh = dem_to_mesh(vehicle_patch, resolution=30.0)
+
+overview = resample_raster(elevation, shape=(512, 512))
+local_grid = reproject_raster(
+    elevation,
+    src_bounds=(west[0], north[0], west[0] + 1.0, north[0] + 1.0),
+    dst_bounds=(west[0] + 0.25, north[0] + 0.25, west[0] + 0.75, north[0] + 0.75),
+    shape=(256, 256),
+)
+
+write_dem_cache("/tmp/ade-dem-cache", tile["name"], elevation, metadata={"bounds": [west[0], north[0], west[0] + 1.0, north[0] + 1.0]})
+cached_elevation, metadata = read_dem_cache("/tmp/ade-dem-cache", tile["name"], return_metadata=True)
 ```
 
 ## Benchmarks

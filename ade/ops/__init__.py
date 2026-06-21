@@ -36,6 +36,9 @@ from .dem import (
     dem_to_point_cloud,
     hillshade,
     mosaic_tiles,
+    read_dem_cache,
+    reproject_raster,
+    resample_raster,
     roughness_map,
     sample_elevation,
     sample_elevation_at_navsat,
@@ -46,6 +49,7 @@ from .dem import (
     terrain_patch,
     terrain_patch_at_navsat,
     traversability_map,
+    write_dem_cache,
 )
 from .geometry import (
     apply_transform,
@@ -351,8 +355,11 @@ __all__ = [
     "random_downsample",
     "radius_outlier_filter",
     "radius_search",
+    "read_dem_cache",
     "reduce_topic",
+    "reproject_raster",
     "resample_topic",
+    "resample_raster",
     "resample_imu",
     "resample_navsat",
     "resample_odometry",
@@ -418,4 +425,5 @@ __all__ = [
     "valid_depth_mask",
     "voxel_downsample",
     "window_topic",
+    "write_dem_cache",
 ]

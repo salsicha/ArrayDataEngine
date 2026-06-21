@@ -15,7 +15,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 5. [x] P2 - Add optional parallel execution for independent chunks/topics.
 6. [x] P2 - Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.
 7. [x] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
-8. [ ] P3 - Finish DEM tile reprojection, resampling, and cache support.
+8. [x] P3 - Finish DEM tile reprojection, resampling, and cache support.
 9. [ ] P3 - Work through the package-and-publish checklist for TestPyPI and PyPI.
 
 ## Backlog
@@ -70,8 +70,8 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add approximate WGS84 to local ENU conversion and inverse conversion.
   - [x] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
   - [x] Add covariance propagation and quality/status masks for navigation streams.
-- [ ] Add DEM and raster operations:
-  - [ ] Mosaic, crop, reproject, resample, and cache DEM tiles.
+- [x] Add DEM and raster operations:
+  - [x] Mosaic, crop, reproject, resample, and cache DEM tiles.
   - [x] Add mosaic, crop, bilinear sampling, and nearest sampling helpers.
   - [x] Compute slope, aspect, hillshade, normals, gradients, roughness, and traversability maps.
   - [x] Add slope, aspect, and hillshade helpers.

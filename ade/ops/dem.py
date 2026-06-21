@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from .nav import navsat_to_enu
@@ -19,6 +22,84 @@ def mosaic_tiles(tiles: dict[tuple[int, int], np.ndarray] | list[list[np.ndarray
         ])
 
     return np.vstack([np.hstack([np.asarray(tile) for tile in row]) for row in tiles])
+
+
+def resample_raster(raster: np.ndarray, shape: tuple[int, int], method: str = "bilinear") -> np.ndarray:
+    """Resample a DEM/raster grid to `(rows, cols)` using nearest or bilinear sampling."""
+
+    arr = _elevation_grid(raster)
+    rows, cols = _output_shape(shape)
+    row_coords = np.linspace(0.0, arr.shape[0] - 1, rows)
+    col_coords = np.linspace(0.0, arr.shape[1] - 1, cols)
+    sample_rows, sample_cols = np.meshgrid(row_coords, col_coords, indexing="ij")
+    return sample_grid(arr, sample_rows, sample_cols, bilinear=_sampling_method(method))
+
+
+def reproject_raster(
+    raster: np.ndarray,
+    src_bounds: tuple[float, float, float, float],
+    dst_bounds: tuple[float, float, float, float] | None = None,
+    shape: tuple[int, int] | None = None,
+    transform=None,
+    method: str = "bilinear",
+    fill_value=np.nan,
+) -> np.ndarray:
+    """Sample a raster into a new coordinate grid.
+
+    Bounds are `(min_x, min_y, max_x, max_y)`. `transform`, when provided, maps
+    destination `x, y` coordinate arrays back into source coordinates. It can be
+    either a callable returning `(x, y)` or a 3x3 homogeneous matrix.
+    """
+
+    arr = _elevation_grid(raster)
+    src = _bounds(src_bounds, "src_bounds")
+    dst = src if dst_bounds is None else _bounds(dst_bounds, "dst_bounds")
+    rows, cols = arr.shape if shape is None else _output_shape(shape)
+    x_coords = np.linspace(dst[0], dst[2], cols)
+    y_coords = np.linspace(dst[1], dst[3], rows)
+    dst_x, dst_y = np.meshgrid(x_coords, y_coords)
+    src_x, src_y = _apply_coordinate_transform(dst_x, dst_y, transform)
+
+    src_cols = (src_x - src[0]) / (src[2] - src[0]) * (arr.shape[1] - 1)
+    src_rows = (src_y - src[1]) / (src[3] - src[1]) * (arr.shape[0] - 1)
+    sampled = sample_grid(arr, src_rows, src_cols, bilinear=_sampling_method(method))
+    inside = (
+        (src_cols >= 0.0)
+        & (src_cols <= arr.shape[1] - 1)
+        & (src_rows >= 0.0)
+        & (src_rows <= arr.shape[0] - 1)
+    )
+    if inside.all():
+        return sampled
+    result = np.full(sampled.shape, fill_value, dtype=np.result_type(sampled.dtype, np.asarray(fill_value).dtype))
+    result[inside] = sampled[inside]
+    return result
+
+
+def write_dem_cache(
+    cache_dir,
+    name: str,
+    raster: np.ndarray,
+    metadata: dict | None = None,
+    compressed: bool = True,
+) -> Path:
+    """Write a DEM tile and optional JSON metadata to a local `.npz` cache file."""
+
+    path = _cache_path(cache_dir, name, suffix=".npz")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = np.savez_compressed if compressed else np.savez
+    writer(path, data=np.asarray(raster), metadata=np.asarray(json.dumps(metadata or {})))
+    return path
+
+
+def read_dem_cache(cache_dir, name: str, return_metadata: bool = False):
+    """Read a DEM tile written by `write_dem_cache`."""
+
+    path = _cache_path(cache_dir, name, suffix=".npz")
+    with np.load(path, allow_pickle=False) as archive:
+        data = archive["data"].copy()
+        metadata = json.loads(str(archive["metadata"].item())) if "metadata" in archive else {}
+    return (data, metadata) if return_metadata else data
 
 
 def slope_aspect(elevation: np.ndarray, resolution: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
@@ -382,3 +463,57 @@ def _patch_size(size: int | tuple[int, int]) -> tuple[int, int]:
     if rows < 1 or cols < 1:
         raise ValueError("size dimensions must be at least 1")
     return rows, cols
+
+
+def _output_shape(shape: tuple[int, int]) -> tuple[int, int]:
+    if len(shape) != 2:
+        raise ValueError("shape must contain (rows, cols)")
+    rows, cols = int(shape[0]), int(shape[1])
+    if rows < 1 or cols < 1:
+        raise ValueError("shape dimensions must be at least 1")
+    return rows, cols
+
+
+def _sampling_method(method: str) -> bool:
+    normalized = method.lower().replace("_", "-")
+    if normalized == "bilinear":
+        return True
+    if normalized in {"nearest", "nearest-neighbor"}:
+        return False
+    raise ValueError("method must be 'bilinear' or 'nearest'")
+
+
+def _bounds(bounds, name: str) -> tuple[float, float, float, float]:
+    values = tuple(float(value) for value in bounds)
+    if len(values) != 4:
+        raise ValueError(f"{name} must contain (min_x, min_y, max_x, max_y)")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} must contain finite values")
+    if values[0] == values[2] or values[1] == values[3]:
+        raise ValueError(f"{name} must span non-zero width and height")
+    return values
+
+
+def _apply_coordinate_transform(x: np.ndarray, y: np.ndarray, transform) -> tuple[np.ndarray, np.ndarray]:
+    if transform is None:
+        return x, y
+    if callable(transform):
+        src_x, src_y = transform(x, y)
+        return np.asarray(src_x, dtype=np.float64), np.asarray(src_y, dtype=np.float64)
+
+    matrix = np.asarray(transform, dtype=np.float64)
+    if matrix.shape != (3, 3):
+        raise ValueError("transform must be a callable or a 3x3 homogeneous matrix")
+    homogeneous = np.stack((x, y, np.ones_like(x)), axis=0).reshape((3, -1))
+    mapped = matrix @ homogeneous
+    scale = np.where(mapped[2] == 0.0, 1.0, mapped[2])
+    src_x = (mapped[0] / scale).reshape(x.shape)
+    src_y = (mapped[1] / scale).reshape(y.shape)
+    return src_x, src_y
+
+
+def _cache_path(cache_dir, name: str, suffix: str) -> Path:
+    safe_name = str(name).replace("/", "_").replace("\\", "_")
+    if not safe_name:
+        raise ValueError("cache tile name cannot be empty")
+    return Path(cache_dir) / f"{safe_name}{suffix}"
