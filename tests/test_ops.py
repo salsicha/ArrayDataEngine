@@ -149,6 +149,8 @@ from ade.ops import (
     select_time_range,
     sensor_to_trajectory,
     slerp,
+    source_pipeline,
+    SourcePipeline,
     smooth_timeseries,
     smooth_trajectory,
     slope_aspect,
@@ -489,6 +491,52 @@ def test_data_buffer_topic_pipeline_streams_without_get_buffer():
     assert calls == [1.0, 2.0]
     assert np.allclose(collected["ts"], np.array([1.0, 2.0]))
     assert np.allclose(collected["data"], np.array([[2.0], [3.0]]))
+
+
+def test_source_pipeline_streams_to_data_buffer_and_tiledb(tmp_path):
+    mapped_names = []
+    pipeline = (
+        source_pipeline(_SmallSource())
+        .select_topic("axis")
+        .time_range(1.0, 2.0)
+        .map(
+            lambda message: mapped_names.append(message["name"]) or {
+                **message,
+                "name": f"{message['name']}_mapped",
+                "data": message["data"] + 10.0,
+            }
+        )
+        .filter(lambda message: message["data"][0] >= 12.0)
+    )
+    assert isinstance(pipeline, SourcePipeline)
+
+    messages = list(pipeline.iter_messages())
+    assert [message["name"] for message in messages] == ["frame_2_mapped"]
+    assert np.allclose(messages[0]["data"], np.array([12.0]))
+    assert mapped_names == ["frame_1", "frame_2"]
+
+    memory_buffer = pipeline.to_buffer(buffer_depth=3)
+    memory_topic = memory_buffer.get_index_range("axis")
+    assert memory_topic["name"].tolist() == [b"frame_2_mapped"]
+    assert np.allclose(memory_topic["ts"], np.array([2.0]))
+    assert np.allclose(memory_topic["data"], np.array([[12.0]]))
+
+    group_uri = str(tmp_path / "source_pipeline_group")
+    tiledb_buffer = pipeline.persist_to_tiledb(group_uri)
+    try:
+        tiledb_topic = tiledb_buffer.topic("axis").collect(chunk_size=1)
+        assert tiledb_topic["name"].tolist() == [b"frame_2_mapped"]
+        assert np.allclose(tiledb_topic["data"], np.array([[12.0]]))
+    finally:
+        tiledb_buffer.close()
+
+    reopened = DataBuffer(data_source=None, data_uri=group_uri, axis="axis", use_db=True)
+    try:
+        persisted = reopened.get_index_range("axis")
+        assert persisted["name"].tolist() == [b"frame_2_mapped"]
+        assert np.allclose(persisted["data"], np.array([[12.0]]))
+    finally:
+        reopened.close()
 
 
 def test_geometry_and_point_cloud_operations():

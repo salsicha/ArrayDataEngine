@@ -387,7 +387,29 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
+Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist directly to TileDB.
+
+```python
+from ade.ops import source_pipeline, voxel_downsample
+from ade.source import DataSources
+
+source = DataSources("/data/rosbag2/split_recording/")
+
+pipeline = (
+    source_pipeline(source)
+    .select_topics("/points")
+    .time_range(12.0, 20.0)
+    .map(lambda msg: {**msg, "data": voxel_downsample(msg["data"], voxel_size=0.1)})
+    .filter(lambda msg: msg["data"].shape[0] > 0)
+)
+
+rolling_buffer = pipeline.to_buffer(buffer_depth=128)
+tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/")
+```
+
+TileDB persistence uses `source.get_count(topic)` to size the destination arrays, then records the actual filtered message count as metadata.
+
+Initial operation coverage includes source-level streaming pipelines, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 

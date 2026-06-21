@@ -9,10 +9,11 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 ## Prioritized Next Work
 
 1. [x] P0 - Finish navigation quality: covariance propagation plus quality/status masks.
-2. [ ] P0 - Add operation pipelines that stream directly from `DataSources`, write to `DataBuffer`, and persist to TileDB without materializing full topics.
-3. [ ] P1 - Add progress reporting, cancellation, and resumable operation checkpoints.
+2. [x] P0 - Add operation pipelines that stream directly from `DataSources`, write to `DataBuffer`, and persist to TileDB without materializing full topics.
+3. [ ] P1 - Add progress reporting, cancellation, and resumable operation checkpoints for long source and topic pipelines.
 4. [ ] P1 - Finish DEM terrain operations: terrain patches, roughness/traversability, and DEM-to-point-cloud/mesh conversion.
-5. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
+5. [ ] P2 - Add optional parallel execution for independent chunks/topics.
+6. [ ] P2 - Add ML-ready exports, deterministic splits, augmentations, and mixed-rate collation.
 
 ## Backlog
 
@@ -81,7 +82,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add guarded materialization limits for explicit `collect()` calls.
   - [x] Reopen existing TileDB datasets without the original source.
   - [x] Resume partial TileDB ingest by replaying the source and skipping stored per-topic offsets.
-  - [ ] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
+  - [x] Add operation pipelines that can stream from `DataSources`, write to `DataBuffer`, and persist to TileDB.
   - [ ] Add optional parallel execution for independent chunks/topics.
   - [ ] Add progress reporting, cancellation, and resumable operation checkpoints.
   - [ ] Add benchmark tests for core operations on synthetic image, point cloud, IMU, odometry, navsat, DEM, and TileDB workloads.

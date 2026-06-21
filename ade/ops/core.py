@@ -772,6 +772,221 @@ class DatasetQuery:
         return DatasetQuery({topic: fn(pipeline) for topic, pipeline in self._pipelines.items()})
 
 
+class SourcePipeline:
+    """Streaming operation pipeline over `DataSources` messages."""
+
+    def __init__(
+        self,
+        data_source,
+        operations: Iterable[_PipelineOperation] = (),
+        topics: Iterable[str] | None = None,
+    ):
+        self.data_source = data_source
+        self._operations = tuple(operations)
+        self.topics = tuple(_source_topics(data_source, topics))
+
+    def select_topics(self, *topics: str | Iterable[str]) -> "SourcePipeline":
+        names = _normalize_topic_selection(topics)
+        missing = [topic for topic in names if self.topics and topic not in self.topics]
+        if missing:
+            raise ValueError(f"topics not found: {missing}")
+        return self._with_operation("source_topics", frozenset(names), topics=names)
+
+    def select_topic(self, topic: str) -> "SourcePipeline":
+        return self.select_topics(topic)
+
+    def map(self, fn: Callable, copy: bool = True) -> "SourcePipeline":
+        return self._with_operation("source_map", fn, copy=copy)
+
+    def filter(self, predicate: Callable, copy: bool = True) -> "SourcePipeline":
+        return self._with_operation("source_filter", predicate, copy=copy)
+
+    def time_range(self, start: float, end: float, inclusive: bool = True) -> "SourcePipeline":
+        if start > end:
+            raise ValueError("start must be less than or equal to end")
+        return self._with_operation("source_time_range", float(start), float(end), inclusive=inclusive)
+
+    def select_time_range(self, start: float, end: float, inclusive: bool = True) -> "SourcePipeline":
+        return self.time_range(start, end, inclusive=inclusive)
+
+    def index_range(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "SourcePipeline":
+        if start is not None and start < 0:
+            raise ValueError("negative source index ranges are not supported")
+        if stop is not None and stop < 0:
+            raise ValueError("negative source index ranges are not supported")
+        if step is not None and step < 1:
+            raise ValueError("step must be at least 1")
+        return self._with_operation("source_index_range", start, stop, step)
+
+    def select_indices(
+        self,
+        start: int | None = None,
+        stop: int | None = None,
+        step: int | None = None,
+    ) -> "SourcePipeline":
+        return self.index_range(start, stop, step)
+
+    def iter_messages(self, copy: bool = True) -> Iterable[dict]:
+        index_counters = [dict() for _ in self._operations]
+        for raw_message in _source_messages(self.data_source):
+            message = _normalize_source_message(raw_message, copy=copy)
+            keep = True
+
+            for operation_index, operation in enumerate(self._operations):
+                if operation.kind == "source_topics":
+                    keep = message["topic"] in operation.args[0]
+                elif operation.kind == "source_map":
+                    mapped = _call_source_callable(
+                        operation.args[0],
+                        _copy_source_message(message) if operation.kwargs.get("copy", True) else message,
+                    )
+                    message = _mapped_source_message(message, mapped, copy=copy)
+                elif operation.kind == "source_filter":
+                    keep = bool(
+                        _call_source_callable(
+                            operation.args[0],
+                            _copy_source_message(message) if operation.kwargs.get("copy", True) else message,
+                        )
+                    )
+                elif operation.kind == "source_time_range":
+                    start, end = operation.args
+                    timestamp = float(message["timestamp"])
+                    if operation.kwargs.get("inclusive", True):
+                        keep = timestamp >= start and timestamp <= end
+                    else:
+                        keep = timestamp > start and timestamp < end
+                elif operation.kind == "source_index_range":
+                    topic = message["topic"]
+                    counters = index_counters[operation_index]
+                    current_index = counters.get(topic, 0)
+                    counters[topic] = current_index + 1
+                    keep = _slice_contains(current_index, *operation.args)
+                else:
+                    raise ValueError(f"unsupported source pipeline operation: {operation.kind}")
+
+                if not keep:
+                    break
+
+            if keep:
+                yield _copy_source_message(message) if copy else message
+
+    def to_buffer(
+        self,
+        buffer_depth: int = 1,
+        data_uri: str = "/tmp/tiledb/my_group/",
+        use_db: bool = False,
+        axis: str | None = None,
+        buffer=None,
+    ):
+        """Stream processed messages into a `DataBuffer`."""
+
+        if buffer is not None:
+            return self._append_to_buffer(buffer)
+
+        if not self.topics:
+            raise ValueError("source pipeline has no topics")
+        if use_db:
+            self._validate_countable(self.topics)
+
+        from ..buffer import DataBuffer
+
+        selected_axis = axis if axis is not None else self.topics[0]
+        pipeline_source = _PipelineSource(self)
+        result = DataBuffer(
+            data_source=pipeline_source,
+            buffer_depth=buffer_depth,
+            data_uri=data_uri,
+            topics=list(self.topics),
+            axis=selected_axis,
+            use_db=use_db,
+            preload=0,
+        )
+        result.load_data_db(selected_axis)
+        return result
+
+    def write_to_buffer(self, buffer=None, **kwargs):
+        """Alias for `to_buffer()`."""
+
+        return self.to_buffer(buffer=buffer, **kwargs)
+
+    def persist_to_tiledb(
+        self,
+        data_uri: str,
+        buffer_depth: int = 1,
+        axis: str | None = None,
+    ):
+        """Stream processed messages into a TileDB-backed `DataBuffer`."""
+
+        return self.to_buffer(buffer_depth=buffer_depth, data_uri=data_uri, use_db=True, axis=axis)
+
+    def _with_operation(self, kind: str, *args, topics: Iterable[str] | None = None, **kwargs) -> "SourcePipeline":
+        return SourcePipeline(
+            self.data_source,
+            operations=(*self._operations, _PipelineOperation(kind, args, kwargs)),
+            topics=self.topics if topics is None else topics,
+        )
+
+    def _topic_capacity(self, topic: str) -> int:
+        get_count = getattr(self.data_source, "get_count", None)
+        if not callable(get_count):
+            raise ValueError("TileDB source pipeline output requires data_source.get_count(topic)")
+        return int(get_count(topic))
+
+    def _validate_countable(self, topics: Iterable[str]) -> None:
+        for topic in topics:
+            self._topic_capacity(topic)
+
+    def _append_to_buffer(self, buffer):
+        for message in self.iter_messages(copy=True):
+            topic = message["topic"]
+            if topic not in buffer.topics:
+                buffer.topics.append(topic)
+            if hasattr(buffer.buffer_impl, "topics") and topic not in buffer.buffer_impl.topics:
+                buffer.buffer_impl.topics.append(topic)
+            if getattr(buffer, "use_db", False):
+                self._prepare_tiledb_append(buffer, message)
+            buffer.append_buffer(message)
+
+        if getattr(buffer, "use_db", False):
+            for topic in buffer.topics:
+                buffer.buffer_impl.close_topic(topic, closed=True)
+        return buffer
+
+    def _prepare_tiledb_append(self, buffer, message: Mapping[str, Any]) -> None:
+        impl = buffer.buffer_impl
+        topic = message["topic"]
+        if topic in impl.counters:
+            return
+        impl.counters[topic] = 0
+        impl.msg_len[topic] = max(self._topic_capacity(topic), 1)
+        impl._init_tdb(message)
+
+
+def source_pipeline(data_source, topics: Iterable[str] | None = None) -> SourcePipeline:
+    """Return a streaming operation pipeline over source messages."""
+
+    return SourcePipeline(data_source, topics=topics)
+
+
+class _PipelineSource:
+    def __init__(self, pipeline: SourcePipeline):
+        self.pipeline = pipeline
+
+    def get_topics(self):
+        return list(self.pipeline.topics)
+
+    def get_count(self, topic):
+        return max(self.pipeline._topic_capacity(topic), 1)
+
+    def get_message(self):
+        yield from self.pipeline.iter_messages(copy=True)
+
+
 def dataset_query(topics: Mapping[str, TopicPipeline | dict | np.ndarray | TopicView]) -> DatasetQuery:
     """Return a lazy dataset-level query over one or more topics."""
 
@@ -887,6 +1102,81 @@ def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOpera
         else:
             raise ValueError(f"unsupported pushdown operation: {operation.kind}")
     return selected
+
+
+def _source_topics(data_source, topics: Iterable[str] | None = None) -> list[str]:
+    if topics is not None:
+        return [str(topic) for topic in topics]
+    get_topics = getattr(data_source, "get_topics", None)
+    if callable(get_topics):
+        return [str(topic) for topic in get_topics()]
+    return []
+
+
+def _source_messages(data_source):
+    get_message = getattr(data_source, "get_message", None)
+    if callable(get_message):
+        yield from get_message()
+        return
+    if callable(data_source):
+        yield from data_source()
+        return
+    raise TypeError("data_source must expose get_message() or be a callable generator factory")
+
+
+def _normalize_source_message(message: Mapping[str, Any], copy: bool = True) -> dict:
+    if not isinstance(message, Mapping):
+        raise TypeError("source messages must be mappings")
+    if "topic" not in message:
+        raise ValueError("source message missing 'topic'")
+    if "data" not in message:
+        raise ValueError("source message missing 'data'")
+
+    result = dict(message)
+    result["topic"] = str(result["topic"])
+    if "timestamp" not in result:
+        if "ts" not in result:
+            raise ValueError("source message missing 'timestamp'")
+        result["timestamp"] = result["ts"]
+    if "name" not in result:
+        result["name"] = result.get("id", result["topic"])
+
+    result["timestamp"] = float(result["timestamp"])
+    data = np.asarray(result["data"])
+    result["data"] = data.copy() if copy else data
+    return result
+
+
+def _copy_source_message(message: Mapping[str, Any]) -> dict:
+    result = dict(message)
+    data = result.get("data")
+    if isinstance(data, np.ndarray):
+        result["data"] = data.copy()
+    return result
+
+
+def _call_source_callable(fn: Callable, message: Mapping[str, Any]):
+    try:
+        return fn(message)
+    except TypeError:
+        return _call_with_metadata(
+            fn,
+            message["data"],
+            float(message["timestamp"]),
+            message.get("name"),
+        )
+
+
+def _mapped_source_message(previous: Mapping[str, Any], mapped, copy: bool) -> dict:
+    if mapped is None:
+        raise ValueError("source map functions must return a message mapping or replacement data")
+    if isinstance(mapped, Mapping):
+        return _normalize_source_message(mapped, copy=copy)
+
+    result = dict(previous)
+    data = np.asarray(mapped)
+    result["data"] = data.copy() if copy else data
+    return result
 
 
 def topic_parts(topic_data: dict | np.ndarray | TopicView) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
