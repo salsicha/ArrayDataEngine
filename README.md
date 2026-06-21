@@ -159,12 +159,12 @@ reduced_points = voxel_downsample(points, voxel_size=0.25)
 preview_points = random_downsample(points, count=10_000, seed=42)
 ```
 
-Image and depth sequences can be resized, cropped, padded, normalized, color-converted, dtype-converted, backprojected, converted to normals, and fused as NumPy stacks.
+Image and depth sequences can be resized, cropped, padded, normalized, color-converted, dtype-converted, backprojected, converted to normals, motion-aligned, and fused as NumPy stacks.
 
 ```python
 import numpy as np
 
-from ade.ops import convert_color, convert_image_dtype, crop_images, depth_to_normals, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, normalize_images, open_mask, resize_images
+from ade.ops import align_images, convert_color, convert_image_dtype, crop_images, depth_to_normals, frame_to_frame_optical_flow, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, motion_compensated_rolling_windows, normalize_images, open_mask, resize_images
 
 frames = window["images"]["data"]
 depth_frames = window["depth"]["data"]
@@ -176,6 +176,10 @@ foreground = open_mask(image_mask(gray_roi, min_value=32), size=3)
 edges = image_gradients(gray_roi, method="sobel")
 pyramid = image_pyramid(gray_roi[0], levels=4)
 local = local_statistics(gray_roi, size=5, statistics=("mean", "std"))
+flow = frame_to_frame_optical_flow(gray_roi, max_shift=8)
+aligned_frames = align_images(gray_roi, max_shift=8)
+for aligned_window in motion_compensated_rolling_windows(gray_roi, window_size=5, max_shift=8):
+    process(aligned_window)
 normals = depth_to_normals(depth_frames[0], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 for rgbd_chunk in iter_rgbd_frame_points(depth_frames, frames, fx=525.0, fy=525.0, cx=319.5, cy=239.5):
     process(rgbd_chunk)
@@ -228,8 +232,14 @@ points_in_odom = frames.transform_points(points_in_lidar, "lidar", "odom", times
 Projection helpers connect point clouds, depth images, RGB images, DEM grids, and camera frames with pinhole intrinsics.
 
 ```python
-from ade.ops import colorize_points, depth_to_point_grid, points_to_depth_image, project_dem_to_image, rgbd_to_points
+from ade.ops import backproject_pixels, camera_model, colorize_points, depth_to_point_grid, distort_pixels, points_to_depth_image, project_camera_points, project_dem_to_image, rectify_image, rgbd_to_points, scale_camera_matrix
 
+camera = camera_model(fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2], distortion=distortion_coeffs)
+small_camera_matrix = scale_camera_matrix(camera.camera_matrix, scale_x=0.5)
+rectified_rgb = rectify_image(rgb_image, camera.camera_matrix, distortion=camera.distortion)
+distorted_pixels = distort_pixels(raw_pixels, camera.camera_matrix, camera.distortion)
+camera_points = backproject_pixels(distorted_pixels, depth_values, camera.camera_matrix, distortion=camera.distortion)
+projected_pixels, visible = project_camera_points(points_in_camera, camera)
 organized_depth_points = depth_to_point_grid(depth_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 rgbd_cloud = rgbd_to_points(depth_image, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 colored_lidar = colorize_points(points_in_camera, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
@@ -248,14 +258,19 @@ vehicle_box = crop_oriented_bounds(points, center=pose_xyz, extent=[8.0, 4.0, 3.
 gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, max_lat=37.8, max_lon=-121.7)
 ```
 
-IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity.
+IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields.
 
 ```python
-from ade.ops import imu_to_trajectory, navsat_to_trajectory, odometry_to_trajectory
+from ade.ops import imu_to_trajectory, navsat_to_trajectory, odometry_to_trajectory, resample_imu, resample_navsat, resample_odometry, resample_trajectory
 
 imu_traj = imu_to_trajectory(window["/imu"])
 odom_traj = odometry_to_trajectory(window["/odom"])
 gps_traj = navsat_to_trajectory(window["/gps"], ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
+
+odom_50hz = resample_trajectory(odom_traj, period=0.02)
+imu_at_image_times = resample_imu(window["/imu"], target_timestamps=image_timestamps)
+odom_at_image_times = resample_odometry(window["/odom"], target_timestamps=image_timestamps)
+gps_at_image_times = resample_navsat(window["/gps"], target_timestamps=image_timestamps, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
 ```
 
 For large datasets, use the lazy topic pipeline. It records operations and only executes them when chunks, rows, reductions, windows, or explicit collection are requested.
@@ -338,7 +353,7 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
-Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU conversion, quaternion interpolation, trajectory speed, and DEM/raster helpers.
+Initial operation coverage includes topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU conversion, quaternion interpolation, trajectory resampling, trajectory speed, and DEM/raster helpers.
 
 ## TileDB Persistence
 

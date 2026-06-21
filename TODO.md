@@ -45,10 +45,10 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
   - [x] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
   - [x] Add valid-depth masks and depth backprojection to point clouds.
-  - [ ] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
-  - [ ] Add camera model utilities for intrinsics, distortion, rectification, and projection.
+  - [x] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
+  - [x] Add camera model utilities for intrinsics, distortion, rectification, and projection.
 - [ ] Add IMU, odometry, and navsat operations:
-  - [ ] Resample and interpolate orientation, angular velocity, linear acceleration, position, velocity, and covariance.
+  - [x] Resample and interpolate orientation, angular velocity, linear acceleration, position, velocity, and covariance.
   - [x] Add generic numeric time-series interpolation.
   - [ ] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
   - [x] Add quaternion normalization and SLERP.

@@ -7,18 +7,24 @@ from ade.buffer import DataBuffer
 from ade.ops import (
     align_bounded,
     align_exact,
+    align_image,
+    align_images,
     align_nearest,
     align_topic,
     apply_image_mask,
     apply_transform,
+    backproject_pixels,
     bounds_mask,
+    CameraModel,
     camera_matrix,
+    camera_model,
     cluster_dbscan,
     close_mask,
     connected_components,
     convert_color,
     convert_image_dtype,
     colorize_points,
+    crop_camera_matrix,
     crop_bounds,
     crop_geographic_bounds,
     crop_image,
@@ -33,12 +39,17 @@ from ade.ops import (
     depth_to_points,
     DatasetQuery,
     dilate_mask,
+    distort_normalized_points,
+    distort_pixels,
     enu_to_navsat,
     erode_mask,
+    estimate_image_shift,
     estimate_normals,
     farthest_point_downsample,
     filter_topic,
     FrameGraph,
+    frame_optical_flow,
+    frame_to_frame_optical_flow,
     from_open3d_point_cloud,
     fuse_rgbd_frames,
     geographic_bounds_mask,
@@ -47,9 +58,14 @@ from ade.ops import (
     image_gradients,
     image_mask,
     image_pyramid,
+    iter_aligned_images,
+    iter_frame_optical_flow,
+    iter_motion_compensated_windows,
     iter_rgbd_frame_points,
     imu_to_trajectory,
+    interpolate_quaternions,
     interpolate_timeseries,
+    interpolate_trajectory,
     iter_chunks,
     knn_search,
     local_covariances,
@@ -58,11 +74,13 @@ from ade.ops import (
     local_std,
     map_topic,
     mosaic_tiles,
+    motion_compensated_rolling_windows,
     multi_scale_icp,
     navsat_to_enu,
     navsat_to_trajectory,
     nearest_neighbor_distance_stats,
     nearest_neighbor_distances,
+    normalized_points_to_pixels,
     normalize_image,
     normalize_images,
     normalize_quaternion,
@@ -72,15 +90,23 @@ from ade.ops import (
     oriented_bounds_mask,
     pad_image,
     pad_images,
+    pixels_to_normalized_points,
     points_to_depth_image,
     point_to_plane_icp,
     point_to_point_icp,
+    project_camera_points,
     project_dem_to_image,
     project_points_to_image,
     random_downsample,
     radius_outlier_filter,
     reduce_topic,
+    resample_imu,
+    resample_navsat,
+    resample_odometry,
     resample_topic,
+    resample_trajectory,
+    rectification_map,
+    rectify_image,
     rolling_window_join,
     resize_images,
     resize_images_nearest,
@@ -90,6 +116,7 @@ from ade.ops import (
     sample_grid,
     sample_image_at_pixels,
     sample_image_at_points,
+    scale_camera_matrix,
     segment_ground,
     segment_plane,
     select_indices,
@@ -105,6 +132,7 @@ from ade.ops import (
     to_open3d_point_cloud,
     topic_pipeline,
     topic_view,
+    translate_image,
     transform_dem_grid,
     transform_navsat,
     transform_odometry,
@@ -112,6 +140,8 @@ from ade.ops import (
     transform_vectors,
     trajectory_speed,
     uniform_downsample,
+    undistort_normalized_points,
+    undistort_pixels,
     valid_depth_mask,
     voxel_downsample,
     window_topic,
@@ -974,6 +1004,123 @@ def test_image_depth_operations():
     assert np.isnan(invalid_normals[1, 1]).all()
 
 
+def test_image_motion_operations():
+    base = np.zeros((24, 24), dtype=np.float64)
+    base[8:12, 9:14] = 1.0
+    base[15, 7] = 2.0
+    base[6, 16] = 3.0
+    shifted = translate_image(base, (2, -3))
+    shifted_again = translate_image(base, (3, -2))
+
+    shift = estimate_image_shift(base, shifted, max_shift=5)
+    assert np.allclose(shift, np.array([2.0, -3.0]))
+
+    flow = frame_optical_flow(base, shifted, max_shift=5)
+    assert flow.shape == (24, 24, 2)
+    assert np.allclose(flow[..., 0], 2.0)
+    assert np.allclose(flow[..., 1], -3.0)
+
+    sequence = np.stack([base, shifted, shifted_again])
+    flows = frame_to_frame_optical_flow(sequence, max_shift=5)
+    assert flows.shape == (2, 24, 24, 2)
+    assert np.allclose(flows[0, ..., 0], 2.0)
+    assert np.allclose(flows[0, ..., 1], -3.0)
+    assert np.allclose(flows[1, ..., 0], 1.0)
+    assert np.allclose(flows[1, ..., 1], 1.0)
+
+    streamed_flows = list(iter_frame_optical_flow(sequence, max_shift=5))
+    assert len(streamed_flows) == 2
+    assert np.allclose(streamed_flows[1][0, 0], np.array([1.0, 1.0]))
+
+    aligned_single, single_shift = align_image(shifted, reference=base, max_shift=5, return_shift=True)
+    assert np.allclose(single_shift, np.array([2.0, -3.0]))
+    assert np.allclose(aligned_single, base)
+
+    aligned, shifts = align_images(sequence, max_shift=5, return_shifts=True)
+    assert np.allclose(shifts, np.array([[0.0, 0.0], [2.0, -3.0], [3.0, -2.0]]))
+    assert np.allclose(aligned, np.stack([base, base, base]))
+
+    streamed_aligned = list(iter_aligned_images(sequence, max_shift=5))
+    assert len(streamed_aligned) == 3
+    assert np.allclose(streamed_aligned[-1], base)
+
+    windows = list(iter_motion_compensated_windows(sequence, window_size=2, max_shift=5, return_shifts=True))
+    assert len(windows) == 3
+    first_window, first_shifts = windows[0]
+    assert first_window.shape == (1, 24, 24)
+    assert np.allclose(first_shifts, np.array([[0.0, 0.0]]))
+    second_window, second_shifts = windows[1]
+    assert second_window.shape == (2, 24, 24)
+    assert np.allclose(second_shifts, np.array([[-2.0, 3.0], [0.0, 0.0]]))
+    assert np.allclose(second_window[0], shifted)
+    assert np.allclose(second_window[1], shifted)
+
+    lazy_windows = motion_compensated_rolling_windows(sequence, window_size=3, max_shift=5, min_periods=2)
+    collected = list(lazy_windows)
+    assert [window.shape for window in collected] == [(2, 24, 24), (3, 24, 24)]
+    assert np.allclose(collected[-1][-1], shifted_again)
+
+
+def test_camera_model_utilities():
+    intrinsics = camera_matrix(fx=2.0, fy=4.0, cx=1.0, cy=2.0)
+    model = camera_model(
+        intrinsics=intrinsics,
+        image_shape=(5, 6),
+        distortion=np.array([0.05, -0.01, 0.001, -0.002, 0.003]),
+        rectification=np.eye(3),
+    )
+    assert isinstance(model, CameraModel)
+    assert model.image_shape == (5, 6)
+    assert model.distortion.shape == (8,)
+
+    scaled = scale_camera_matrix(intrinsics, scale_x=2.0, scale_y=0.5)
+    assert np.allclose(scaled, camera_matrix(fx=4.0, fy=2.0, cx=2.0, cy=1.0))
+    cropped = crop_camera_matrix(scaled, row_offset=1.0, col_offset=2.0)
+    assert np.allclose(cropped, camera_matrix(fx=4.0, fy=2.0, cx=0.0, cy=0.0))
+
+    pixels = np.array([[1.5, 2.0], [2.0, 3.0], [0.5, 1.0]])
+    normalized = pixels_to_normalized_points(pixels, intrinsics)
+    assert np.allclose(normalized_points_to_pixels(normalized, intrinsics), pixels)
+
+    coefficients = np.array([0.05, -0.01, 0.001, -0.002, 0.003])
+    distorted_normalized = distort_normalized_points(normalized, coefficients)
+    undistorted_normalized = undistort_normalized_points(distorted_normalized, coefficients, iterations=10)
+    assert np.allclose(undistorted_normalized, normalized, atol=1e-8)
+
+    distorted_pixels = distort_pixels(pixels, intrinsics, coefficients)
+    undistorted_pixels = undistort_pixels(distorted_pixels, intrinsics, coefficients, iterations=10)
+    assert np.allclose(undistorted_pixels, pixels, atol=1e-8)
+
+    points = np.array([[0.0, 0.0, 1.0], [0.5, 0.25, 1.0], [0.0, 0.0, -1.0]])
+    projected, depth, valid = project_camera_points(
+        points,
+        camera_model(intrinsics=intrinsics, image_shape=(5, 6), distortion=np.zeros(5)),
+        return_depth=True,
+    )
+    assert np.allclose(projected[:2], np.array([[1.0, 2.0], [2.0, 3.0]]))
+    assert np.allclose(depth, np.array([1.0, 1.0, -1.0]))
+    assert valid.tolist() == [True, True, False]
+
+    projected_with_distortion, distorted_valid = project_points_to_image(
+        points[:2],
+        camera_matrix=intrinsics,
+        distortion=np.zeros(5),
+        image_shape=(5, 6),
+    )
+    assert distorted_valid.tolist() == [True, True]
+    assert np.allclose(projected_with_distortion, projected[:2])
+
+    backprojected = backproject_pixels(projected[:2], depth[:2], intrinsics, distortion=np.zeros(5))
+    assert np.allclose(backprojected, points[:2])
+
+    image = np.arange(25, dtype=np.float64).reshape(5, 5)
+    rect_map = rectification_map(image.shape, intrinsics, distortion=np.zeros(5), rectification=np.eye(3))
+    assert rect_map.shape == (5, 5, 2)
+    assert np.allclose(rect_map[2, 1], np.array([1.0, 2.0]))
+    rectified = rectify_image(image, intrinsics, distortion=np.zeros(5), rectification=np.eye(3), bilinear=False)
+    assert np.array_equal(rectified, image)
+
+
 def test_projection_helpers_between_sensor_arrays():
     intrinsics = camera_matrix(fx=2.0, fy=2.0, cx=1.0, cy=1.0)
     points = np.array([
@@ -1107,6 +1254,46 @@ def test_navigation_operations():
     speed = trajectory_speed(np.array([0.0, 1.0, 2.0]), np.array([[0.0, 0.0], [1.0, 0.0], [3.0, 0.0]]))
     assert np.allclose(speed, np.array([1.0, 1.5, 2.0]))
 
+    orientations = np.array([
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
+    interpolated_orientation = interpolate_quaternions(
+        np.array([0.0, 1.0]),
+        orientations,
+        np.array([0.5]),
+    )
+    assert np.allclose(abs(interpolated_orientation[0, 2]), np.sqrt(0.5))
+    assert np.allclose(abs(interpolated_orientation[0, 3]), np.sqrt(0.5))
+
+    trajectory = {
+        "ts": np.array([0.0, 1.0]),
+        "position": np.array([[0.0, 0.0, 0.0], [10.0, 20.0, 30.0]]),
+        "orientation": orientations,
+        "linear_velocity": np.array([[0.0, 0.0, 0.0], [2.0, 4.0, 6.0]]),
+        "angular_velocity": np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]]),
+        "linear_acceleration": np.array([[1.0, 1.0, 1.0], [3.0, 5.0, 7.0]]),
+        "position_covariance": np.array([[0.0, 0.2, 0.4], [1.0, 1.2, 1.4]]),
+        "orientation_covariance": np.array([[0.1, 0.1, 0.1], [0.3, 0.3, 0.3]]),
+        "linear_velocity_covariance": np.array([[0.2, 0.2, 0.2], [0.4, 0.4, 0.4]]),
+        "angular_velocity_covariance": np.array([[0.3, 0.3, 0.3], [0.5, 0.5, 0.5]]),
+        "linear_acceleration_covariance": np.array([[0.4, 0.4, 0.4], [0.6, 0.6, 0.6]]),
+        "source": "odometry",
+        "topic": "/odom",
+        "frame_id": "odom",
+    }
+    interpolated = interpolate_trajectory(trajectory, np.array([0.0, 0.5, 1.0]))
+    assert interpolated["topic"] == "/odom"
+    assert interpolated["frame_id"] == "odom"
+    assert np.allclose(interpolated["position"][1], np.array([5.0, 10.0, 15.0]))
+    assert np.allclose(interpolated["linear_velocity"][1], np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(interpolated["angular_velocity"][1], np.array([0.0, 0.0, 1.0]))
+    assert np.allclose(interpolated["linear_acceleration"][1], np.array([2.0, 3.0, 4.0]))
+    assert np.allclose(interpolated["position_covariance"][1], np.array([0.5, 0.7, 0.9]))
+    assert np.allclose(abs(interpolated["orientation"][1, 2]), np.sqrt(0.5))
+    fixed_rate = resample_trajectory(trajectory, period=0.5)
+    assert np.allclose(fixed_rate["ts"], np.array([0.0, 0.5, 1.0]))
+
 
 def test_sensor_streams_convert_to_common_trajectory_arrays():
     timestamps = np.array([0.0, 1.0])
@@ -1153,6 +1340,27 @@ def test_sensor_streams_convert_to_common_trajectory_arrays():
 
     dispatched = sensor_to_trajectory(odom, kind="odometry", timestamps=timestamps)
     assert np.allclose(dispatched["pose"], odom_traj["pose"])
+
+    imu_resampled = resample_imu({"ts": timestamps, "data": imu}, target_timestamps=np.array([0.5]))
+    assert np.allclose(imu_resampled["angular_velocity"][0, 2], 0.15)
+    assert np.allclose(imu_resampled["linear_acceleration"][0], np.array([2.5, 3.5, 4.5]))
+    assert np.allclose(imu_resampled["angular_velocity_covariance"][0], np.array([0.01, 0.02, 0.03]))
+
+    odom_resampled = resample_odometry(odom, timestamps=timestamps, target_timestamps=np.array([0.5]))
+    assert np.allclose(odom_resampled["position"][0], np.array([0.5, 1.0, 1.5]))
+    assert np.allclose(odom_resampled["linear_velocity"][0], np.array([1.0, 0.5, 0.0]))
+    assert np.allclose(odom_resampled["angular_velocity"][0, 2], 0.15)
+
+    nav_resampled = resample_navsat(
+        {"ts": timestamps, "data": navsat},
+        target_timestamps=np.array([0.5]),
+        ref_lat=37.0,
+        ref_lon=-122.0,
+        ref_alt=10.0,
+    )
+    assert np.allclose(nav_resampled["position"][0], np.array([0.0, 10.0, 1.0]))
+    assert np.allclose(nav_resampled["linear_velocity"][0], np.array([0.0, 20.0, 2.0]))
+    assert np.allclose(nav_resampled["navsat"][0, 2], 11.0)
 
 
 def test_dem_raster_operations():

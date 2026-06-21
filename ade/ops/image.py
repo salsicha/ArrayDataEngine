@@ -358,6 +358,253 @@ def local_std(image: np.ndarray, size=3, spatial_axes=None) -> np.ndarray:
     return local_statistics(image, size=size, statistics=("std",), spatial_axes=spatial_axes)["std"]
 
 
+def estimate_image_shift(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    max_shift: int | tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Estimate integer ``(row_shift, col_shift)`` from reference to moving image."""
+
+    ref, mov = _motion_pair(reference, moving)
+    return _phase_correlation_shift(ref, mov, max_shift=max_shift)
+
+
+def frame_optical_flow(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    max_shift: int | tuple[int, int] | None = None,
+    block_size: int | tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Estimate a dense frame-to-frame flow field with ``(dy, dx)`` channels."""
+
+    ref, mov = _motion_pair(reference, moving)
+    height, width = ref.shape
+    flow = np.empty((height, width, 2), dtype=np.float64)
+    if block_size is None:
+        shift = _phase_correlation_shift(ref, mov, max_shift=max_shift)
+        flow[..., 0] = shift[0]
+        flow[..., 1] = shift[1]
+        return flow
+
+    block_h, block_w = _kernel_shape(block_size)
+    for row_start in range(0, height, block_h):
+        row_stop = min(row_start + block_h, height)
+        for col_start in range(0, width, block_w):
+            col_stop = min(col_start + block_w, width)
+            shift = _phase_correlation_shift(
+                ref[row_start:row_stop, col_start:col_stop],
+                mov[row_start:row_stop, col_start:col_stop],
+                max_shift=max_shift,
+            )
+            flow[row_start:row_stop, col_start:col_stop, 0] = shift[0]
+            flow[row_start:row_stop, col_start:col_stop, 1] = shift[1]
+    return flow
+
+
+def iter_frame_optical_flow(
+    images,
+    max_shift: int | tuple[int, int] | None = None,
+    block_size: int | tuple[int, int] | None = None,
+):
+    """Yield optical flow for adjacent frames without materializing a flow stack."""
+
+    iterator = iter(_iter_image_frames(images))
+    try:
+        previous = next(iterator)
+    except StopIteration:
+        return
+
+    for current in iterator:
+        yield frame_optical_flow(previous, current, max_shift=max_shift, block_size=block_size)
+        previous = current
+
+
+def frame_to_frame_optical_flow(
+    images: np.ndarray,
+    max_shift: int | tuple[int, int] | None = None,
+    block_size: int | tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Collect adjacent-frame optical flow fields into a ``(N - 1, H, W, 2)`` stack."""
+
+    arr = _as_image_sequence(images)
+    height, width = arr.shape[1], arr.shape[2]
+    flows = list(iter_frame_optical_flow(arr, max_shift=max_shift, block_size=block_size))
+    if not flows:
+        return np.empty((0, height, width, 2), dtype=np.float64)
+    return np.stack(flows, axis=0)
+
+
+def translate_image(image: np.ndarray, shift, fill_value=0) -> np.ndarray:
+    """Translate an image by integer ``(row_shift, col_shift)`` pixels."""
+
+    arr = np.asarray(image)
+    if arr.ndim not in (2, 3):
+        raise ValueError("image must have shape (H, W) or (H, W, C)")
+    row_shift, col_shift = _integer_shift(shift)
+    result = np.full(arr.shape, fill_value, dtype=arr.dtype)
+    height, width = arr.shape[:2]
+
+    src_row_start = max(0, -row_shift)
+    src_row_stop = height - max(0, row_shift)
+    dst_row_start = max(0, row_shift)
+    dst_row_stop = height - max(0, -row_shift)
+    src_col_start = max(0, -col_shift)
+    src_col_stop = width - max(0, col_shift)
+    dst_col_start = max(0, col_shift)
+    dst_col_stop = width - max(0, -col_shift)
+
+    if src_row_start >= src_row_stop or src_col_start >= src_col_stop:
+        return result
+    result[dst_row_start:dst_row_stop, dst_col_start:dst_col_stop, ...] = arr[
+        src_row_start:src_row_stop,
+        src_col_start:src_col_stop,
+        ...,
+    ]
+    return result
+
+
+def align_image(
+    moving: np.ndarray,
+    reference: np.ndarray | None = None,
+    shift=None,
+    max_shift: int | tuple[int, int] | None = None,
+    fill_value=0,
+    return_shift: bool = False,
+):
+    """Align one moving image to a reference using estimated translation."""
+
+    if shift is None:
+        if reference is None:
+            raise ValueError("reference is required when shift is not provided")
+        shift = estimate_image_shift(reference, moving, max_shift=max_shift)
+    shift = np.asarray(shift, dtype=np.float64)
+    aligned = translate_image(moving, -shift, fill_value=fill_value)
+    if return_shift:
+        return aligned, shift
+    return aligned
+
+
+def iter_aligned_images(
+    images,
+    max_shift: int | tuple[int, int] | None = None,
+    fill_value=0,
+    incremental: bool = True,
+    return_shifts: bool = False,
+):
+    """Yield images aligned to the first frame without collecting the sequence."""
+
+    iterator = iter(_iter_image_frames(images))
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return
+
+    cumulative = np.zeros(2, dtype=np.float64)
+    previous = first
+    yield (first.copy(), cumulative.copy()) if return_shifts else first.copy()
+
+    for current in iterator:
+        if incremental:
+            shift = estimate_image_shift(previous, current, max_shift=max_shift)
+            cumulative = cumulative + shift
+        else:
+            cumulative = estimate_image_shift(first, current, max_shift=max_shift)
+        aligned = translate_image(current, -cumulative, fill_value=fill_value)
+        yield (aligned, cumulative.copy()) if return_shifts else aligned
+        previous = current
+
+
+def align_images(
+    images: np.ndarray,
+    max_shift: int | tuple[int, int] | None = None,
+    fill_value=0,
+    incremental: bool = True,
+    return_shifts: bool = False,
+):
+    """Collect a sequence aligned to the first frame."""
+
+    if return_shifts:
+        pairs = list(iter_aligned_images(
+            images,
+            max_shift=max_shift,
+            fill_value=fill_value,
+            incremental=incremental,
+            return_shifts=True,
+        ))
+        if not pairs:
+            arr = _as_image_sequence(images)
+            return np.empty_like(arr), np.empty((0, 2), dtype=np.float64)
+        aligned, shifts = zip(*pairs)
+        return np.stack(aligned, axis=0), np.stack(shifts, axis=0)
+
+    aligned = list(iter_aligned_images(
+        images,
+        max_shift=max_shift,
+        fill_value=fill_value,
+        incremental=incremental,
+    ))
+    if not aligned:
+        return np.empty_like(_as_image_sequence(images))
+    return np.stack(aligned, axis=0)
+
+
+def iter_motion_compensated_windows(
+    images,
+    window_size: int,
+    max_shift: int | tuple[int, int] | None = None,
+    fill_value=0,
+    min_periods: int = 1,
+    return_shifts: bool = False,
+):
+    """Yield trailing rolling windows aligned to each window's newest frame."""
+
+    from collections import deque
+
+    window_size = int(window_size)
+    min_periods = int(min_periods)
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if min_periods < 1 or min_periods > window_size:
+        raise ValueError("min_periods must be in [1, window_size]")
+
+    window = deque(maxlen=window_size)
+    for frame in _iter_image_frames(images):
+        window.append(frame)
+        if len(window) < min_periods:
+            continue
+
+        reference = window[-1]
+        aligned = []
+        shifts = []
+        for candidate in window:
+            shift = estimate_image_shift(reference, candidate, max_shift=max_shift)
+            aligned.append(translate_image(candidate, -shift, fill_value=fill_value))
+            shifts.append(shift)
+        aligned_stack = np.stack(aligned, axis=0)
+        shift_stack = np.stack(shifts, axis=0)
+        yield (aligned_stack, shift_stack) if return_shifts else aligned_stack
+
+
+def motion_compensated_rolling_windows(
+    images,
+    window_size: int,
+    max_shift: int | tuple[int, int] | None = None,
+    fill_value=0,
+    min_periods: int = 1,
+    return_shifts: bool = False,
+):
+    """Return a lazy iterator of trailing motion-compensated image windows."""
+
+    return iter_motion_compensated_windows(
+        images,
+        window_size=window_size,
+        max_shift=max_shift,
+        fill_value=fill_value,
+        min_periods=min_periods,
+        return_shifts=return_shifts,
+    )
+
+
 def valid_depth_mask(depth: np.ndarray, min_depth: float = 0.0, max_depth: float | None = None) -> np.ndarray:
     arr = np.asarray(depth, dtype=np.float64)
     mask = np.isfinite(arr) & (arr > min_depth)
@@ -664,6 +911,117 @@ def _resize_spatial_nearest(image: np.ndarray, shape: tuple[int, int], spatial_a
     col_idx = np.linspace(0, arr.shape[spatial_axes[1]] - 1, out_w).round().astype(int)
     result = np.take(arr, row_idx, axis=spatial_axes[0])
     return np.take(result, col_idx, axis=spatial_axes[1])
+
+
+def _iter_image_frames(images):
+    if isinstance(images, np.ndarray):
+        arr = _as_image_sequence(images)
+        for frame in arr:
+            yield frame
+        return
+
+    try:
+        arr = np.asarray(images)
+    except ValueError:
+        arr = None
+    if arr is not None and arr.dtype != object and arr.ndim in (3, 4):
+        for frame in arr:
+            yield frame
+        return
+
+    for frame in images:
+        arr_frame = np.asarray(frame)
+        if arr_frame.ndim not in (2, 3):
+            raise ValueError("each image frame must have shape (H, W) or (H, W, C)")
+        yield arr_frame
+
+
+def _motion_pair(reference: np.ndarray, moving: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ref = _motion_image(reference)
+    mov = _motion_image(moving)
+    if ref.shape != mov.shape:
+        raise ValueError("reference and moving images must have matching spatial shape")
+    return ref, mov
+
+
+def _motion_image(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.ndim == 3:
+        arr = rgb_to_gray(arr)
+    if arr.ndim != 2:
+        raise ValueError("image must have shape (H, W) or (H, W, C)")
+    arr = arr.astype(np.float64, copy=False)
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    return arr
+
+
+def _phase_correlation_shift(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    max_shift: int | tuple[int, int] | None = None,
+) -> np.ndarray:
+    if reference.size == 0:
+        return np.zeros(2, dtype=np.float64)
+
+    ref = reference.astype(np.float64, copy=False) - float(np.mean(reference))
+    mov = moving.astype(np.float64, copy=False) - float(np.mean(moving))
+    if not np.any(ref) or not np.any(mov):
+        return np.zeros(2, dtype=np.float64)
+
+    cross_power = np.fft.fft2(mov) * np.conj(np.fft.fft2(ref))
+    magnitude = np.abs(cross_power)
+    cross_power = np.divide(cross_power, magnitude, out=np.zeros_like(cross_power), where=magnitude > 1e-12)
+    correlation = np.fft.ifft2(cross_power).real
+    peak = _bounded_correlation_peak(correlation, max_shift=max_shift)
+    return _peak_to_shift(peak, correlation.shape)
+
+
+def _bounded_correlation_peak(correlation: np.ndarray, max_shift: int | tuple[int, int] | None) -> tuple[int, int]:
+    if max_shift is None:
+        return tuple(int(index) for index in np.unravel_index(np.argmax(correlation), correlation.shape))
+
+    max_row, max_col = _normalize_max_shift(max_shift)
+    height, width = correlation.shape
+    max_row = min(max_row, height // 2)
+    max_col = min(max_col, width // 2)
+    rows = _shift_candidate_indices(height, max_row)
+    cols = _shift_candidate_indices(width, max_col)
+    bounded = correlation[np.ix_(rows, cols)]
+    local = np.unravel_index(np.argmax(bounded), bounded.shape)
+    return int(rows[local[0]]), int(cols[local[1]])
+
+
+def _shift_candidate_indices(size: int, max_shift: int) -> np.ndarray:
+    if max_shift <= 0:
+        return np.array([0], dtype=int)
+    positive = np.arange(0, max_shift + 1, dtype=int)
+    negative = np.arange(size - max_shift, size, dtype=int)
+    return np.unique(np.concatenate((positive, negative)))
+
+
+def _peak_to_shift(peak: tuple[int, int], shape: tuple[int, int]) -> np.ndarray:
+    shift = np.array(peak, dtype=np.float64)
+    for axis, size in enumerate(shape):
+        if shift[axis] > size // 2:
+            shift[axis] -= size
+    return shift
+
+
+def _normalize_max_shift(max_shift: int | tuple[int, int]) -> tuple[int, int]:
+    if np.isscalar(max_shift):
+        row = col = int(max_shift)
+    else:
+        row, col = int(max_shift[0]), int(max_shift[1])
+    if row < 0 or col < 0:
+        raise ValueError("max_shift must be non-negative")
+    return row, col
+
+
+def _integer_shift(shift) -> tuple[int, int]:
+    arr = np.asarray(shift, dtype=np.float64)
+    if arr.shape != (2,):
+        raise ValueError("shift must contain row and column values")
+    return int(np.rint(arr[0])), int(np.rint(arr[1]))
 
 
 def _depth_intrinsics(

@@ -308,6 +308,41 @@ def transform_dem_grid(
     )
 
 
+@dataclass(frozen=True)
+class CameraModel:
+    """Pinhole camera model with optional distortion and rectification metadata."""
+
+    camera_matrix: np.ndarray
+    image_shape: tuple[int, int] | None = None
+    distortion: np.ndarray | None = None
+    rectification: np.ndarray | None = None
+    projection_matrix: np.ndarray | None = None
+
+    def __post_init__(self):
+        matrix = np.asarray(self.camera_matrix, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError("camera_matrix must have shape (3, 3)")
+        object.__setattr__(self, "camera_matrix", matrix.copy())
+
+        if self.image_shape is not None:
+            object.__setattr__(self, "image_shape", _image_height_width(self.image_shape))
+
+        if self.distortion is not None:
+            object.__setattr__(self, "distortion", _distortion_coefficients(self.distortion))
+
+        if self.rectification is not None:
+            rectification = np.asarray(self.rectification, dtype=np.float64)
+            if rectification.shape != (3, 3):
+                raise ValueError("rectification must have shape (3, 3)")
+            object.__setattr__(self, "rectification", rectification.copy())
+
+        if self.projection_matrix is not None:
+            projection = np.asarray(self.projection_matrix, dtype=np.float64)
+            if projection.shape not in ((3, 3), (3, 4)):
+                raise ValueError("projection_matrix must have shape (3, 3) or (3, 4)")
+            object.__setattr__(self, "projection_matrix", projection.copy())
+
+
 def camera_matrix(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
     """Return a 3x3 pinhole camera intrinsic matrix."""
 
@@ -320,6 +355,264 @@ def camera_matrix(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def camera_model(
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    intrinsics: np.ndarray | None = None,
+    image_shape: tuple[int, int] | None = None,
+    distortion: np.ndarray | None = None,
+    rectification: np.ndarray | None = None,
+    projection_matrix: np.ndarray | None = None,
+) -> CameraModel:
+    """Create a `CameraModel` from pinhole intrinsics and optional calibration arrays."""
+
+    return CameraModel(
+        camera_matrix=_camera_matrix_from_optional(fx, fy, cx, cy, intrinsics),
+        image_shape=image_shape,
+        distortion=distortion,
+        rectification=rectification,
+        projection_matrix=projection_matrix,
+    )
+
+
+def scale_camera_matrix(matrix: np.ndarray, scale_x: float, scale_y: float | None = None) -> np.ndarray:
+    """Scale focal length and principal point for resized images."""
+
+    sx = float(scale_x)
+    sy = sx if scale_y is None else float(scale_y)
+    scaled = _camera_matrix_from_optional(None, None, None, None, matrix)
+    scaled[0, 0] *= sx
+    scaled[0, 2] *= sx
+    scaled[1, 1] *= sy
+    scaled[1, 2] *= sy
+    return scaled
+
+
+def crop_camera_matrix(matrix: np.ndarray, row_offset: float = 0.0, col_offset: float = 0.0) -> np.ndarray:
+    """Adjust principal point after cropping an image."""
+
+    cropped = _camera_matrix_from_optional(None, None, None, None, matrix)
+    cropped[0, 2] -= float(col_offset)
+    cropped[1, 2] -= float(row_offset)
+    return cropped
+
+
+def pixels_to_normalized_points(pixels: np.ndarray, camera_matrix: np.ndarray) -> np.ndarray:
+    """Convert `(col, row)` pixels to normalized camera coordinates."""
+
+    coords, original_shape = _pixel_array(pixels)
+    intrinsics = _camera_intrinsics(None, None, None, None, camera_matrix)
+    normalized = np.empty_like(coords, dtype=np.float64)
+    normalized[:, 0] = (coords[:, 0] - intrinsics[2]) / intrinsics[0]
+    normalized[:, 1] = (coords[:, 1] - intrinsics[3]) / intrinsics[1]
+    return normalized.reshape(original_shape)
+
+
+def normalized_points_to_pixels(points: np.ndarray, camera_matrix: np.ndarray) -> np.ndarray:
+    """Convert normalized camera coordinates to `(col, row)` pixels."""
+
+    normalized, original_shape = _pixel_array(points)
+    intrinsics = _camera_intrinsics(None, None, None, None, camera_matrix)
+    pixels = np.empty_like(normalized, dtype=np.float64)
+    pixels[:, 0] = normalized[:, 0] * intrinsics[0] + intrinsics[2]
+    pixels[:, 1] = normalized[:, 1] * intrinsics[1] + intrinsics[3]
+    return pixels.reshape(original_shape)
+
+
+def distort_normalized_points(points: np.ndarray, distortion: np.ndarray | None = None) -> np.ndarray:
+    """Apply Brown-Conrady distortion to normalized camera coordinates."""
+
+    normalized, original_shape = _pixel_array(points)
+    coefficients = _distortion_coefficients(distortion)
+    if not np.any(coefficients):
+        return normalized.copy().reshape(original_shape)
+
+    k1, k2, p1, p2, k3, k4, k5, k6 = coefficients
+    x = normalized[:, 0]
+    y = normalized[:, 1]
+    r2 = x * x + y * y
+    r4 = r2 * r2
+    r6 = r4 * r2
+    numerator = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+    denominator = 1.0 + k4 * r2 + k5 * r4 + k6 * r6
+    radial = np.divide(numerator, denominator, out=np.ones_like(numerator), where=denominator != 0.0)
+    distorted = np.empty_like(normalized, dtype=np.float64)
+    distorted[:, 0] = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    distorted[:, 1] = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return distorted.reshape(original_shape)
+
+
+def undistort_normalized_points(
+    points: np.ndarray,
+    distortion: np.ndarray | None = None,
+    iterations: int = 5,
+) -> np.ndarray:
+    """Invert Brown-Conrady distortion with fixed-point iteration."""
+
+    distorted, original_shape = _pixel_array(points)
+    coefficients = _distortion_coefficients(distortion)
+    if not np.any(coefficients):
+        return distorted.copy().reshape(original_shape)
+
+    estimate = distorted.copy()
+    for _ in range(int(iterations)):
+        redistorted = distort_normalized_points(estimate, coefficients).reshape(-1, 2)
+        estimate += distorted - redistorted
+    return estimate.reshape(original_shape)
+
+
+def distort_pixels(
+    pixels: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply lens distortion to `(col, row)` pixels."""
+
+    normalized = pixels_to_normalized_points(pixels, camera_matrix)
+    distorted = distort_normalized_points(normalized, distortion)
+    return normalized_points_to_pixels(distorted, camera_matrix)
+
+
+def undistort_pixels(
+    pixels: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+    iterations: int = 5,
+) -> np.ndarray:
+    """Remove lens distortion from `(col, row)` pixels."""
+
+    normalized = pixels_to_normalized_points(pixels, camera_matrix)
+    undistorted = undistort_normalized_points(normalized, distortion, iterations=iterations)
+    return normalized_points_to_pixels(undistorted, camera_matrix)
+
+
+def backproject_pixels(
+    pixels: np.ndarray,
+    depth: np.ndarray | float,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+) -> np.ndarray:
+    """Backproject `(col, row)` pixels and depth values to XYZ camera points."""
+
+    _, original_shape = _pixel_array(pixels)
+    normalized = pixels_to_normalized_points(pixels, camera_matrix).reshape(-1, 2)
+    if distortion is not None:
+        normalized = undistort_normalized_points(normalized, distortion).reshape(-1, 2)
+
+    depth_values = np.asarray(depth, dtype=np.float64)
+    if depth_values.ndim == 0:
+        z = np.full(normalized.shape[0], float(depth_values), dtype=np.float64)
+    else:
+        z = np.broadcast_to(depth_values, original_shape[:-1]).reshape(-1).astype(np.float64, copy=False)
+
+    points = np.empty((normalized.shape[0], 3), dtype=np.float64)
+    points[:, 0] = normalized[:, 0] * z
+    points[:, 1] = normalized[:, 1] * z
+    points[:, 2] = z
+    return points.reshape((*original_shape[:-1], 3))
+
+
+def project_camera_points(
+    points: np.ndarray,
+    camera: CameraModel | None = None,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    camera_matrix: np.ndarray | None = None,
+    distortion: np.ndarray | None = None,
+    image_shape: tuple[int, int] | None = None,
+    transform: np.ndarray | None = None,
+    return_depth: bool = False,
+):
+    """Project XYZ camera points with optional camera model distortion."""
+
+    matrix, coefficients, shape = _camera_model_components(
+        camera,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        camera_matrix=camera_matrix,
+        distortion=distortion,
+        image_shape=image_shape,
+    )
+    return _project_points_with_camera(
+        points,
+        matrix,
+        distortion=coefficients,
+        image_shape=shape,
+        transform=transform,
+        return_depth=return_depth,
+    )
+
+
+def rectification_map(
+    image_shape: tuple[int, int],
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+    rectification: np.ndarray | None = None,
+    new_camera_matrix: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return source `(col, row)` coordinates for rectifying an image."""
+
+    height, width = _image_height_width(image_shape)
+    source_matrix = _camera_matrix_from_optional(None, None, None, None, camera_matrix)
+    target_matrix = source_matrix if new_camera_matrix is None else _camera_matrix_from_optional(
+        None,
+        None,
+        None,
+        None,
+        new_camera_matrix,
+    )
+    rotation = np.eye(3, dtype=np.float64) if rectification is None else np.asarray(rectification, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError("rectification must have shape (3, 3)")
+
+    rows, cols = np.indices((height, width), dtype=np.float64)
+    target_pixels = np.stack((cols, rows), axis=-1)
+    target_normalized = pixels_to_normalized_points(target_pixels, target_matrix).reshape(-1, 2)
+    target_rays = np.column_stack((target_normalized, np.ones(target_normalized.shape[0], dtype=np.float64)))
+    source_rays = target_rays @ np.linalg.inv(rotation).T
+    source_normalized = source_rays[:, :2] / source_rays[:, 2:3]
+    source_distorted = distort_normalized_points(source_normalized, distortion).reshape(-1, 2)
+    return normalized_points_to_pixels(source_distorted, source_matrix).reshape(height, width, 2)
+
+
+def rectify_image(
+    image: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+    rectification: np.ndarray | None = None,
+    new_camera_matrix: np.ndarray | None = None,
+    output_shape: tuple[int, int] | None = None,
+    bilinear: bool = True,
+    fill_value=0,
+) -> np.ndarray:
+    """Rectify an image by sampling through a rectification map."""
+
+    arr = np.asarray(image)
+    if arr.ndim not in (2, 3):
+        raise ValueError("image must have shape (H, W) or (H, W, C)")
+    shape = arr.shape[:2] if output_shape is None else _image_height_width(output_shape)
+    mapping = rectification_map(
+        shape,
+        camera_matrix=camera_matrix,
+        distortion=distortion,
+        rectification=rectification,
+        new_camera_matrix=new_camera_matrix,
+    )
+    samples = sample_image_at_pixels(
+        arr,
+        mapping.reshape(-1, 2),
+        bilinear=bilinear,
+        fill_value=fill_value,
+    )
+    return samples.reshape((*shape, *arr.shape[2:]))
+
+
 def project_points_to_image(
     points: np.ndarray,
     fx: float | None = None,
@@ -329,37 +622,20 @@ def project_points_to_image(
     image_shape: tuple[int, int] | None = None,
     transform: np.ndarray | None = None,
     camera_matrix: np.ndarray | None = None,
+    distortion: np.ndarray | None = None,
     return_depth: bool = False,
 ):
     """Project XYZ points into image pixels as `(col, row)` coordinates."""
 
-    intrinsics = _camera_intrinsics(fx, fy, cx, cy, camera_matrix)
-    arr = _as_points(points)
-    xyz = (
-        _transform_xyz(arr[:, :3], transform)
-        if transform is not None
-        else np.asarray(arr[:, :3], dtype=np.float64)
+    matrix = _camera_matrix_from_optional(fx, fy, cx, cy, camera_matrix)
+    return _project_points_with_camera(
+        points,
+        matrix,
+        distortion=distortion,
+        image_shape=image_shape,
+        transform=transform,
+        return_depth=return_depth,
     )
-    depth = xyz[:, 2]
-
-    valid = np.isfinite(xyz).all(axis=1) & (depth > 0.0)
-    pixels = np.full((arr.shape[0], 2), np.nan, dtype=np.float64)
-    if np.any(valid):
-        pixels[valid, 0] = intrinsics[0] * xyz[valid, 0] / depth[valid] + intrinsics[2]
-        pixels[valid, 1] = intrinsics[1] * xyz[valid, 1] / depth[valid] + intrinsics[3]
-
-    if image_shape is not None:
-        height, width = _image_height_width(image_shape)
-        valid &= (
-            (pixels[:, 0] >= 0.0)
-            & (pixels[:, 0] <= width - 1)
-            & (pixels[:, 1] >= 0.0)
-            & (pixels[:, 1] <= height - 1)
-        )
-
-    if return_depth:
-        return pixels, depth.copy(), valid
-    return pixels, valid
 
 
 def sample_image_at_pixels(
@@ -784,6 +1060,82 @@ def _transform_quaternions(quaternions: np.ndarray, transform: np.ndarray) -> np
     return _normalize_quaternions(_quaternion_multiply(rotation_q, q))
 
 
+def _project_points_with_camera(
+    points: np.ndarray,
+    matrix: np.ndarray,
+    distortion: np.ndarray | None = None,
+    image_shape: tuple[int, int] | None = None,
+    transform: np.ndarray | None = None,
+    return_depth: bool = False,
+):
+    intrinsics = _camera_intrinsics(None, None, None, None, matrix)
+    arr = _as_points(points)
+    xyz = (
+        _transform_xyz(arr[:, :3], transform)
+        if transform is not None
+        else np.asarray(arr[:, :3], dtype=np.float64)
+    )
+    depth = xyz[:, 2]
+
+    valid = np.isfinite(xyz).all(axis=1) & (depth > 0.0)
+    pixels = np.full((arr.shape[0], 2), np.nan, dtype=np.float64)
+    if np.any(valid):
+        normalized = np.empty((np.count_nonzero(valid), 2), dtype=np.float64)
+        normalized[:, 0] = xyz[valid, 0] / depth[valid]
+        normalized[:, 1] = xyz[valid, 1] / depth[valid]
+        normalized = distort_normalized_points(normalized, distortion).reshape(-1, 2)
+        pixels[valid, 0] = intrinsics[0] * normalized[:, 0] + intrinsics[2]
+        pixels[valid, 1] = intrinsics[1] * normalized[:, 1] + intrinsics[3]
+
+    if image_shape is not None:
+        height, width = _image_height_width(image_shape)
+        valid &= (
+            (pixels[:, 0] >= 0.0)
+            & (pixels[:, 0] <= width - 1)
+            & (pixels[:, 1] >= 0.0)
+            & (pixels[:, 1] <= height - 1)
+        )
+
+    if return_depth:
+        return pixels, depth.copy(), valid
+    return pixels, valid
+
+
+def _camera_model_components(
+    camera: CameraModel | None,
+    fx: float | None,
+    fy: float | None,
+    cx: float | None,
+    cy: float | None,
+    camera_matrix: np.ndarray | None,
+    distortion: np.ndarray | None,
+    image_shape: tuple[int, int] | None,
+) -> tuple[np.ndarray, np.ndarray | None, tuple[int, int] | None]:
+    if camera is not None:
+        matrix = camera.camera_matrix if camera_matrix is None and fx is None and fy is None and cx is None and cy is None else (
+            _camera_matrix_from_optional(fx, fy, cx, cy, camera_matrix)
+        )
+        coefficients = camera.distortion if distortion is None else _distortion_coefficients(distortion)
+        shape = camera.image_shape if image_shape is None else _image_height_width(image_shape)
+        return matrix, coefficients, shape
+
+    matrix = _camera_matrix_from_optional(fx, fy, cx, cy, camera_matrix)
+    coefficients = None if distortion is None else _distortion_coefficients(distortion)
+    shape = None if image_shape is None else _image_height_width(image_shape)
+    return matrix, coefficients, shape
+
+
+def _camera_matrix_from_optional(
+    fx: float | None,
+    fy: float | None,
+    cx: float | None,
+    cy: float | None,
+    matrix: np.ndarray | None,
+) -> np.ndarray:
+    intrinsics = _camera_intrinsics(fx, fy, cx, cy, matrix)
+    return camera_matrix(intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3])
+
+
 def _camera_intrinsics(
     fx: float | None,
     fy: float | None,
@@ -805,6 +1157,24 @@ def _camera_intrinsics(
     if fx == 0 or fy == 0:
         raise ValueError("fx and fy must be non-zero")
     return np.array([fx, fy, cx, cy], dtype=np.float64)
+
+
+def _distortion_coefficients(distortion: np.ndarray | None) -> np.ndarray:
+    if distortion is None:
+        return np.zeros(8, dtype=np.float64)
+    coefficients = np.asarray(distortion, dtype=np.float64).reshape(-1)
+    if coefficients.size not in (0, 4, 5, 8):
+        raise ValueError("distortion must contain 4, 5, or 8 coefficients")
+    normalized = np.zeros(8, dtype=np.float64)
+    normalized[: coefficients.size] = coefficients
+    return normalized
+
+
+def _pixel_array(pixels: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
+    arr = np.asarray(pixels, dtype=np.float64)
+    if arr.shape[-1:] != (2,):
+        raise ValueError("pixels/points must have two values on the last axis")
+    return arr.reshape(-1, 2), arr.shape
 
 
 def _image_height_width(image_shape: tuple[int, int]) -> tuple[int, int]:

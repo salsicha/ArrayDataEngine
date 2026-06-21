@@ -51,6 +51,170 @@ def interpolate_timeseries(timestamps: np.ndarray, values: np.ndarray, target_ti
     return interpolated.reshape((targets.size,) + vals.shape[1:])
 
 
+def interpolate_quaternions(
+    timestamps: np.ndarray,
+    orientations: np.ndarray,
+    target_timestamps: np.ndarray,
+) -> np.ndarray:
+    """Interpolate XYZW quaternions at target timestamps using SLERP."""
+
+    ts, targets = _interpolation_timestamps(timestamps, target_timestamps)
+    quaternions = np.asarray(orientations, dtype=np.float64)
+    if quaternions.shape != (ts.size, 4):
+        raise ValueError("orientations must have shape (N, 4)")
+    quaternions = normalize_quaternion(quaternions)
+    if ts.size == 1:
+        return np.repeat(quaternions, targets.size, axis=0)
+
+    result = np.empty((targets.size, 4), dtype=np.float64)
+    for index, target in enumerate(targets):
+        if target <= ts[0]:
+            result[index] = quaternions[0]
+        elif target >= ts[-1]:
+            result[index] = quaternions[-1]
+        else:
+            upper = int(np.searchsorted(ts, target, side="right"))
+            lower = upper - 1
+            fraction = float((target - ts[lower]) / (ts[upper] - ts[lower]))
+            result[index] = slerp(quaternions[lower], quaternions[upper], fraction)
+    return normalize_quaternion(result)
+
+
+def interpolate_trajectory(trajectory: Mapping[str, Any], target_timestamps: np.ndarray) -> dict:
+    """Interpolate a common trajectory dict onto target timestamps."""
+
+    ts, targets = _interpolation_timestamps(trajectory["ts"], target_timestamps)
+    position = interpolate_timeseries(ts, _trajectory_field(trajectory, "position", ts.size, 3), targets)
+    orientation = interpolate_quaternions(ts, _trajectory_field(trajectory, "orientation", ts.size, 4), targets)
+    linear_velocity = interpolate_timeseries(ts, _trajectory_field(trajectory, "linear_velocity", ts.size, 3), targets)
+    angular_velocity = interpolate_timeseries(ts, _trajectory_field(trajectory, "angular_velocity", ts.size, 3), targets)
+    linear_acceleration = interpolate_timeseries(
+        ts,
+        _trajectory_field(trajectory, "linear_acceleration", ts.size, 3),
+        targets,
+    )
+    result = _trajectory_dict(
+        ts=targets,
+        position=position,
+        orientation=orientation,
+        linear_velocity=linear_velocity,
+        angular_velocity=angular_velocity,
+        linear_acceleration=linear_acceleration,
+        position_covariance=interpolate_timeseries(
+            ts,
+            _trajectory_field(trajectory, "position_covariance", ts.size, 3),
+            targets,
+        ),
+        orientation_covariance=interpolate_timeseries(
+            ts,
+            _trajectory_field(trajectory, "orientation_covariance", ts.size, 3),
+            targets,
+        ),
+        linear_velocity_covariance=interpolate_timeseries(
+            ts,
+            _trajectory_field(trajectory, "linear_velocity_covariance", ts.size, 3),
+            targets,
+        ),
+        angular_velocity_covariance=interpolate_timeseries(
+            ts,
+            _trajectory_field(trajectory, "angular_velocity_covariance", ts.size, 3),
+            targets,
+        ),
+        linear_acceleration_covariance=interpolate_timeseries(
+            ts,
+            _trajectory_field(trajectory, "linear_acceleration_covariance", ts.size, 3),
+            targets,
+        ),
+        source=str(trajectory.get("source", "trajectory")),
+        metadata=_trajectory_metadata(trajectory),
+    )
+
+    if "reference" in trajectory:
+        reference = dict(trajectory["reference"])
+        result["reference"] = reference
+        if "navsat" in trajectory:
+            result["navsat"] = enu_to_navsat(
+                result["position"],
+                reference["lat"],
+                reference["lon"],
+                reference.get("alt", 0.0),
+            )
+    return result
+
+
+def resample_trajectory(
+    trajectory: Mapping[str, Any],
+    period: float | None = None,
+    target_timestamps: np.ndarray | None = None,
+    start: float | None = None,
+    end: float | None = None,
+) -> dict:
+    """Resample a common trajectory dict to target timestamps or a fixed period."""
+
+    targets = _resample_targets(trajectory["ts"], period=period, target_timestamps=target_timestamps, start=start, end=end)
+    return interpolate_trajectory(trajectory, targets)
+
+
+def resample_imu(
+    imu_data,
+    period: float | None = None,
+    target_timestamps: np.ndarray | None = None,
+    timestamps: np.ndarray | None = None,
+    position=None,
+    linear_velocity=None,
+    start: float | None = None,
+    end: float | None = None,
+) -> dict:
+    """Convert and resample an IMU stream as a common trajectory dict."""
+
+    trajectory = imu_to_trajectory(
+        imu_data,
+        timestamps=timestamps,
+        position=position,
+        linear_velocity=linear_velocity,
+    )
+    return resample_trajectory(trajectory, period=period, target_timestamps=target_timestamps, start=start, end=end)
+
+
+def resample_odometry(
+    odometry_data,
+    period: float | None = None,
+    target_timestamps: np.ndarray | None = None,
+    timestamps: np.ndarray | None = None,
+    start: float | None = None,
+    end: float | None = None,
+) -> dict:
+    """Convert and resample an odometry stream as a common trajectory dict."""
+
+    trajectory = odometry_to_trajectory(odometry_data, timestamps=timestamps)
+    return resample_trajectory(trajectory, period=period, target_timestamps=target_timestamps, start=start, end=end)
+
+
+def resample_navsat(
+    navsat_data,
+    period: float | None = None,
+    target_timestamps: np.ndarray | None = None,
+    timestamps: np.ndarray | None = None,
+    ref_lat: float | None = None,
+    ref_lon: float | None = None,
+    ref_alt: float | None = None,
+    compute_velocity: bool = True,
+    start: float | None = None,
+    end: float | None = None,
+) -> dict:
+    """Convert and resample a NavSat stream as a local ENU trajectory dict."""
+
+    trajectory = navsat_to_trajectory(
+        navsat_data,
+        timestamps=timestamps,
+        ref_lat=ref_lat,
+        ref_lon=ref_lon,
+        ref_alt=ref_alt,
+        compute_velocity=compute_velocity,
+    )
+    return resample_trajectory(trajectory, period=period, target_timestamps=target_timestamps, start=start, end=end)
+
+
 def imu_to_trajectory(imu_data, timestamps: np.ndarray | None = None, position=None, linear_velocity=None) -> dict:
     """Convert ADE IMU arrays shaped `(N, 6, 4)` into a common trajectory dict."""
 
@@ -185,6 +349,61 @@ def trajectory_speed(timestamps: np.ndarray, positions: np.ndarray) -> np.ndarra
         raise ValueError("timestamps must not contain duplicate values")
     velocity = np.gradient(pos, axis=0) / dt.reshape((-1,) + (1,) * (pos.ndim - 1))
     return np.linalg.norm(velocity, axis=-1)
+
+
+def _interpolation_timestamps(
+    timestamps: np.ndarray,
+    target_timestamps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    ts = np.asarray(timestamps, dtype=np.float64)
+    targets = np.asarray(target_timestamps, dtype=np.float64)
+    if ts.ndim != 1:
+        raise ValueError("timestamps must be one-dimensional")
+    if targets.ndim != 1:
+        raise ValueError("target_timestamps must be one-dimensional")
+    if ts.size == 0:
+        raise ValueError("timestamps cannot be empty")
+    if np.any(np.diff(ts) <= 0):
+        raise ValueError("timestamps must be strictly increasing")
+    return ts, targets
+
+
+def _resample_targets(
+    timestamps: np.ndarray,
+    period: float | None,
+    target_timestamps: np.ndarray | None,
+    start: float | None,
+    end: float | None,
+) -> np.ndarray:
+    ts = np.asarray(timestamps, dtype=np.float64)
+    if target_timestamps is not None:
+        return np.asarray(target_timestamps, dtype=np.float64)
+    if period is None:
+        raise ValueError("period or target_timestamps is required")
+    period = float(period)
+    if period <= 0.0:
+        raise ValueError("period must be positive")
+    if ts.ndim != 1 or ts.size == 0:
+        raise ValueError("trajectory timestamps must be a non-empty one-dimensional array")
+    start_value = float(ts[0] if start is None else start)
+    end_value = float(ts[-1] if end is None else end)
+    if start_value > end_value:
+        raise ValueError("start must be less than or equal to end")
+    count = int(np.floor((end_value - start_value) / period + 1e-12)) + 1
+    return start_value + np.arange(count, dtype=np.float64) * period
+
+
+def _trajectory_field(trajectory: Mapping[str, Any], key: str, count: int, width: int) -> np.ndarray:
+    if key not in trajectory:
+        return np.full((count, width), np.nan, dtype=np.float64)
+    arr = np.asarray(trajectory[key], dtype=np.float64)
+    if arr.shape[0] != count:
+        raise ValueError(f"trajectory field {key!r} must match timestamp count")
+    return arr
+
+
+def _trajectory_metadata(trajectory: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: trajectory[key] for key in ("topic", "source_uri", "frame_id") if key in trajectory}
 
 
 def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None):
