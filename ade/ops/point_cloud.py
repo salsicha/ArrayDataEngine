@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping, Sequence
 from itertools import product
 
 import numpy as np
 
 from .geometry import _as_points, _as_transform_matrix, apply_transform, crop_bounds
+from .nav import quaternion_to_rotation_matrix
 
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -243,6 +245,188 @@ def hybrid_search(
         distances[row, :count] = candidate_distances[order]
 
     return distances, indices, counts
+
+
+def iter_loop_closure_candidates(
+    trajectory,
+    radius: float,
+    min_separation: int = 30,
+    max_candidates_per_pose: int = 1,
+):
+    """Yield pose-index loop closure candidates using a streaming spatial index.
+
+    Each yielded record uses the current/source pose as `source_index` and an
+    earlier nearby pose as `target_index`. Candidate generation only keeps a
+    lightweight spatial index of prior pose positions, so callers can process
+    long trajectories without materializing all pairwise distances.
+    """
+
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    min_separation = int(min_separation)
+    max_candidates_per_pose = int(max_candidates_per_pose)
+    if min_separation < 1:
+        raise ValueError("min_separation must be at least 1")
+    if max_candidates_per_pose < 1:
+        raise ValueError("max_candidates_per_pose must be at least 1")
+
+    positions = _trajectory_positions(trajectory)
+    if positions.shape[0] <= min_separation:
+        return
+
+    if radius == 0:
+        buckets: dict[tuple[float, float, float], list[int]] = {}
+        for index, position in enumerate(positions):
+            cutoff = index - min_separation
+            if cutoff >= 0:
+                key = tuple(float(value) for value in positions[cutoff])
+                buckets.setdefault(key, []).append(cutoff)
+            key = tuple(float(value) for value in position)
+            candidates = [(0.0, target_index) for target_index in buckets.get(key, ()) if target_index <= cutoff]
+            for distance, target_index in candidates[:max_candidates_per_pose]:
+                yield {
+                    "source_index": int(index),
+                    "target_index": int(target_index),
+                    "pose_distance": float(distance),
+                }
+        return
+
+    cell_size = float(radius)
+    radius_squared = cell_size * cell_size
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    offsets = tuple(product((-1, 0, 1), repeat=3))
+
+    for index, position in enumerate(positions):
+        cutoff = index - min_separation
+        if cutoff >= 0:
+            key = _loop_closure_cell(positions[cutoff], cell_size)
+            buckets.setdefault(key, []).append(cutoff)
+
+        if not buckets:
+            continue
+
+        cell = _loop_closure_cell(position, cell_size)
+        candidates = []
+        for offset in offsets:
+            key = tuple(int(cell[dim] + offset[dim]) for dim in range(3))
+            for target_index in buckets.get(key, ()):
+                diff = position - positions[target_index]
+                distance_squared = float(np.dot(diff, diff))
+                if distance_squared <= radius_squared:
+                    candidates.append((distance_squared, int(target_index)))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        for distance_squared, target_index in candidates[:max_candidates_per_pose]:
+            yield {
+                "source_index": int(index),
+                "target_index": int(target_index),
+                "pose_distance": float(np.sqrt(distance_squared)),
+            }
+
+
+def find_loop_closure_candidates(
+    trajectory,
+    radius: float,
+    min_separation: int = 30,
+    max_candidates_per_pose: int = 1,
+) -> dict[str, np.ndarray]:
+    """Collect loop closure candidates from `iter_loop_closure_candidates`."""
+
+    records = list(
+        iter_loop_closure_candidates(
+            trajectory,
+            radius=radius,
+            min_separation=min_separation,
+            max_candidates_per_pose=max_candidates_per_pose,
+        )
+    )
+    return _loop_closure_records_to_arrays(records)
+
+
+def verify_loop_closures(
+    point_clouds,
+    trajectory,
+    candidates=None,
+    radius: float | None = None,
+    min_separation: int = 30,
+    max_candidates_per_pose: int = 1,
+    method: str = "point_to_point",
+    voxel_size: float | None = None,
+    max_correspondence_distance: float | None = None,
+    min_fitness: float = 0.3,
+    max_inlier_rmse: float | None = None,
+    return_all: bool = False,
+    **icp_kwargs,
+) -> dict[str, np.ndarray]:
+    """Verify loop closure candidates for aligned point cloud and pose streams.
+
+    `point_clouds` can be a sequence of point arrays or a topic mapping with a
+    `data` field. `trajectory` can be a common trajectory mapping with `position`
+    and `orientation`, or an array shaped `(N, 7+)` containing XYZ + XYZW poses.
+    The returned transform maps each source/current point cloud into the target
+    loop-closure point cloud frame.
+    """
+
+    clouds = _point_cloud_sequence(point_clouds)
+    poses = _trajectory_pose_array(trajectory)
+    if len(clouds) != poses.shape[0]:
+        raise ValueError("point_clouds and trajectory must contain the same number of samples")
+
+    pose_matrices = _pose_matrices(poses)
+    if candidates is None:
+        if radius is None:
+            raise ValueError("provide candidates or a candidate search radius")
+        candidate_iter = iter_loop_closure_candidates(
+            trajectory,
+            radius=radius,
+            min_separation=min_separation,
+            max_candidates_per_pose=max_candidates_per_pose,
+        )
+    else:
+        candidate_iter = _iter_candidate_records(candidates)
+
+    records = []
+    for candidate in candidate_iter:
+        source_index = int(candidate["source_index"])
+        target_index = int(candidate["target_index"])
+        if source_index < 0 or source_index >= len(clouds) or target_index < 0 or target_index >= len(clouds):
+            raise ValueError("loop closure candidate indices must refer to point_clouds")
+
+        source = _loop_closure_cloud(clouds[source_index], voxel_size)
+        target = _loop_closure_cloud(clouds[target_index], voxel_size)
+        seed = np.linalg.inv(pose_matrices[target_index]) @ pose_matrices[source_index]
+        registration_kwargs = dict(icp_kwargs)
+        if method == "multi_scale":
+            registration_kwargs.setdefault("max_correspondence_distances", max_correspondence_distance)
+        else:
+            registration_kwargs.setdefault("max_correspondence_distance", max_correspondence_distance)
+        result = odometry_seeded_icp(
+            source,
+            target,
+            odometry_transform=seed,
+            method=method,
+            **registration_kwargs,
+        )
+        accepted = bool(result["fitness"] >= min_fitness)
+        if max_inlier_rmse is not None:
+            accepted = accepted and bool(result["inlier_rmse"] <= max_inlier_rmse)
+        if accepted or return_all:
+            records.append({
+                "source_index": source_index,
+                "target_index": target_index,
+                "pose_distance": float(candidate.get("pose_distance", np.nan)),
+                "accepted": accepted,
+                "fitness": float(result["fitness"]),
+                "inlier_rmse": float(result["inlier_rmse"]),
+                "correspondence_count": int(result["correspondence_count"]),
+                "transform": result["transform"],
+                "odometry_seed": result["odometry_seed"],
+            })
+
+    return _loop_closure_records_to_arrays(records, include_verification=True)
 
 
 def connected_components(
@@ -1123,6 +1307,149 @@ def _open3d_optional_array(point_cloud, attribute: str, count: int) -> np.ndarra
     return values
 
 
+def _trajectory_positions(trajectory) -> np.ndarray:
+    if isinstance(trajectory, Mapping):
+        if "position" in trajectory:
+            positions = np.asarray(trajectory["position"], dtype=np.float64)
+        elif "pose" in trajectory:
+            positions = np.asarray(trajectory["pose"], dtype=np.float64)[..., :3]
+        elif "data" in trajectory:
+            data = np.asarray(trajectory["data"], dtype=np.float64)
+            positions = data[..., :3]
+        else:
+            raise ValueError("trajectory mappings must contain 'position', 'pose', or 'data'")
+    else:
+        arr = np.asarray(trajectory, dtype=np.float64)
+        positions = arr[..., :3]
+
+    if positions.ndim != 2 or positions.shape[1] < 3:
+        raise ValueError("trajectory positions must have shape (N, 3+)")
+    if not np.isfinite(positions[:, :3]).all():
+        raise ValueError("trajectory positions must be finite")
+    return positions[:, :3]
+
+
+def _trajectory_pose_array(trajectory) -> np.ndarray:
+    if isinstance(trajectory, Mapping):
+        if "pose" in trajectory:
+            poses = np.asarray(trajectory["pose"], dtype=np.float64)
+        elif "position" in trajectory and "orientation" in trajectory:
+            poses = np.column_stack((
+                np.asarray(trajectory["position"], dtype=np.float64),
+                np.asarray(trajectory["orientation"], dtype=np.float64),
+            ))
+        elif "data" in trajectory:
+            poses = np.asarray(trajectory["data"], dtype=np.float64)
+        else:
+            raise ValueError("trajectory mappings must contain pose data")
+    else:
+        poses = np.asarray(trajectory, dtype=np.float64)
+
+    if poses.ndim != 2 or poses.shape[1] < 7:
+        raise ValueError("trajectory poses must have shape (N, 7+) with XYZ + XYZW quaternion")
+    if not np.isfinite(poses[:, :7]).all():
+        raise ValueError("trajectory poses must be finite")
+    return poses[:, :7]
+
+
+def _pose_matrices(poses: np.ndarray) -> np.ndarray:
+    arr = np.asarray(poses, dtype=np.float64)
+    matrices = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], arr.shape[0], axis=0)
+    matrices[:, :3, :3] = quaternion_to_rotation_matrix(arr[:, 3:7])
+    matrices[:, :3, 3] = arr[:, :3]
+    return matrices
+
+
+def _point_cloud_sequence(point_clouds):
+    if isinstance(point_clouds, Mapping):
+        if "data" not in point_clouds:
+            raise ValueError("point cloud mappings must contain a 'data' field")
+        values = point_clouds["data"]
+    else:
+        values = point_clouds
+
+    if isinstance(values, np.ndarray) and values.ndim >= 3:
+        return [values[index] for index in range(values.shape[0])]
+    if isinstance(values, np.ndarray) and values.dtype == object and values.ndim == 1:
+        return list(values)
+    if isinstance(values, Sequence):
+        return list(values)
+    raise ValueError("point_clouds must be a sequence, object array, stacked array, or mapping with 'data'")
+
+
+def _loop_closure_cell(position: np.ndarray, cell_size: float) -> tuple[int, int, int]:
+    cell = np.floor(np.asarray(position, dtype=np.float64)[:3] / cell_size).astype(np.int64)
+    return tuple(int(value) for value in cell)
+
+
+def _loop_closure_cloud(points, voxel_size: float | None) -> np.ndarray:
+    cloud = np.asarray(_as_points(points), dtype=np.float64)
+    if voxel_size is None:
+        return cloud
+    return voxel_downsample(cloud, voxel_size)
+
+
+def _iter_candidate_records(candidates):
+    if isinstance(candidates, Mapping):
+        sources = np.asarray(candidates["source_index"], dtype=np.int64)
+        targets = np.asarray(candidates["target_index"], dtype=np.int64)
+        distances = np.asarray(candidates.get("pose_distance", np.full(sources.shape, np.nan)), dtype=np.float64)
+        if sources.shape != targets.shape or sources.shape != distances.shape:
+            raise ValueError("candidate arrays must have matching shapes")
+        for source_index, target_index, distance in zip(sources, targets, distances, strict=True):
+            yield {
+                "source_index": int(source_index),
+                "target_index": int(target_index),
+                "pose_distance": float(distance),
+            }
+        return
+
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            yield candidate
+            continue
+        if len(candidate) == 2:
+            source_index, target_index = candidate
+            distance = np.nan
+        elif len(candidate) == 3:
+            source_index, target_index, distance = candidate
+        else:
+            raise ValueError("candidate records must have 2 or 3 values")
+        yield {
+            "source_index": int(source_index),
+            "target_index": int(target_index),
+            "pose_distance": float(distance),
+        }
+
+
+def _loop_closure_records_to_arrays(records: list[dict], include_verification: bool = False) -> dict[str, np.ndarray]:
+    count = len(records)
+    result = {
+        "source_index": np.asarray([record["source_index"] for record in records], dtype=np.int64),
+        "target_index": np.asarray([record["target_index"] for record in records], dtype=np.int64),
+        "pose_distance": np.asarray([record["pose_distance"] for record in records], dtype=np.float64),
+    }
+    if include_verification:
+        result.update({
+            "accepted": np.asarray([record["accepted"] for record in records], dtype=bool),
+            "fitness": np.asarray([record["fitness"] for record in records], dtype=np.float64),
+            "inlier_rmse": np.asarray([record["inlier_rmse"] for record in records], dtype=np.float64),
+            "correspondence_count": np.asarray(
+                [record["correspondence_count"] for record in records],
+                dtype=np.int64,
+            ),
+            "transform": np.asarray(
+                [record["transform"] for record in records],
+                dtype=np.float64,
+            ).reshape((count, 4, 4)),
+            "odometry_seed": np.asarray(
+                [record["odometry_seed"] for record in records],
+                dtype=np.float64,
+            ).reshape((count, 4, 4)),
+        })
+    return result
+
+
 __all__ = [
     "apply_transform",
     "cluster_dbscan",
@@ -1131,8 +1458,10 @@ __all__ = [
     "curvature_descriptors",
     "estimate_normals",
     "farthest_point_downsample",
+    "find_loop_closure_candidates",
     "from_open3d_point_cloud",
     "hybrid_search",
+    "iter_loop_closure_candidates",
     "knn_search",
     "local_covariances",
     "nearest_neighbor_distance_stats",
@@ -1149,5 +1478,6 @@ __all__ = [
     "statistical_outlier_filter",
     "to_open3d_point_cloud",
     "uniform_downsample",
+    "verify_loop_closures",
     "voxel_downsample",
 ]

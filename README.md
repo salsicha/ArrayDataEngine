@@ -189,7 +189,7 @@ rgbd_cloud = fuse_rgbd_frames(depth_frames[:10], frames[:10], fx=525.0, fy=525.0
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
-from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample
+from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample, verify_loop_closures
 
 uniform_points = uniform_downsample(points, every_k=4)
 keypoints = farthest_point_downsample(points, count=2_048)
@@ -200,6 +200,8 @@ components = connected_components(points, radius=0.5, min_component_size=20)
 ground, obstacles, ground_mask = segment_ground(points, distance_threshold=0.15)
 registration = multi_scale_icp(scan_a, scan_b, voxel_sizes=(1.0, 0.5, 0.25))
 open3d_cloud = to_open3d_point_cloud(points, color_columns=(3, 4, 5))
+
+closures = verify_loop_closures(point_cloud_sequence, trajectory, radius=3.0, min_separation=60)
 ```
 
 SE(3) coordinate-frame helpers work across common robotics arrays:

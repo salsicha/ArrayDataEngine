@@ -52,6 +52,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add nearest-neighbor search with KNN, radius search, and hybrid search.
   - [x] Add KNN and radius search.
   - [x] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
+  - [x] Add loop closure candidate search and ICP verification for datasets with point cloud and pose streams.
   - [x] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
 - [x] Add image and depth operations:
   - [x] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.

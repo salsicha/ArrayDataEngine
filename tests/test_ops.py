@@ -67,6 +67,7 @@ from ade.ops import (
     estimate_normals,
     euler_to_quaternion,
     farthest_point_downsample,
+    find_loop_closure_candidates,
     filter_topic,
     FrameGraph,
     frame_optical_flow,
@@ -81,6 +82,7 @@ from ade.ops import (
     image_pyramid,
     iter_aligned_images,
     iter_frame_optical_flow,
+    iter_loop_closure_candidates,
     iter_motion_compensated_windows,
     iter_rgbd_frame_points,
     imu_to_trajectory,
@@ -202,6 +204,7 @@ from ade.ops import (
     undistort_normalized_points,
     undistort_pixels,
     valid_depth_mask,
+    verify_loop_closures,
     voxel_downsample,
     window_topic,
     write_dem_cache,
@@ -986,6 +989,83 @@ def test_point_cloud_registration_helpers():
     )
     assert np.allclose(odom_result["odometry_seed"], source_pose)
     assert np.allclose(odom_result["transform"][:3, 3], translation)
+
+
+def test_point_cloud_loop_closure_helpers():
+    poses = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [0.25, 0.05, 0.0, 0.0, 0.0, 0.0, 1.0],
+    ])
+    trajectory = {
+        "ts": np.arange(poses.shape[0], dtype=np.float64),
+        "pose": poses,
+        "position": poses[:, :3],
+        "orientation": poses[:, 3:7],
+    }
+
+    candidates = find_loop_closure_candidates(
+        trajectory,
+        radius=0.5,
+        min_separation=2,
+        max_candidates_per_pose=2,
+    )
+    assert candidates["source_index"].tolist() == [3]
+    assert candidates["target_index"].tolist() == [0]
+    assert np.allclose(candidates["pose_distance"], np.array([np.hypot(0.25, 0.05)]))
+
+    streamed = list(iter_loop_closure_candidates(poses, radius=0.5, min_separation=2))
+    assert streamed == [
+        {
+            "source_index": 3,
+            "target_index": 0,
+            "pose_distance": float(np.hypot(0.25, 0.05)),
+        }
+    ]
+
+    world_points = np.array([
+        [0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.1],
+        [0.0, 0.5, 0.2],
+        [0.5, 0.5, 0.3],
+        [0.2, 0.8, 0.4],
+        [0.8, 0.2, 0.5],
+    ])
+    point_clouds = [
+        world_points,
+        world_points - poses[1, :3],
+        world_points - poses[2, :3],
+        world_points - poses[3, :3],
+    ]
+    closures = verify_loop_closures(
+        {"data": np.asarray(point_clouds, dtype=object)},
+        trajectory,
+        candidates=candidates,
+        max_correspondence_distance=0.2,
+        min_fitness=0.9,
+        max_inlier_rmse=1.0e-9,
+        max_iterations=5,
+    )
+    assert closures["accepted"].tolist() == [True]
+    assert closures["source_index"].tolist() == [3]
+    assert closures["target_index"].tolist() == [0]
+    assert np.allclose(closures["odometry_seed"][0, :3, 3], poses[3, :3])
+    assert np.allclose(closures["transform"][0, :3, 3], poses[3, :3])
+    assert closures["fitness"][0] == 1.0
+    assert closures["inlier_rmse"][0] < 1.0e-12
+
+    multiscale_closures = verify_loop_closures(
+        point_clouds,
+        poses,
+        candidates=candidates,
+        method="multi_scale",
+        voxel_sizes=(0.0,),
+        max_correspondence_distance=0.2,
+        min_fitness=0.9,
+        max_iterations=(3,),
+    )
+    assert multiscale_closures["accepted"].tolist() == [True]
 
 
 def test_open3d_point_cloud_adapters_use_optional_dependency():
