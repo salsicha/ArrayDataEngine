@@ -164,7 +164,7 @@ Image and depth sequences can be resized, cropped, padded, normalized, color-con
 ```python
 import numpy as np
 
-from ade.ops import align_images, convert_color, convert_image_dtype, crop_images, depth_to_normals, frame_to_frame_optical_flow, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, motion_compensated_rolling_windows, normalize_images, open_mask, resize_images
+from ade.ops import align_images, calibrate_depth_metric_scale, convert_color, convert_image_dtype, crop_images, depth_to_normals, frame_to_frame_optical_flow, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, motion_compensated_rolling_windows, normalize_images, open_mask, resize_images
 
 frames = window["images"]["data"]
 depth_frames = window["depth"]["data"]
@@ -184,12 +184,13 @@ normals = depth_to_normals(depth_frames[0], fx=525.0, fy=525.0, cx=319.5, cy=239
 for rgbd_chunk in iter_rgbd_frame_points(depth_frames, frames, fx=525.0, fy=525.0, cx=319.5, cy=239.5):
     process(rgbd_chunk)
 rgbd_cloud = fuse_rgbd_frames(depth_frames[:10], frames[:10], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+depth_calibration, metric_depth = calibrate_depth_metric_scale(relative_depth, lidar_points, fx=525.0, fy=525.0, cx=319.5, cy=239.5, return_adjusted=True)
 ```
 
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
-from ade.ops import connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample, verify_loop_closures
+from ade.ops import calibrate_point_cloud_metric_scale, connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample, verify_loop_closures
 
 uniform_points = uniform_downsample(points, every_k=4)
 keypoints = farthest_point_downsample(points, count=2_048)
@@ -202,6 +203,7 @@ registration = multi_scale_icp(scan_a, scan_b, voxel_sizes=(1.0, 0.5, 0.25))
 open3d_cloud = to_open3d_point_cloud(points, color_columns=(3, 4, 5))
 
 closures = verify_loop_closures(point_cloud_sequence, trajectory, radius=3.0, min_separation=60)
+scale_calibration, metric_points = calibrate_point_cloud_metric_scale(relative_points, lidar_points, return_adjusted=True)
 ```
 
 SE(3) coordinate-frame helpers work across common robotics arrays:

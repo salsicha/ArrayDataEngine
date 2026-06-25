@@ -6,7 +6,7 @@ from itertools import product
 
 import numpy as np
 
-from .geometry import _as_points, _as_transform_matrix, apply_transform, crop_bounds
+from .geometry import _as_points, _as_transform_matrix, apply_transform, crop_bounds, points_to_depth_image
 from .nav import quaternion_to_rotation_matrix
 
 
@@ -245,6 +245,131 @@ def hybrid_search(
         distances[row, :count] = candidate_distances[order]
 
     return distances, indices, counts
+
+
+def calibrate_point_cloud_metric_scale(
+    relative_points: np.ndarray,
+    accurate_points: np.ndarray,
+    correspondence: str = "index",
+    fit_offset: bool = True,
+    max_correspondence_distance: float | None = None,
+    return_adjusted: bool = False,
+):
+    """Estimate an isotropic metric-scale calibration for a relative point cloud.
+
+    The fitted model is `accurate_xyz ~= scale * relative_xyz + offset`.
+    `correspondence="index"` pairs rows directly. `correspondence="nearest"`
+    pairs each relative point with its nearest accurate point and can be gated
+    with `max_correspondence_distance`.
+    """
+
+    relative = np.asarray(_as_points(relative_points), dtype=np.float64)
+    accurate = np.asarray(_as_points(accurate_points), dtype=np.float64)
+    source_xyz, target_xyz = _metric_point_correspondences(
+        relative,
+        accurate,
+        correspondence=correspondence,
+        max_correspondence_distance=max_correspondence_distance,
+    )
+    scale, offset = _fit_isotropic_metric_scale(source_xyz, target_xyz, fit_offset=fit_offset)
+    adjusted = apply_point_cloud_metric_scale(relative_points, {"scale": scale, "offset": offset})
+    rmse = _metric_rmse(source_xyz * scale + offset, target_xyz)
+    calibration = {
+        "kind": "point_cloud_metric_scale",
+        "scale": float(scale),
+        "offset": offset,
+        "fit_offset": bool(fit_offset),
+        "correspondence": correspondence,
+        "correspondence_count": int(source_xyz.shape[0]),
+        "rmse": float(rmse),
+    }
+    return (calibration, adjusted) if return_adjusted else calibration
+
+
+def apply_point_cloud_metric_scale(points: np.ndarray, calibration: Mapping | float, offset=None) -> np.ndarray:
+    """Apply a metric-scale calibration to point-cloud XYZ columns."""
+
+    arr = _as_points(points)
+    scale, translation = _metric_scale_offset(calibration, offset=offset, width=3)
+    result = arr.astype(np.result_type(arr.dtype, np.float64), copy=True)
+    result[:, :3] = np.asarray(arr[:, :3], dtype=np.float64) * scale + translation
+    return result
+
+
+def calibrate_depth_metric_scale(
+    relative_depth: np.ndarray,
+    accurate_points: np.ndarray,
+    fx: float | None = None,
+    fy: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
+    camera_matrix: np.ndarray | None = None,
+    transform: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+    fit_offset: bool = True,
+    min_depth: float = 0.0,
+    return_adjusted: bool = False,
+):
+    """Calibrate a relative depth image against an accurate camera-frame point cloud.
+
+    Accurate points are rasterized into the depth image plane, then the model
+    `metric_depth ~= scale * relative_depth + offset` is fitted over pixels
+    valid in both arrays.
+    """
+
+    relative = np.asarray(relative_depth, dtype=np.float64)
+    if relative.ndim != 2:
+        raise ValueError("relative_depth must have shape (H, W)")
+    accurate_depth = points_to_depth_image(
+        accurate_points,
+        image_shape=relative.shape,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        camera_matrix=camera_matrix,
+        transform=transform,
+        fill_value=0.0,
+    )
+    valid = np.isfinite(relative) & np.isfinite(accurate_depth) & (relative > min_depth) & (accurate_depth > 0.0)
+    if mask is not None:
+        keep = np.asarray(mask, dtype=bool)
+        if keep.shape != relative.shape:
+            raise ValueError("mask must match relative_depth shape")
+        valid &= keep
+    if not np.any(valid):
+        raise ValueError("no valid overlapping depth samples for calibration")
+
+    scale, offset = _fit_scalar_metric_scale(relative[valid], accurate_depth[valid], fit_offset=fit_offset)
+    adjusted = apply_depth_metric_scale(relative_depth, {"scale": scale, "offset": offset}, min_depth=min_depth)
+    residual = adjusted[valid] - accurate_depth[valid]
+    calibration = {
+        "kind": "depth_metric_scale",
+        "scale": float(scale),
+        "offset": float(offset),
+        "fit_offset": bool(fit_offset),
+        "correspondence_count": int(valid.sum()),
+        "rmse": float(np.sqrt(np.mean(residual ** 2))),
+    }
+    return (calibration, adjusted) if return_adjusted else calibration
+
+
+def apply_depth_metric_scale(
+    depth: np.ndarray,
+    calibration: Mapping | float,
+    offset: float | None = None,
+    min_depth: float = 0.0,
+    preserve_invalid: bool = True,
+) -> np.ndarray:
+    """Apply a metric-scale calibration to a relative depth image or sequence."""
+
+    arr = np.asarray(depth, dtype=np.float64)
+    scale, bias = _metric_scale_offset(calibration, offset=offset, width=1)
+    adjusted = arr * scale + float(bias[0])
+    if not preserve_invalid:
+        return adjusted
+    valid = np.isfinite(arr) & (arr > min_depth)
+    return np.where(valid, adjusted, arr)
 
 
 def iter_loop_closure_candidates(
@@ -1307,6 +1432,129 @@ def _open3d_optional_array(point_cloud, attribute: str, count: int) -> np.ndarra
     return values
 
 
+def _metric_point_correspondences(
+    relative: np.ndarray,
+    accurate: np.ndarray,
+    correspondence: str,
+    max_correspondence_distance: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    mode = correspondence.lower()
+    rel = relative[:, :3]
+    acc = accurate[:, :3]
+    rel_valid = np.isfinite(rel).all(axis=1)
+    acc_valid = np.isfinite(acc).all(axis=1)
+
+    if mode == "index":
+        if rel.shape[0] != acc.shape[0]:
+            raise ValueError("index correspondence requires point clouds with the same row count")
+        keep = rel_valid & acc_valid
+        source = rel[keep]
+        target = acc[keep]
+    elif mode == "nearest":
+        source_candidates = rel[rel_valid]
+        target_candidates = acc[acc_valid]
+        if source_candidates.shape[0] == 0 or target_candidates.shape[0] == 0:
+            raise ValueError("point clouds must contain finite XYZ points")
+        distances, indices = knn_search(target_candidates, source_candidates, k=1)
+        keep = np.ones(source_candidates.shape[0], dtype=bool)
+        if max_correspondence_distance is not None:
+            if max_correspondence_distance < 0:
+                raise ValueError("max_correspondence_distance must be non-negative")
+            keep &= distances[:, 0] <= max_correspondence_distance
+        source = source_candidates[keep]
+        target = target_candidates[indices[keep, 0]]
+    else:
+        raise ValueError("correspondence must be 'index' or 'nearest'")
+
+    if source.shape[0] < 2:
+        raise ValueError("at least two finite correspondences are required for metric calibration")
+    return source, target
+
+
+def _fit_isotropic_metric_scale(source_xyz: np.ndarray, target_xyz: np.ndarray, fit_offset: bool) -> tuple[float, np.ndarray]:
+    source = np.asarray(source_xyz, dtype=np.float64)
+    target = np.asarray(target_xyz, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("source_xyz and target_xyz must both have shape (N, 3)")
+
+    if fit_offset:
+        source_mean = source.mean(axis=0)
+        target_mean = target.mean(axis=0)
+        centered_source = source - source_mean
+        centered_target = target - target_mean
+        denominator = float(np.einsum("ij,ij->", centered_source, centered_source))
+        if denominator <= np.finfo(np.float64).eps:
+            raise ValueError("relative point correspondences do not span enough geometry to estimate scale")
+        scale = float(np.einsum("ij,ij->", centered_source, centered_target) / denominator)
+        offset = target_mean - scale * source_mean
+    else:
+        denominator = float(np.einsum("ij,ij->", source, source))
+        if denominator <= np.finfo(np.float64).eps:
+            raise ValueError("relative point correspondences do not span enough geometry to estimate scale")
+        scale = float(np.einsum("ij,ij->", source, target) / denominator)
+        offset = np.zeros(3, dtype=np.float64)
+
+    if not np.isfinite(scale) or abs(scale) <= np.finfo(np.float64).eps:
+        raise ValueError("estimated metric scale is invalid")
+    return scale, offset.astype(np.float64, copy=False)
+
+
+def _fit_scalar_metric_scale(source: np.ndarray, target: np.ndarray, fit_offset: bool) -> tuple[float, float]:
+    src = np.asarray(source, dtype=np.float64).reshape(-1)
+    dst = np.asarray(target, dtype=np.float64).reshape(-1)
+    keep = np.isfinite(src) & np.isfinite(dst)
+    src = src[keep]
+    dst = dst[keep]
+    if src.size < 2:
+        raise ValueError("at least two finite scalar correspondences are required for metric calibration")
+
+    if fit_offset:
+        source_mean = float(src.mean())
+        target_mean = float(dst.mean())
+        centered_source = src - source_mean
+        centered_target = dst - target_mean
+        denominator = float(np.dot(centered_source, centered_source))
+        if denominator <= np.finfo(np.float64).eps:
+            raise ValueError("relative depth values do not span enough range to estimate scale")
+        scale = float(np.dot(centered_source, centered_target) / denominator)
+        offset = target_mean - scale * source_mean
+    else:
+        denominator = float(np.dot(src, src))
+        if denominator <= np.finfo(np.float64).eps:
+            raise ValueError("relative depth values do not span enough range to estimate scale")
+        scale = float(np.dot(src, dst) / denominator)
+        offset = 0.0
+
+    if not np.isfinite(scale) or abs(scale) <= np.finfo(np.float64).eps:
+        raise ValueError("estimated metric scale is invalid")
+    return scale, float(offset)
+
+
+def _metric_scale_offset(calibration: Mapping | float, offset, width: int) -> tuple[float, np.ndarray]:
+    if isinstance(calibration, Mapping):
+        scale = float(calibration["scale"])
+        raw_offset = calibration.get("offset", 0.0 if offset is None else offset)
+    else:
+        scale = float(calibration)
+        raw_offset = 0.0 if offset is None else offset
+    if not np.isfinite(scale):
+        raise ValueError("scale must be finite")
+
+    values = np.asarray(raw_offset, dtype=np.float64)
+    if values.ndim == 0:
+        values = np.full((width,), float(values), dtype=np.float64)
+    if values.shape != (width,):
+        raise ValueError(f"offset must be scalar or have shape ({width},)")
+    if not np.isfinite(values).all():
+        raise ValueError("offset must be finite")
+    return scale, values
+
+
+def _metric_rmse(source: np.ndarray, target: np.ndarray) -> float:
+    residual = np.asarray(source, dtype=np.float64) - np.asarray(target, dtype=np.float64)
+    return float(np.sqrt(np.mean(np.einsum("ij,ij->i", residual, residual))))
+
+
 def _trajectory_positions(trajectory) -> np.ndarray:
     if isinstance(trajectory, Mapping):
         if "position" in trajectory:
@@ -1451,7 +1699,11 @@ def _loop_closure_records_to_arrays(records: list[dict], include_verification: b
 
 
 __all__ = [
+    "apply_depth_metric_scale",
+    "apply_point_cloud_metric_scale",
     "apply_transform",
+    "calibrate_depth_metric_scale",
+    "calibrate_point_cloud_metric_scale",
     "cluster_dbscan",
     "connected_components",
     "crop_bounds",

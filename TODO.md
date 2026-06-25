@@ -53,6 +53,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add KNN and radius search.
   - [x] Add registration helpers for point-to-point ICP, point-to-plane ICP, multi-scale ICP, and odometry-seeded registration.
   - [x] Add loop closure candidate search and ICP verification for datasets with point cloud and pose streams.
+  - [x] Calibrate relative point clouds to accurate metric point clouds and apply the fitted scale/offset.
   - [x] Add conversion adapters to and from Open3D point clouds when `open3d` is installed.
 - [x] Add image and depth operations:
   - [x] Resize, crop, pad, normalize, color convert, and dtype convert image sequences.
@@ -60,6 +61,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add masks, morphology, thresholding, gradients, pyramids, and local statistics.
   - [x] Add depth-image operations: valid-depth masks, backprojection to point clouds, depth-to-normal, and RGB-D fusion.
   - [x] Add valid-depth masks and depth backprojection to point clouds.
+  - [x] Calibrate relative depth images to accurate metric point clouds and apply the fitted scale/offset.
   - [x] Add frame-to-frame optical flow, image alignment, and motion-compensated rolling windows.
   - [x] Add camera model utilities for intrinsics, distortion, rectification, and projection.
 - [x] Add IMU, odometry, and navsat operations:

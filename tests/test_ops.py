@@ -17,11 +17,15 @@ from ade.ops import (
     augment_image,
     augment_point_cloud,
     augment_trajectory,
+    apply_depth_metric_scale,
     apply_image_mask,
+    apply_point_cloud_metric_scale,
     apply_transform,
     backproject_pixels,
     bounds_mask,
     CameraModel,
+    calibrate_depth_metric_scale,
+    calibrate_point_cloud_metric_scale,
     camera_matrix,
     camera_model,
     CancellationToken,
@@ -1066,6 +1070,60 @@ def test_point_cloud_loop_closure_helpers():
         max_iterations=(3,),
     )
     assert multiscale_closures["accepted"].tolist() == [True]
+
+
+def test_metric_scale_calibration_for_point_clouds_and_depth_images():
+    accurate = np.array([
+        [1.0, 2.0, 3.0, 10.0],
+        [2.0, 4.0, 6.0, 20.0],
+        [3.0, 6.0, 9.0, 30.0],
+        [4.0, 8.0, 12.0, 40.0],
+    ])
+    offset = np.array([0.5, -1.0, 2.0])
+    relative = accurate.copy()
+    relative[:, :3] = (accurate[:, :3] - offset) / 2.5
+
+    calibration, adjusted = calibrate_point_cloud_metric_scale(
+        relative,
+        accurate,
+        correspondence="index",
+        return_adjusted=True,
+    )
+    assert calibration["kind"] == "point_cloud_metric_scale"
+    assert np.isclose(calibration["scale"], 2.5)
+    assert np.allclose(calibration["offset"], offset)
+    assert calibration["correspondence_count"] == accurate.shape[0]
+    assert calibration["rmse"] < 1.0e-12
+    assert np.allclose(adjusted[:, :3], accurate[:, :3])
+    assert np.array_equal(adjusted[:, 3], accurate[:, 3])
+
+    manually_adjusted = apply_point_cloud_metric_scale(relative, calibration)
+    assert np.allclose(manually_adjusted[:, :3], accurate[:, :3])
+
+    metric_depth = np.array([[2.0, 3.5], [5.0, 6.5]])
+    relative_depth = (metric_depth - 0.25) / 1.5
+    accurate_points = depth_to_points(metric_depth, fx=1.0, fy=1.0, cx=0.0, cy=0.0)
+    depth_calibration, metric_adjusted = calibrate_depth_metric_scale(
+        relative_depth,
+        accurate_points,
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        return_adjusted=True,
+    )
+    assert depth_calibration["kind"] == "depth_metric_scale"
+    assert np.isclose(depth_calibration["scale"], 1.5)
+    assert np.isclose(depth_calibration["offset"], 0.25)
+    assert depth_calibration["correspondence_count"] == metric_depth.size
+    assert depth_calibration["rmse"] < 1.0e-12
+    assert np.allclose(metric_adjusted, metric_depth)
+
+    relative_depth_with_invalid = relative_depth.copy()
+    relative_depth_with_invalid[0, 0] = 0.0
+    adjusted_with_invalid = apply_depth_metric_scale(relative_depth_with_invalid, depth_calibration)
+    assert adjusted_with_invalid[0, 0] == 0.0
+    assert np.allclose(adjusted_with_invalid[1], metric_depth[1])
 
 
 def test_open3d_point_cloud_adapters_use_optional_dependency():
