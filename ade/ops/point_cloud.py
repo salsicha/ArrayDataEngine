@@ -302,6 +302,57 @@ def valid_point_cloud_points(points: np.ndarray, finite: bool = True, drop_zero_
         mask &= np.any(arr[:, :3] != 0, axis=1)
     return arr[mask].copy()
 
+
+def calibrate_depth_anything_point_cloud(
+    points: np.ndarray,
+    calibration=None,
+    scale: float | None = None,
+    offset: float | None = None,
+    min_depth: float | None = 0.1,
+    max_depth: float | None = 8.0,
+) -> np.ndarray:
+    """Convert relative Depth Anything camera-frame points into metric camera-frame points.
+
+    MapEverything publishes `/mapping/pointcloud/depth_anything` as camera-ray
+    coordinates scaled by raw relative depth. The paired calibration reconstructs
+    metric depth as `metric_depth = scale * relative_depth + offset`; X/Y must be
+    recomputed by scaling the camera ray by the metric depth, not by applying a
+    simple XYZ affine transform.
+    """
+
+    arr = _as_points(points).astype(np.float64, copy=False)
+    scale_value, offset_value = _depth_anything_scale_offset(calibration, scale, offset)
+    relative_depth = -arr[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        metric_depth = scale_value * relative_depth + offset_value
+        ratio = metric_depth / relative_depth
+
+    mask = np.isfinite(ratio) & np.isfinite(metric_depth) & (relative_depth > 0.0)
+    if min_depth is not None:
+        mask &= metric_depth >= float(min_depth)
+    if max_depth is not None:
+        mask &= metric_depth <= float(max_depth)
+
+    result = arr[mask].copy()
+    result[:, :2] *= ratio[mask, None]
+    result[:, 2] = -metric_depth[mask]
+    return result
+
+
+def _depth_anything_scale_offset(calibration, scale, offset) -> tuple[float, float]:
+    if calibration is not None:
+        if isinstance(calibration, Mapping):
+            scale = calibration.get("scale", scale)
+            offset = calibration.get("offset", offset)
+        else:
+            values = np.asarray(calibration, dtype=np.float64).reshape(-1)
+            if values.size >= 2:
+                scale = values[0]
+                offset = values[1]
+    if scale is None or offset is None:
+        raise ValueError("provide calibration or both scale and offset")
+    return float(scale), float(offset)
+
 def apply_point_cloud_metric_scale(points: np.ndarray, calibration: Mapping | float, offset=None) -> np.ndarray:
     """Apply a metric-scale calibration to point-cloud XYZ columns."""
 
@@ -1719,6 +1770,7 @@ __all__ = [
     "apply_point_cloud_metric_scale",
     "apply_transform",
     "calibrate_depth_metric_scale",
+    "calibrate_depth_anything_point_cloud",
     "calibrate_point_cloud_metric_scale",
     "cluster_dbscan",
     "connected_components",

@@ -7,7 +7,7 @@ import numpy as np
 class PoseStamped(SimpleNamespace):
     pass
 
-from ade.ops import apply_transform, pose_to_matrix, source_pipeline, valid_point_cloud_points
+from ade.ops import apply_transform, calibrate_depth_anything_point_cloud, pose_to_matrix, source_pipeline, valid_point_cloud_points
 from ade.sensors.pose_sensor import PoseSensor
 
 
@@ -42,6 +42,16 @@ def test_pose_to_matrix_transforms_point_cloud_points():
 
     assert np.allclose(transformed[0], np.array([1.0, 3.0, 3.0]))
     assert np.allclose(transformed[1], np.array([1.0, 2.0, 3.0]))
+
+
+def test_calibrate_depth_anything_point_cloud_recomputes_metric_camera_rays():
+    relative = np.array([[0.2, -0.1, -2.0], [1.0, 0.0, -0.0]])
+    calibration = {"scale": 1.5, "offset": 0.5}
+
+    metric = calibrate_depth_anything_point_cloud(relative, calibration)
+
+    assert metric.shape == (1, 3)
+    assert np.allclose(metric[0], np.array([0.35, -0.175, -3.5]))
 
 
 def test_valid_point_cloud_points_removes_padding():

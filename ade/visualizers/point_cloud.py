@@ -7,12 +7,22 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    import open3d as o3d
-    from open3d.web_visualizer import draw
-except ImportError:
-    o3d = None
-    draw = None
+o3d = None
+draw = None
+
+
+def _ensure_open3d():
+    global o3d, draw
+    if o3d is not None:
+        return True
+    try:
+        import open3d as imported_open3d
+        from open3d.web_visualizer import draw as imported_draw
+    except ImportError:
+        return False
+    o3d = imported_open3d
+    draw = imported_draw
+    return True
 
 
 class VisTool:
@@ -21,8 +31,11 @@ class VisTool:
 
     def __init__(self, embed=True, **kwargs):
         self.output_path = Path(kwargs.get("output_path", "ade_pointcloud_viewer.html"))
+        backend = str(kwargs.get("backend", "auto")).lower()
 
-        if o3d is None:
+        has_open3d = False if backend == "html" else _ensure_open3d()
+
+        if backend == "html" or not has_open3d:
             self._init_html()
             self.show_point_cloud = self._show_point_cloud_html
             self.update_point_cloud = self._update_point_cloud_html

@@ -78,6 +78,8 @@ class DB3Source(RosSource):
                     }
                     if decoded.frame_id is not None:
                         message["frame_id"] = decoded.frame_id
+                    if decoded.extra is not None:
+                        message.update(decoded.extra)
                     yield message
 
 
@@ -145,7 +147,7 @@ class DB3Source(RosSource):
 
     def _standalone_db3_input(self) -> bool:
         input_path = Path(self.input_path)
-        if not input_path.is_file() or input_path.suffix.lower() != ".db3":
+        if not input_path.is_file():
             return False
         metadata_path = input_path.parent / "metadata.yaml"
         referenced = self._metadata_db3_paths(metadata_path)
@@ -154,7 +156,7 @@ class DB3Source(RosSource):
 
     def _db3_paths(self):
         input_path = Path(self.input_path)
-        if input_path.is_file() and input_path.suffix.lower() == ".db3":
+        if input_path.is_file():
             metadata_path = input_path.parent / "metadata.yaml"
             referenced = self._metadata_db3_paths(metadata_path)
             if input_path in referenced:

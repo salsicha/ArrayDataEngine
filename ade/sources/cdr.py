@@ -12,6 +12,7 @@ class DecodedMessage:
     name: str
     timestamp: float
     frame_id: str | None = None
+    extra: dict | None = None
 
 
 class CDRReader:
@@ -68,6 +69,8 @@ def decode_supported_cdr_message(rawdata: bytes, msgtype: str) -> DecodedMessage
         return decode_pose_stamped(rawdata)
     if msgtype == "sensor_msgs/msg/PointCloud2":
         return decode_pointcloud2(rawdata)
+    if msgtype == "mapeverything_msgs/msg/DepthAnythingCalibration":
+        return decode_depth_anything_calibration(rawdata)
     return None
 
 
@@ -94,6 +97,57 @@ def decode_pose_stamped(rawdata: bytes) -> DecodedMessage:
         dtype=np.float64,
     )
     return DecodedMessage(pose, "PoseStamped", timestamp, frame_id)
+
+
+def decode_depth_anything_calibration(rawdata: bytes) -> DecodedMessage:
+    reader = CDRReader(rawdata)
+    timestamp, header_frame_id = decode_header(reader)
+    schema_version = reader.read_uint32()
+    source = reader.read_string()
+    relative_pointcloud_topic = reader.read_string()
+    overlay_mesh_source = reader.read_string()
+    frame_id = reader.read_string()
+    relative_depth_width = reader.read_uint32()
+    relative_depth_height = reader.read_uint32()
+    image_width = reader.read_uint32()
+    image_height = reader.read_uint32()
+    scale = reader.read_float64()
+    offset = reader.read_float64()
+    equation = reader.read_string()
+    relative_depth_units = reader.read_string()
+    metric_depth_units = reader.read_string()
+    calibration_source = reader.read_string()
+    metadata_json = reader.read_string()
+    values = np.array(
+        [
+            scale,
+            offset,
+            relative_depth_width,
+            relative_depth_height,
+            image_width,
+            image_height,
+        ],
+        dtype=np.float64,
+    )
+    extra = {
+        "schema_version": schema_version,
+        "source": source,
+        "relative_pointcloud_topic": relative_pointcloud_topic,
+        "overlay_mesh_source": overlay_mesh_source,
+        "frame_id": frame_id,
+        "relative_depth_width": relative_depth_width,
+        "relative_depth_height": relative_depth_height,
+        "image_width": image_width,
+        "image_height": image_height,
+        "scale": scale,
+        "offset": offset,
+        "equation": equation,
+        "relative_depth_units": relative_depth_units,
+        "metric_depth_units": metric_depth_units,
+        "calibration_source": calibration_source,
+        "metadata_json": metadata_json,
+    }
+    return DecodedMessage(values, "DepthAnythingCalibration", timestamp, header_frame_id, extra)
 
 
 def decode_pointcloud2(rawdata: bytes) -> DecodedMessage:

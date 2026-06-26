@@ -31,7 +31,11 @@ class DataSources:
         img_types = [".png", ".jpg", ".jpeg", ".tiff"]
 
         # Check file extension in [".bag", ".db3", ".png"]
-        if self.file_type == ".bag":
+        if self.file_type == ".bag" and self._is_sqlite_rosbag(data_path):
+            from .sources.db3_source import DB3Source
+
+            self.source = DB3Source(data_path)
+        elif self.file_type == ".bag":
             from .sources.bag_source import BagSource
 
             self.source = BagSource(data_path)
@@ -60,6 +64,17 @@ class DataSources:
 
         if not self.source.data_exists():
             raise FileNotFoundError(f"No data found for {data_path}")
+
+
+    @staticmethod
+    def _is_sqlite_rosbag(data_path):
+        if not os.path.isfile(data_path):
+            return False
+        try:
+            with open(data_path, "rb") as handle:
+                return handle.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
 
 
     @staticmethod
