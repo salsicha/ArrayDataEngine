@@ -1,0 +1,13 @@
+{
+  "captured_at" : "2026-06-26T02:54:33Z",
+  "coordinate_frame" : "map",
+  "metadata" : {
+    "mesh_count" : "29",
+    "visualization_mode" : "Solid Mesh"
+  },
+  "obj_file" : "final_overlay_mesh.obj",
+  "schema_version" : 1,
+  "source" : "arkit_scene_reconstruction",
+  "triangle_count" : 192013,
+  "vertex_count" : 106231
+}

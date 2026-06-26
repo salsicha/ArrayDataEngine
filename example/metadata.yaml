@@ -2,10 +2,10 @@ rosbag2_bagfile_information:
   version: 9
   storage_identifier: sqlite3
   duration:
-    nanoseconds: 24168127776
+    nanoseconds: 23484834671
   starting_time:
-    nanoseconds_since_epoch: 1782439503905805110
-  message_count: 1720
+    nanoseconds_since_epoch: 1782442449858077049
+  message_count: 1676
   topics_with_message_count:
     - topic_metadata:
         name: /mapping/pose
@@ -14,7 +14,7 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 1447
+      message_count: 1410
     - topic_metadata:
         name: /mapping/pointcloud/depth_anything
         type: sensor_msgs/msg/PointCloud2
@@ -22,7 +22,7 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 39
+      message_count: 38
     - topic_metadata:
         name: /mapping/pointcloud/lidar
         type: sensor_msgs/msg/PointCloud2
@@ -30,7 +30,7 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 116
+      message_count: 113
     - topic_metadata:
         name: /mapping/depth_anything/calibration
         type: mapeverything_msgs/msg/DepthAnythingCalibration
@@ -38,7 +38,7 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 39
+      message_count: 38
     - topic_metadata:
         name: /mapping/dem/tile
         type: mapeverything_msgs/msg/GeoRasterTile
@@ -54,7 +54,7 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 39
+      message_count: 38
     - topic_metadata:
         name: /mapping/camera/camera_info
         type: sensor_msgs/msg/CameraInfo
@@ -62,17 +62,17 @@ rosbag2_bagfile_information:
         offered_qos_profiles:
           []
         type_description_hash: ""
-      message_count: 39
+      message_count: 38
   compression_format: ""
   compression_mode: ""
   relative_file_paths:
-    - 0_mapeverything_0_native_ros2_2026_06_25-19_08_28.db3
+    - 0_mapeverything_0_native_ros2_2026_06_25-19_58_30.db3
   files:
-    - path: 0_mapeverything_0_native_ros2_2026_06_25-19_08_28.db3
+    - path: 0_mapeverything_0_native_ros2_2026_06_25-19_58_30.db3
       starting_time:
-        nanoseconds_since_epoch: 1782439503905805110
+        nanoseconds_since_epoch: 1782442449858077049
       duration:
-        nanoseconds: 24168127776
-      message_count: 1720
+        nanoseconds: 23484834671
+      message_count: 1676
   custom_data: ~
   ros_distro: rolling
