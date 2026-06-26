@@ -67,4 +67,4 @@ visualization = [
 Homepage = "https://github.com/salsicha/arraydataengine"
 
 [tool.setuptools.packages.find]
-include = ["ade*"]
+include = ["ade*", "ArrayDataEngine*"]

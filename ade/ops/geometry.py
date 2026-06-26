@@ -183,6 +183,32 @@ def apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return result
 
 
+
+def pose_to_matrix(pose: np.ndarray) -> np.ndarray:
+    """Convert one XYZ + XYZW quaternion pose to a 4x4 SE(3) matrix."""
+
+    arr = np.asarray(pose, dtype=np.float64)
+    if arr.shape != (7,) and not (arr.ndim == 1 and arr.shape[0] >= 7):
+        raise ValueError("pose must have shape (7+) with XYZ + XYZW quaternion")
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = _quaternion_to_rotation_matrix(arr[3:7])
+    matrix[:3, 3] = arr[:3]
+    return matrix
+
+
+def poses_to_matrices(poses: np.ndarray) -> np.ndarray:
+    """Convert XYZ + XYZW quaternion poses to 4x4 SE(3) matrices."""
+
+    arr = np.asarray(poses, dtype=np.float64)
+    if arr.ndim == 1:
+        return pose_to_matrix(arr)
+    if arr.ndim != 2 or arr.shape[1] < 7:
+        raise ValueError("poses must have shape (N, 7+) with XYZ + XYZW quaternion")
+    matrices = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], arr.shape[0], axis=0)
+    matrices[:, :3, :3] = _quaternion_to_rotation_matrix(arr[:, 3:7])
+    matrices[:, :3, 3] = arr[:, :3]
+    return matrices
+
 def transform_vectors(vectors: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Rotate XYZ vectors by the rotation part of a transform."""
 

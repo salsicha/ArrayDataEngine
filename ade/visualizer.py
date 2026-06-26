@@ -42,6 +42,14 @@ class Visualizer:
         self.vis_tool.update(*args, **kwargs)
 
 
+    def add_point_cloud(self, *args, **kwargs):
+        self.vis_tool.add_point_cloud(*args, **kwargs)
+
+
+    def add_pose_arrow(self, *args, **kwargs):
+        self.vis_tool.add_pose_arrow(*args, **kwargs)
+
+
     def show(self, *args, **kwargs):
         self.vis_tool.show(*args, **kwargs) # this calls destroy
 

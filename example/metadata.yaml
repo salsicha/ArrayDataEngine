@@ -1,0 +1,78 @@
+rosbag2_bagfile_information:
+  version: 9
+  storage_identifier: sqlite3
+  duration:
+    nanoseconds: 24168127776
+  starting_time:
+    nanoseconds_since_epoch: 1782439503905805110
+  message_count: 1720
+  topics_with_message_count:
+    - topic_metadata:
+        name: /mapping/pose
+        type: geometry_msgs/msg/PoseStamped
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 1447
+    - topic_metadata:
+        name: /mapping/pointcloud/depth_anything
+        type: sensor_msgs/msg/PointCloud2
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 39
+    - topic_metadata:
+        name: /mapping/pointcloud/lidar
+        type: sensor_msgs/msg/PointCloud2
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 116
+    - topic_metadata:
+        name: /mapping/depth_anything/calibration
+        type: mapeverything_msgs/msg/DepthAnythingCalibration
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 39
+    - topic_metadata:
+        name: /mapping/dem/tile
+        type: mapeverything_msgs/msg/GeoRasterTile
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 1
+    - topic_metadata:
+        name: /mapping/camera/image/compressed
+        type: sensor_msgs/msg/CompressedImage
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 39
+    - topic_metadata:
+        name: /mapping/camera/camera_info
+        type: sensor_msgs/msg/CameraInfo
+        serialization_format: cdr
+        offered_qos_profiles:
+          []
+        type_description_hash: ""
+      message_count: 39
+  compression_format: ""
+  compression_mode: ""
+  relative_file_paths:
+    - 0_mapeverything_0_native_ros2_2026_06_25-19_08_28.db3
+  files:
+    - path: 0_mapeverything_0_native_ros2_2026_06_25-19_08_28.db3
+      starting_time:
+        nanoseconds_since_epoch: 1782439503905805110
+      duration:
+        nanoseconds: 24168127776
+      message_count: 1720
+  custom_data: ~
+  ros_distro: rolling

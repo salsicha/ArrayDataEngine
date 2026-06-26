@@ -1322,6 +1322,59 @@ class SourcePipeline:
         _update_checkpoint(checkpoint, done_progress, operation_counters=index_counters)
         _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
+
+    def nearest_topic_pairs(
+        self,
+        reference_topic: str,
+        target_topic: str,
+        tolerance: float | None = None,
+        copy: bool = True,
+    ) -> Iterable[tuple[dict, dict]]:
+        """Yield reference messages paired with the nearest target message seen in the stream.
+
+        This streaming join is intended for time-ordered sources. It buffers target
+        messages and pairs each reference message with the nearest target timestamp
+        available once a newer target has been observed.
+        """
+
+        if reference_topic not in self.topics:
+            raise ValueError(f"reference topic not found: {reference_topic!r}")
+        if target_topic not in self.topics:
+            raise ValueError(f"target topic not found: {target_topic!r}")
+
+        targets: deque[dict] = deque()
+        pending_references: deque[dict] = deque()
+
+        def emit_ready(current_time: float):
+            while pending_references and targets and targets[-1]["timestamp"] >= pending_references[0]["timestamp"]:
+                reference = pending_references.popleft()
+                target = _nearest_buffered_message(targets, float(reference["timestamp"]), tolerance)
+                if target is None:
+                    continue
+                yield (
+                    _copy_source_message(reference) if copy else reference,
+                    _copy_source_message(target) if copy else target,
+                )
+                while len(targets) > 2 and targets[1]["timestamp"] <= current_time:
+                    targets.popleft()
+
+        selected = self.select_topics(reference_topic, target_topic)
+        for message in selected.iter_messages(copy=copy):
+            if message["topic"] == target_topic:
+                targets.append(message)
+                yield from emit_ready(float(message["timestamp"]))
+            elif message["topic"] == reference_topic:
+                pending_references.append(message)
+                yield from emit_ready(float(message["timestamp"]))
+
+        for reference in pending_references:
+            target = _nearest_buffered_message(targets, float(reference["timestamp"]), tolerance)
+            if target is not None:
+                yield (
+                    _copy_source_message(reference) if copy else reference,
+                    _copy_source_message(target) if copy else target,
+                )
+
     def to_buffer(
         self,
         buffer_depth: int = 1,
@@ -1723,6 +1776,15 @@ def _source_topics(data_source, topics: Iterable[str] | None = None) -> list[str
         return [str(topic) for topic in get_topics()]
     return []
 
+
+
+def _nearest_buffered_message(messages: deque[dict], timestamp: float, tolerance: float | None = None) -> dict | None:
+    if not messages:
+        return None
+    best = min(messages, key=lambda message: abs(float(message["timestamp"]) - timestamp))
+    if tolerance is not None and abs(float(best["timestamp"]) - timestamp) > tolerance:
+        return None
+    return best
 
 def _source_messages(data_source):
     get_message = getattr(data_source, "get_message", None)

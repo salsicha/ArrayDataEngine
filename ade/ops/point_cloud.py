@@ -286,6 +286,22 @@ def calibrate_point_cloud_metric_scale(
     return (calibration, adjusted) if return_adjusted else calibration
 
 
+
+def valid_point_cloud_points(points: np.ndarray, finite: bool = True, drop_zero_xyz: bool = True) -> np.ndarray:
+    """Return point-cloud rows that contain valid XYZ coordinates.
+
+    PointCloud2 readers may pad scans to a fixed row count with all-zero rows;
+    `drop_zero_xyz=True` removes that padding while keeping real nonzero points.
+    """
+
+    arr = _as_points(points)
+    mask = np.ones(arr.shape[0], dtype=bool)
+    if finite:
+        mask &= np.isfinite(arr[:, :3]).all(axis=1)
+    if drop_zero_xyz:
+        mask &= np.any(arr[:, :3] != 0, axis=1)
+    return arr[mask].copy()
+
 def apply_point_cloud_metric_scale(points: np.ndarray, calibration: Mapping | float, offset=None) -> np.ndarray:
     """Apply a metric-scale calibration to point-cloud XYZ columns."""
 
@@ -1730,6 +1746,7 @@ __all__ = [
     "statistical_outlier_filter",
     "to_open3d_point_cloud",
     "uniform_downsample",
+    "valid_point_cloud_points",
     "verify_loop_closures",
     "voxel_downsample",
 ]
