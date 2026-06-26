@@ -37,8 +37,7 @@ def main() -> None:
     visualizer = ADE.Visualizer(
         "pointcloud",
         embed=False,
-        backend="html",
-        output_path=bag_path.with_name("mapeverything_stitched_pointcloud.html"),
+        backend="native",
     )
 
     stitched = stitch_depth_anything_pointclouds(source, visualizer=visualizer)

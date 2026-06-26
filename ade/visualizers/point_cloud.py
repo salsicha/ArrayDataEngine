@@ -3,6 +3,7 @@
 
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +18,22 @@ def _ensure_open3d():
         return True
     try:
         import open3d as imported_open3d
-        from open3d.web_visualizer import draw as imported_draw
     except ImportError:
         return False
+    try:
+        from open3d.web_visualizer import draw as imported_draw
+    except ImportError:
+        imported_draw = None
     o3d = imported_open3d
     draw = imported_draw
     return True
+
+
+def _configure_native_glfw_platform():
+    if os.environ.get("GLFW_PLATFORM"):
+        return
+    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+        os.environ["GLFW_PLATFORM"] = "x11"
 
 
 class VisTool:
@@ -32,8 +43,16 @@ class VisTool:
     def __init__(self, embed=True, **kwargs):
         self.output_path = Path(kwargs.get("output_path", "ade_pointcloud_viewer.html"))
         backend = str(kwargs.get("backend", "auto")).lower()
+        native_requested = backend in {"native", "open3d", "desktop"} or (backend == "auto" and not embed)
 
+        if native_requested:
+            _configure_native_glfw_platform()
         has_open3d = False if backend == "html" else _ensure_open3d()
+        if native_requested and not has_open3d:
+            raise RuntimeError(
+                "The native point-cloud visualizer requires the optional `open3d` dependency. "
+                "Install it with `pip install open3d` or use backend='html'."
+            )
 
         if backend == "html" or not has_open3d:
             self._init_html()
@@ -44,7 +63,7 @@ class VisTool:
             self.add_point_cloud = self._add_point_cloud_html
             self.show = self._show_html
             self.update = self._update_point_cloud_html
-        elif embed:
+        elif embed and not native_requested:
             self._init_embeded()
             self.show_point_cloud = self._show_point_cloud_embedded
             self.update_point_cloud = self._update_point_cloud_embedded
@@ -136,7 +155,13 @@ class VisTool:
     def _init_native(self):
         ## Pop out
         self.vis = o3d.visualization.Visualizer()
-        self.vis.create_window()
+        if not self.vis.create_window():
+            raise RuntimeError(
+                "Open3D failed to create a native GLFW window. On Wayland this usually means "
+                "the Open3D legacy visualizer/GLEW path could not use a compatible OpenGL "
+                "context. Make sure XWayland is running and try `GLFW_PLATFORM=x11 "
+                "python example/mapeverything.py`."
+            )
         self.new_pcd = o3d.geometry.PointCloud()
 
 
