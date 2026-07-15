@@ -55,8 +55,12 @@ def mosaic_dem_tiles(tiles, fill_value=np.nan, return_index: bool = False):
         keyed_tiles[key] = arr
 
     assert tile_shape is not None
-    latitudes = np.array(sorted({lat for lat, _ in keyed_tiles}, reverse=True), dtype=np.int64)
-    longitudes = np.array(sorted({lon for _, lon in keyed_tiles}), dtype=np.int64)
+    # Span the full coordinate range so fully-missing rows/columns become
+    # fill_value bands instead of silently collapsing the grid.
+    present_lats = {lat for lat, _ in keyed_tiles}
+    present_lons = {lon for _, lon in keyed_tiles}
+    latitudes = np.arange(max(present_lats), min(present_lats) - 1, -1, dtype=np.int64)
+    longitudes = np.arange(min(present_lons), max(present_lons) + 1, dtype=np.int64)
     dtype = np.result_type(*(tile.dtype for tile in keyed_tiles.values()), np.asarray(fill_value).dtype)
     tile_rows, tile_cols = tile_shape
     mosaic = np.full(
@@ -164,13 +168,17 @@ def slope_aspect(elevation: np.ndarray, resolution: float = 1.0) -> tuple[np.nda
         raise ValueError("resolution must be positive")
     dz_dx, dz_dy = terrain_gradients(elevation, resolution=resolution)
     slope = np.arctan(np.hypot(dz_dx, dz_dy))
-    aspect = np.arctan2(-dz_dx, dz_dy)
+    # Compass bearing of the downslope direction (-dz_dx, -dz_dy) with
+    # 0 = north (+y, increasing row) and pi/2 = east, matching terrain_normals.
+    aspect = np.arctan2(-dz_dx, -dz_dy)
     return slope, aspect
 
 
 def hillshade(elevation: np.ndarray, azimuth: float = 315.0, altitude: float = 45.0, resolution: float = 1.0) -> np.ndarray:
     slope, aspect = slope_aspect(elevation, resolution)
-    azimuth_rad = np.deg2rad(360.0 - azimuth + 90.0)
+    # aspect is already a compass bearing, so the sun azimuth can be compared
+    # directly; cos() of the relative angle is convention-independent.
+    azimuth_rad = np.deg2rad(azimuth)
     altitude_rad = np.deg2rad(altitude)
     shaded = (
         np.sin(altitude_rad) * np.cos(slope)

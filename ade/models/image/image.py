@@ -36,10 +36,14 @@ def align_images(images):
 
         new_img = cv2.warpAffine(images[i + 1], translation_matrix, out_shape)
 
-        # TODO: this should be sensitive to sign, and also handle y
-        synth_background = make_background()
-        img = cv2.resize(synth_background, out_shape)
-        new_img[:, -x_shift:] = img[:, -x_shift:]
+        # TODO: alignment should also patch the y bands exposed by y_shift
+        if x_shift != 0:
+            synth_background = make_background()
+            img = cv2.resize(synth_background, out_shape)
+            if x_shift > 0:
+                new_img[:, -x_shift:] = img[:, -x_shift:]
+            else:
+                new_img[:, :-x_shift] = img[:, :-x_shift]
 
         new_images.append(new_img)
 
@@ -226,25 +230,26 @@ def create_synth_image(t, pose):
     y_off = 320
     side = 30
     
+    # every 0.1 second shifts the beacons one pixel
+    shift = int(pose["x"] * 10)
+
     synth_img = make_background()
     for x in beacon_arr:
         period = x[3]
         ts = t * 10
         remainder = np.rint(ts % period)
         if remainder == 0:
-            x_ind = int(x[0] * scale + x_off)
+            x_ind = int(x[0] * scale + x_off + shift)
             y_ind = int(x[1] * scale + y_off)
             x_0 = int(x_ind-side/2)
             x_1 = int(x_ind+side/2)
             y_0 = int(y_ind-side/2)
             y_1 = int(y_ind+side/2)
 
-            # every 0.1 second shifts the beacons one pixel
-            shift = pose["x"] * 10
-
             synth_img[x_0:x_1, y_0:y_1] = make_beacon()
 
-    img = cv2.resize(synth_img, (x_size, y_size))
+    # cv2 dsize is (width, height); match create_synth_image_moving's (32, 40)
+    img = cv2.resize(synth_img, (y_size, x_size))
 
     return img
 

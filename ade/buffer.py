@@ -172,7 +172,7 @@ class DataBuffer:
         return self.topics
 
     def get_size(self):
-        return self.msg_len[self._axis]
+        return self.msg_len.get(self._axis, 0)
 
     def load_data_db(self, axis: str) -> None:
         if not axis in self.topics:
@@ -202,7 +202,12 @@ class DataBuffer:
                 yield self.get_buffer(), counter
             except StopIteration:
                 _logger.info("End of source")
-                self.reset_buffer()
+                try:
+                    self.reset_buffer()
+                except StopIteration:
+                    # A restarted source can be empty; a bare StopIteration
+                    # here would become a RuntimeError under PEP 479.
+                    _logger.info("Source is empty after reset")
                 return
 
     def roll_buffer(self, axis: str) -> None:
@@ -265,12 +270,20 @@ class DataBuffer:
     def _topic_frame_id(self, axis: str) -> str | None:
         return getattr(self.buffer_impl, "frame_ids", {}).get(axis)
 
+    def _topic_data(self, axis: str, copy: bool = True):
+        # Prefer get_topic, which returns only rows holding real messages;
+        # get_buffer includes the zero-filled slots of a partially-full buffer.
+        get_topic = getattr(self.buffer_impl, "get_topic", None)
+        if callable(get_topic):
+            return get_topic(axis, copy=copy)
+        return self.get_buffer(copy=copy)[axis]
+
     def topic_view(self, axis: str, copy: bool = True, metadata=None):
         from .ops import topic_view
 
         self._validate_topic_axis(axis)
         return topic_view(
-            self.get_buffer(copy=copy)[axis],
+            self._topic_data(axis, copy=copy),
             topic=axis,
             source_uri=self._source_uri(),
             frame_id=self._topic_frame_id(axis),
@@ -332,13 +345,12 @@ class DataBuffer:
                 )
             return
 
-        view = self.topic_view(axis, copy=copy)
-        for operation in operations:
-            if operation.kind == "time_range":
-                start, end = operation.args
-                view = view.select_time_range(start, end, inclusive=operation.kwargs.get("inclusive", True), copy=False)
-            elif operation.kind == "index_range":
-                view = view.select_indices(*operation.args, copy=False)
+        from .ops.core import _apply_pushdown_to_view
+
+        # _apply_pushdown_to_view handles every operation kind (including
+        # frame_id and spatial_bounds) and raises on unknown kinds instead of
+        # silently dropping them.
+        view = _apply_pushdown_to_view(self.topic_view(axis, copy=copy), operations)
         yield from view.iter_chunks(chunk_size, copy=False)
 
     def map_topic(

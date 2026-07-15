@@ -49,12 +49,13 @@ class IMUSensor(BaseSensor):
         nanosec = msg.header.stamp.nanosec
         ts = sec + nanosec * 1e-9
 
+        # 3x3 row-major covariance diagonals are indices 0, 4, 8
         orient = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
-        orient_cov = [msg.orientation_covariance[0], msg.orientation_covariance[3], msg.orientation_covariance[6], 0.0]
+        orient_cov = [msg.orientation_covariance[0], msg.orientation_covariance[4], msg.orientation_covariance[8], 0.0]
         ang_vel = [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z, 0.0]
-        ang_vel_cov = [msg.angular_velocity_covariance[0], msg.angular_velocity_covariance[3], msg.angular_velocity_covariance[6], 0.0]
+        ang_vel_cov = [msg.angular_velocity_covariance[0], msg.angular_velocity_covariance[4], msg.angular_velocity_covariance[8], 0.0]
         lin_acc = [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z, 0.0]
-        lin_acc_cov = [msg.linear_acceleration_covariance[0], msg.linear_acceleration_covariance[3], msg.linear_acceleration_covariance[6], 0.0]
+        lin_acc_cov = [msg.linear_acceleration_covariance[0], msg.linear_acceleration_covariance[4], msg.linear_acceleration_covariance[8], 0.0]
 
         npified = np.array([orient, orient_cov, ang_vel, ang_vel_cov, lin_acc, lin_acc_cov])
 

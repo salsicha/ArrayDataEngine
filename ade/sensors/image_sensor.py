@@ -47,9 +47,8 @@ class ImageSensor(BaseSensor):
         base_dtype, channels = dtype_channels
         dtype = np.dtype(base_dtype)
         if dtype.itemsize > 1:
-            is_bigendian = getattr(msg, "is_bigendian", False)
-            if not isinstance(is_bigendian, bool):
-                is_bigendian = False
+            # sensor_msgs/Image.is_bigendian is uint8; rosbags yields int, not bool
+            is_bigendian = bool(getattr(msg, "is_bigendian", False) or False)
             dtype = dtype.newbyteorder(">" if is_bigendian else "<")
 
         bytes_per_pixel = dtype.itemsize * channels

@@ -16,7 +16,9 @@ def _as_points(points: np.ndarray) -> np.ndarray:
 
 
 def _as_transform_matrix(transform: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(transform, dtype=np.float64)
+    # Always return an owned array: callers (e.g. FrameGraph) may hold onto
+    # the result, and aliasing the caller's 4x4 lets later mutation corrupt it.
+    matrix = np.array(transform, dtype=np.float64)
     if matrix.shape == (3, 3):
         normalized = np.eye(4, dtype=np.float64)
         normalized[:3, :3] = matrix
@@ -175,7 +177,7 @@ def _transform_xyz(xyz: np.ndarray, transform: np.ndarray) -> np.ndarray:
 def apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply a 3x3, 3x4, or 4x4 transform to point XYZ columns."""
 
-    arr = _as_points(points)
+    arr = np.asarray(_as_points(points), dtype=np.float64)
     xyz = _transform_xyz(arr[:, :3], transform)
 
     result = arr.copy()
@@ -1367,12 +1369,14 @@ def _slerp_quaternion(q0: np.ndarray, q1: np.ndarray, fraction: float) -> np.nda
 
 
 def _quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
-    x, y, z, w = _normalize_quaternions(quaternion)
-    return np.array([
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-    ], dtype=np.float64)
+    q = _normalize_quaternions(quaternion)
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    rows = (
+        np.stack((1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)), axis=-1),
+        np.stack((2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)), axis=-1),
+        np.stack((2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)), axis=-1),
+    )
+    return np.stack(rows, axis=-2)
 
 
 def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:

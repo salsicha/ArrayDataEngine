@@ -72,6 +72,15 @@ class NumpyBuffer:
             return ordered[:0]
         return ordered[-count:]
 
+    @property
+    def msg_len(self) -> dict:
+        return dict(self._counts)
+
+    def get_topic(self, topic: str, copy: bool = True) -> np.ndarray:
+        """Return only the rows that hold real messages, oldest first."""
+        valid = self._valid_ordered_topic(topic)
+        return valid.copy() if copy else valid
+
     def roll_buffer(self, axis: str) -> None:
         self._axis = axis
         while True:
@@ -209,10 +218,9 @@ class NumpyBuffer:
 
     def __getitem__(self, subscript):
         ordered_data = self._ordered_topic(self._axis)['data']
-        if isinstance(subscript, slice):
+        if isinstance(subscript, (slice, int, np.integer)):
             return np.squeeze(ordered_data[subscript])
-        elif isinstance(subscript, (int, np.integer)):
-            return np.squeeze(ordered_data[subscript])
+        raise TypeError(f"unsupported subscript type: {type(subscript).__name__}")
 
     def __setitem__(self, subscript, newval):
         logical_indices = self._logical_indices(self._axis)

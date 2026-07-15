@@ -21,7 +21,9 @@ class CDRReader:
             raise ValueError("CDR payload is too short")
         self.data = memoryview(data)
         self.offset = 4
-        self.endian = "<" if data[1] == 1 else ">"
+        # Bit 0 of the encapsulation id is the endianness flag (covers
+        # CDR_LE 0x0001, PL_CDR_LE 0x0003, and the XCDR2 LE variants).
+        self.endian = "<" if data[1] & 1 else ">"
 
     def align(self, size: int) -> None:
         remainder = (self.offset - 4) % size
@@ -50,17 +52,17 @@ class CDRReader:
         return float(self.read("d", 8))
 
     def read_string(self) -> str:
+        # CDR has no padding after string/sequence payloads; alignment is
+        # driven by the next field's own type.
         length = self.read_uint32()
         raw = bytes(self.data[self.offset:self.offset + length])
         self.offset += length
-        self.align(4)
         return raw.rstrip(b"\x00").decode(errors="replace")
 
     def read_bytes(self) -> bytes:
         length = self.read_uint32()
         raw = bytes(self.data[self.offset:self.offset + length])
         self.offset += length
-        self.align(4)
         return raw
 
 
@@ -162,8 +164,15 @@ def decode_pointcloud2(rawdata: bytes) -> DecodedMessage:
     point_bytes = reader.read_bytes()
     reader.read_bool()  # is_dense
 
-    point_count = int(height) * int(width)
-    points = pointcloud_xyz(point_bytes, fields, point_count, int(point_step), bool(is_bigendian))
+    points = pointcloud_xyz(
+        point_bytes,
+        fields,
+        int(height),
+        int(width),
+        int(point_step),
+        int(row_step),
+        bool(is_bigendian),
+    )
     return DecodedMessage(points, "PointCloud2", timestamp, frame_id)
 
 
@@ -178,8 +187,10 @@ def decode_point_field(reader: CDRReader) -> dict[str, int | str]:
 def pointcloud_xyz(
     point_bytes: bytes,
     fields: list[dict[str, int | str]],
-    point_count: int,
+    height: int,
+    width: int,
     point_step: int,
+    row_step: int,
     is_bigendian: bool,
 ) -> np.ndarray:
     by_name = {str(field["name"]): field for field in fields}
@@ -187,18 +198,34 @@ def pointcloud_xyz(
     if missing:
         raise ValueError(f"PointCloud2 is missing XYZ field(s): {missing}")
 
-    byteorder = ">" if is_bigendian else "<"
+    point_count = height * width
     output = np.empty((point_count, 3), dtype=np.float32)
+    if point_count == 0:
+        return output
+
+    byteorder = ">" if is_bigendian else "<"
+    # Organized clouds may pad each row; honor row_step when it is larger
+    # than the packed row size, otherwise treat the buffer as dense.
+    padded_rows = height > 1 and row_step > width * point_step
     for column, name in enumerate(("x", "y", "z")):
         field = by_name[name]
         dtype = point_field_dtype(int(field["datatype"]), byteorder)
-        values = np.ndarray(
-            shape=(point_count,),
-            dtype=dtype,
-            buffer=point_bytes,
-            offset=int(field["offset"]),
-            strides=(point_step,),
-        )
+        if padded_rows:
+            values = np.ndarray(
+                shape=(height, width),
+                dtype=dtype,
+                buffer=point_bytes,
+                offset=int(field["offset"]),
+                strides=(row_step, point_step),
+            ).reshape(-1)
+        else:
+            values = np.ndarray(
+                shape=(point_count,),
+                dtype=dtype,
+                buffer=point_bytes,
+                offset=int(field["offset"]),
+                strides=(point_step,),
+            )
         output[:, column] = values.astype(np.float32, copy=False)
     return output
 

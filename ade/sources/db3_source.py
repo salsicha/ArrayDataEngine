@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from .ros_source import RosSource
 from ..sensors.pointcloud2_sensor import PointCloudSensor
@@ -43,18 +44,32 @@ class DB3Source(RosSource):
             self.data_path = os.path.dirname(data_path) or "."
 
     def messages(self):
-        if not self._standalone_db3_input():
-            try:
-                yield from super().messages()
-                return
-            except ModuleNotFoundError as exc:
-                if exc.name != "rosbags":
-                    raise
+        try:
+            iterator = super().messages()
+            first = next(iterator)
+        except ModuleNotFoundError as exc:
+            if exc.name != "rosbags":
+                raise
+        except StopIteration:
+            return
+        except Exception:
+            # rosbags cannot open standalone .db3 chunks that lack a
+            # metadata.yaml; only those may fall back to the raw sqlite reader.
+            if not self._standalone_db3_input():
+                raise
+        else:
+            yield first
+            yield from iterator
+            return
 
+        yield from self._sqlite_messages()
+
+    def _sqlite_messages(self):
         from .cdr import decode_supported_cdr_message
 
         for db_path in self._db3_paths():
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 rows = connection.execute(
                     """
                     SELECT messages.timestamp, topics.name, topics.type, messages.data
@@ -81,6 +96,8 @@ class DB3Source(RosSource):
                     if decoded.extra is not None:
                         message.update(decoded.extra)
                     yield message
+            finally:
+                connection.close()
 
 
     def _metadata(self):
@@ -113,7 +130,7 @@ class DB3Source(RosSource):
         end = None
         for db_path in db_paths:
             try:
-                with sqlite3.connect(db_path) as connection:
+                with closing(sqlite3.connect(db_path)) as connection:
                     topic_rows = connection.execute(
                         "select id, name from topics order by id"
                     ).fetchall()

@@ -4,9 +4,11 @@ import numpy as np
 
 
 def normalize_image(image: np.ndarray, min_value=None, max_value=None, dtype=np.float32) -> np.ndarray:
-    arr = np.asarray(image)
-    min_value = arr.min() if min_value is None else min_value
-    max_value = arr.max() if max_value is None else max_value
+    # Subtract in float64: integer dtypes wrap around (or overflow on NumPy 2)
+    # when min_value exceeds a pixel value.
+    arr = np.asarray(image).astype(np.float64, copy=False)
+    min_value = arr.min() if min_value is None else float(min_value)
+    max_value = arr.max() if max_value is None else float(max_value)
     span = max_value - min_value
     if span == 0:
         return np.zeros(arr.shape, dtype=dtype)
@@ -313,9 +315,11 @@ def image_pyramid(image: np.ndarray, levels: int, downscale: float = 2.0, method
         raise ValueError("downscale must be greater than 1")
 
     current = np.asarray(image).copy()
+    # Infer the spatial axes once from the input; re-inferring per level can
+    # misroute once a shrinking width lands in the channel-like range {1,3,4}.
+    axes = _infer_spatial_axes(current, None)
     pyramid = [current]
     for _ in range(1, levels):
-        axes = _infer_spatial_axes(current, None)
         out_h = max(1, int(np.ceil(current.shape[axes[0]] / downscale)))
         out_w = max(1, int(np.ceil(current.shape[axes[1]] / downscale)))
         current = _resize_spatial_nearest(current, (out_h, out_w), axes)
@@ -532,8 +536,7 @@ def align_images(
             return_shifts=True,
         ))
         if not pairs:
-            arr = _as_image_sequence(images)
-            return np.empty_like(arr), np.empty((0, 2), dtype=np.float64)
+            return _empty_aligned_result(images), np.empty((0, 2), dtype=np.float64)
         aligned, shifts = zip(*pairs)
         return np.stack(aligned, axis=0), np.stack(shifts, axis=0)
 
@@ -544,8 +547,17 @@ def align_images(
         incremental=incremental,
     ))
     if not aligned:
-        return np.empty_like(_as_image_sequence(images))
+        return _empty_aligned_result(images)
     return np.stack(aligned, axis=0)
+
+
+def _empty_aligned_result(images) -> np.ndarray:
+    # Empty lists and exhausted generators carry no frame shape at all;
+    # fall back to a (0, 0, 0) sequence instead of crashing.
+    try:
+        return np.empty_like(_as_image_sequence(images))
+    except ValueError:
+        return np.empty((0, 0, 0), dtype=np.float64)
 
 
 def iter_motion_compensated_windows(

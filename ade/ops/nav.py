@@ -859,7 +859,7 @@ def navsat_to_trajectory(
 
     status = _mapping_value(navsat_data, "status")
     position_covariance = _mapping_value(navsat_data, "position_covariance", "covariance")
-    values, ts, metadata = _topic_data_and_timestamps(navsat_data, timestamps)
+    values, ts, metadata = _topic_data_and_timestamps(navsat_data, timestamps, message_ndim=1)
     navsat = _as_navsat_stream(values)
     if ref_lat is None:
         ref_lat = float(navsat[0, 0])
@@ -1307,7 +1307,10 @@ def _local_xyz(values: np.ndarray, name: str) -> np.ndarray:
     return arr
 
 
-def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None):
+def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None, message_ndim: int = 2):
+    """`message_ndim` is the dimensionality of a single message (2 for the
+    (6, 4)/(8, 4) IMU and odometry layouts, 1 for (3,) navsat samples)."""
+
     metadata: dict[str, Any] = {}
     if isinstance(sensor_data, Mapping):
         values = sensor_data["data"]
@@ -1321,7 +1324,7 @@ def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None
 
     arr = np.asarray(values, dtype=np.float64)
     if timestamps is None:
-        count = 1 if arr.ndim in {1, 2} else arr.shape[0]
+        count = 1 if arr.ndim <= message_ndim else arr.shape[0]
         ts = np.arange(count, dtype=np.float64)
     else:
         ts = np.atleast_1d(np.asarray(timestamps, dtype=np.float64))

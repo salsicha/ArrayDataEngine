@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -252,7 +252,9 @@ class TopicView:
         for _, timestamp, value, message_id in iterator:
             try:
                 acc = fn(acc, value.copy() if copy else value, float(timestamp), message_id)
-            except TypeError:
+            except TypeError as exc:
+                if _type_error_from_inside(exc, fn):
+                    raise
                 acc = fn(acc, value.copy() if copy else value)
         return acc
 
@@ -329,11 +331,18 @@ class TopicPipeline:
     ):
         self._chunk_source = chunk_source
         self._operations = tuple(operations)
-        self.metadata = _coerce_metadata(metadata) or TopicMetadata(
-            topic=topic,
-            source_uri=source_uri,
-            frame_id=frame_id,
-        )
+        base = _coerce_metadata(metadata)
+        if base is None:
+            self.metadata = TopicMetadata(topic=topic, source_uri=source_uri, frame_id=frame_id)
+        else:
+            # Merge explicit kwargs over the base metadata like TopicView does
+            # instead of silently discarding them.
+            self.metadata = replace(
+                base,
+                topic=base.topic if topic is None else topic,
+                source_uri=base.source_uri if source_uri is None else source_uri,
+                frame_id=base.frame_id if frame_id is None else frame_id,
+            )
 
     def map(self, fn: Callable, copy: bool = True) -> "TopicPipeline":
         return self._with_operation("map", fn, copy=copy)
@@ -506,7 +515,9 @@ class TopicPipeline:
         for message_id, timestamp, value in iterator:
             try:
                 acc = fn(acc, value.copy() if copy else value, float(timestamp), message_id)
-            except TypeError:
+            except TypeError as exc:
+                if _type_error_from_inside(exc, fn):
+                    raise
                 acc = fn(acc, value.copy() if copy else value)
         return acc
 
@@ -558,7 +569,11 @@ class TopicPipeline:
         ids = np.concatenate(ids_parts) if ids_parts else None
         timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
         if output is None:
-            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
+            if data_parts:
+                data = np.concatenate(data_parts, axis=0)
+            else:
+                template = self._empty_data_template()
+                data = np.array([]) if template is None else template
         else:
             data = output if offset == output.shape[0] else output[:offset]
         return TopicView(ids, timestamps, data, metadata=self.metadata).as_dict(copy=False)
@@ -836,8 +851,24 @@ class TopicPipeline:
 
         return tuple(pushdown_operations), tuple(remaining_operations)
 
+    def _empty_data_template(self) -> np.ndarray | None:
+        """Schema-correct empty data array for no-match collects, or None when
+        the output schema is unknowable (a map operation may change it)."""
+
+        _, remaining = self._split_pushdown_operations()
+        if any(operation.kind == "map" for operation in remaining):
+            return None
+        try:
+            for chunk in self._chunk_source(1, False, ()):
+                return np.asarray(chunk.data)[:0].copy()
+        except Exception:
+            return None
+        return None
+
     def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool) -> TopicView:
-        ids_array = np.asarray(ids, dtype=object)
+        # Preserve "no ids" instead of fabricating a column of Nones so the
+        # lazy path returns the same schema as the eager path.
+        ids_array = None if all(i is None for i in ids) else np.asarray(ids, dtype=object)
         ts_array = np.asarray(timestamps, dtype=np.float64)
         data_array = np.asarray(values)
         return TopicView(ids_array, ts_array, data_array, metadata=self.metadata, copy=copy)
@@ -902,8 +933,9 @@ class TopicWindowPipeline:
                     timestamps.popleft()
                     values.popleft()
 
+            window_ids = None if all(i is None for i in ids) else np.asarray(ids, dtype=object)
             yield TopicView(
-                np.asarray(ids, dtype=object),
+                window_ids,
                 np.asarray(timestamps, dtype=np.float64),
                 np.asarray(values),
                 metadata=self.pipeline.metadata,
@@ -1112,7 +1144,11 @@ class DatasetQuery:
 
             ids = np.concatenate(ids_parts) if ids_parts else None
             timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
-            data = np.concatenate(data_parts, axis=0) if data_parts else np.array([])
+            if data_parts:
+                data = np.concatenate(data_parts, axis=0)
+            else:
+                template = pipeline._empty_data_template()
+                data = np.array([]) if template is None else template
             collected[topic] = TopicView(ids, timestamps, data, metadata=pipeline.metadata).as_dict(copy=False)
 
         return collected
@@ -1831,13 +1867,15 @@ def _copy_source_message(message: Mapping[str, Any]) -> dict:
 def _call_source_callable(fn: Callable, message: Mapping[str, Any]):
     try:
         return fn(message)
-    except TypeError:
-        return _call_with_metadata(
-            fn,
-            message["data"],
-            float(message["timestamp"]),
-            message.get("name"),
-        )
+    except TypeError as exc:
+        if _type_error_from_inside(exc, fn):
+            raise
+    return _call_with_metadata(
+        fn,
+        message["data"],
+        float(message["timestamp"]),
+        message.get("name"),
+    )
 
 
 def _mapped_source_message(previous: Mapping[str, Any], mapped, copy: bool) -> dict:
@@ -2267,14 +2305,39 @@ def _slice_contains(index: int, start: int | None, stop: int | None, step: int |
     return (index - start) % step == 0
 
 
+def _type_error_from_inside(exc: TypeError, fn: Callable) -> bool:
+    """True when the TypeError was raised inside fn's own body (its frame ran).
+
+    Retrying with fewer arguments is only safe for argument-binding errors;
+    re-invoking a function that already executed masks the user's real error
+    and can duplicate side effects."""
+
+    code = getattr(getattr(fn, "__func__", fn), "__code__", None)
+    if code is None:
+        call = getattr(fn, "__call__", None)
+        code = getattr(getattr(call, "__func__", call), "__code__", None)
+    if code is None:
+        return False
+    traceback = exc.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code is code:
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def _call_with_metadata(fn: Callable, data: np.ndarray, ts: float, message_id: Any) -> Any:
     try:
         return fn(data, ts, message_id)
-    except TypeError:
-        try:
-            return fn(data, ts)
-        except TypeError:
-            return fn(data)
+    except TypeError as exc:
+        if _type_error_from_inside(exc, fn):
+            raise
+    try:
+        return fn(data, ts)
+    except TypeError as exc:
+        if _type_error_from_inside(exc, fn):
+            raise
+    return fn(data)
 
 
 def select_indices(topic_data: dict | np.ndarray, start: int | None = None, stop: int | None = None, step: int | None = None) -> dict:

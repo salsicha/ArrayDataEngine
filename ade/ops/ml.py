@@ -281,7 +281,7 @@ def augment_point_cloud(
     if jitter_std:
         xyz = xyz + rng.normal(0.0, float(jitter_std), size=xyz.shape)
     result[:, :3] = xyz
-    if dropout_ratio:
+    if dropout_ratio and result.shape[0]:
         keep = rng.random(result.shape[0]) >= float(dropout_ratio)
         if not np.any(keep):
             keep[int(rng.integers(0, result.shape[0]))] = True
@@ -313,6 +313,16 @@ def augment_trajectory(
         trajectory_array = np.asarray(result["trajectory"], dtype=np.float64).copy()
         trajectory_array[..., :3] = position
         result["trajectory"] = trajectory_array
+    if "navsat" in result and "reference" in result:
+        from .nav import enu_to_navsat
+
+        reference = result["reference"]
+        result["navsat"] = enu_to_navsat(
+            position,
+            reference["lat"],
+            reference["lon"],
+            reference.get("alt", 0.0),
+        )
     return result
 
 

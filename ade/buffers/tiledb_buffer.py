@@ -104,7 +104,9 @@ class TileDBBuffer:
         self._open_arrays = {}
         self._open_timestamp_arrays = {}
         self.timestamps = {}
-        self.read_only = data_source is None
+        # DataBuffer passes iter(()) (not None) for a source-less reopen, so
+        # a missing init_source must also mark the buffer read-only.
+        self.read_only = data_source is None or init_source is None
         self._hydrate_existing_topics()
 
     def _write_metadata(self, topic: str, tiledb_array, closed: bool | None = None) -> None:
@@ -609,6 +611,9 @@ class TileDBBuffer:
         for topic, count in self.counters.items():
             buffer[topic] = self.get_index_range(topic, 0, count, copy=copy)
         return buffer
+
+    def get_topic(self, topic: str, copy: bool = True) -> dict:
+        return self.get_index_range(topic, 0, self.counters.get(topic, 0), copy=copy)
 
     def iter_topic_chunks(self, axis: str, chunk_size: int, copy: bool = False, operations=()):
         if chunk_size < 1:

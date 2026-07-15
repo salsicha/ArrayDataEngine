@@ -807,6 +807,10 @@ def statistical_outlier_filter(points: np.ndarray, k: int = 8, std_ratio: float 
     if arr.shape[0] == 0:
         mask = np.array([], dtype=bool)
         return (arr.copy(), mask) if return_mask else arr.copy()
+    if arr.shape[0] == 1:
+        # A single point has no neighbors to judge it by; keep it.
+        mask = np.ones(1, dtype=bool)
+        return (arr.copy(), mask) if return_mask else arr.copy()
     neighbor_count = max(2, min(k + 1, arr.shape[0]))
     distances, _ = knn_search(arr, arr[:, :3], k=neighbor_count)
     mean_distances = distances[:, 1:].mean(axis=1)
