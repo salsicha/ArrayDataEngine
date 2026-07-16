@@ -5,6 +5,10 @@
 
 # Array Data Engine
 
+[![PyPI](https://img.shields.io/pypi/v/arraydataengine)](https://pypi.org/project/arraydataengine/)
+[![tests](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml/badge.svg)](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to TileDB.
 
 The project is aimed at robotics and perception workflows where algorithms need synchronized windows of image, point cloud, navigation, odometry, IMU, and terrain-like array data.
@@ -21,6 +25,18 @@ The project is aimed at robotics and perception workflows where algorithms need 
 - Notebook examples for demos, iterators, terrain, INS, MOT, and TileDB workflows.
 
 ## Installation
+
+```bash
+python -m pip install arraydataengine
+```
+
+The distribution name is `arraydataengine`; the import names are `ade` (the
+library) and `ArrayDataEngine` (a convenience facade):
+
+```python
+from ade.buffer import DataBuffer
+from ade.source import DataSources
+```
 
 For editable local development:
 
