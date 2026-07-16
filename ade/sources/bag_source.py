@@ -5,6 +5,10 @@ import os
 from .ros_source import RosSource
 from ..sensors.pointcloud2_sensor import PointCloudSensor
 from ..sensors.image_sensor import ImageSensor
+from ..sensors.imu_sensor import IMUSensor
+from ..sensors.odom_sensor import OdomSensor
+from ..sensors.nav_sensor import NavSensor
+from ..sensors.pose_sensor import PoseSensor
 
 
 class BagSource(RosSource):
@@ -17,6 +21,11 @@ class BagSource(RosSource):
     SENSOR_TYPES = {
         "pointcloud2": PointCloudSensor,
         "image": ImageSensor,
+        "imu": IMUSensor,
+        "odometry": OdomSensor,
+        "navsatfix": NavSensor,
+        "pose": PoseSensor,
+        "posestamped": PoseSensor,
     }
 
 

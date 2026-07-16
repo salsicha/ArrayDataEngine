@@ -147,10 +147,11 @@ class BoxList(object):
             transposed_ymin = ymin
             transposed_ymax = ymax
         elif method == FLIP_TOP_BOTTOM:
+            TO_REMOVE = 1
             transposed_xmin = xmin
             transposed_xmax = xmax
-            transposed_ymin = image_height - ymax
-            transposed_ymax = image_height - ymin
+            transposed_ymin = image_height - ymax - TO_REMOVE
+            transposed_ymax = image_height - ymin - TO_REMOVE
 
         transposed_boxes = torch.cat(
             (transposed_xmin, transposed_ymin, transposed_xmax, transposed_ymax), dim=-1

@@ -31,20 +31,27 @@ class BaseSensor:
     """
 
 
-    def __init__(self, rawdata: bytes, msgtype: str):
+    def __init__(self, rawdata: bytes, msgtype: str, deserializer=None):
         """Constructor
 
+        `deserializer` is a callable `(rawdata, msgtype) -> message` supplied
+        by the reader that produced the raw payload (e.g. AnyReader.deserialize),
+        which knows whether the payload is ROS1- or CDR-serialized. Without it,
+        deserialization falls back to CDR, which is only correct for ROS2 data.
         """
 
         self.rawdata = rawdata
         self.msgtype = msgtype
         self.frame_id: str | None = None
+        self._deserializer = deserializer
 
-        # ROSbags to native ROS class converter 
+        # ROSbags to native ROS class converter
         self.NATIVE_CLASSES: dict[str, Any] = {}
 
 
     def deserialize(self):
+        if self._deserializer is not None:
+            return self._deserializer(self.rawdata, self.msgtype)
         if _deserialize_cdr is not None:
             msg = _deserialize_cdr(self.rawdata, self.msgtype)
         else:

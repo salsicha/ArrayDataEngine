@@ -328,15 +328,16 @@ def test_synthetic_dem_source_reuses_session_decodes_and_caches_tiles(monkeypatc
     messages = list(source.messages())
 
     assert _FakeSession.created == 1
-    assert [msg["name"] for msg in messages] == ["N1W1", "N1W2"]
+    # Real SRTM tile names are zero-padded: 2-digit latitude, 3-digit longitude
+    assert [msg["name"] for msg in messages] == ["N01W001", "N01W002"]
     assert [msg["data"].shape for msg in messages] == [(4, 4), (4, 4)]
     assert all(call[3] == 7.0 for call in _FakeSession.calls)
-    assert (tmp_path / "N1W1.hgt").exists()
-    assert (tmp_path / "N1W2.hgt").exists()
+    assert (tmp_path / "N01W001.hgt").exists()
+    assert (tmp_path / "N01W002.hgt").exists()
 
 
 def test_synthetic_dem_source_reads_cached_tile_without_credentials(monkeypatch, tmp_path):
-    (tmp_path / "N1W1.hgt").write_bytes(_dem_hgt_bytes())
+    (tmp_path / "N01W001.hgt").write_bytes(_dem_hgt_bytes())
     monkeypatch.delenv("earthdata_username", raising=False)
     monkeypatch.delenv("earthdata_password", raising=False)
 
@@ -349,6 +350,6 @@ def test_synthetic_dem_source_reads_cached_tile_without_credentials(monkeypatch,
     source = DEMSource([1, 2], [1, 2], cache_dir=tmp_path)
     messages = list(source.messages())
 
-    assert [msg["name"] for msg in messages] == ["N1W1"]
+    assert [msg["name"] for msg in messages] == ["N01W001"]
     assert np.array_equal(messages[0]["data"], np.arange(16, dtype=np.int16).reshape(4, 4))
-    assert messages[0]["source_uri"] == str(tmp_path / "N1W1.hgt")
+    assert messages[0]["source_uri"] == str(tmp_path / "N01W001.hgt")

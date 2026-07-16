@@ -54,7 +54,10 @@ class VisTool:
                 "Install it with `pip install open3d` or use backend='html'."
             )
 
-        if backend == "html" or not has_open3d:
+        # The embedded backend needs open3d.web_visualizer.draw; when open3d
+        # is present without the Jupyter stack, fall back to the html viewer.
+        embedded_available = has_open3d and draw is not None
+        if backend == "html" or not has_open3d or (embed and not native_requested and not embedded_available):
             self._init_html()
             self.show_point_cloud = self._show_point_cloud_html
             self.update_point_cloud = self._update_point_cloud_html
@@ -265,9 +268,10 @@ class VisTool:
 
     def _update_point_cloud_embedded(self, last_message, odom_transform):
         ## Embedded
+        points = np.asarray(last_message)
         new_pcd = o3d.geometry.PointCloud()
-        new_pcd.points = o3d.utility.Vector3dVector(last_message)
-        new_pcd.colors = o3d.utility.Vector3dVector(np.zeros((last_message.shape[0], last_message.shape[1])))
+        new_pcd.points = o3d.utility.Vector3dVector(points[:, :3])
+        new_pcd.colors = o3d.utility.Vector3dVector(self.get_colors(points))
         new_pcd.transform(odom_transform)
         self.shapes.append(new_pcd)
 
@@ -275,6 +279,8 @@ class VisTool:
     def get_colors(self, data):
         channel = 2
         colors = np.zeros((data.shape[0], 3), dtype=np.float64)
+        if data.shape[0] == 0:
+            return colors
         z_vals = data[:, -1]
         z_min = z_vals.min()
         z_max = z_vals.max()
@@ -288,11 +294,15 @@ class VisTool:
 
     def _update_point_cloud_native(self, last_message, odom_transform):
         ## Pop out
-        self.new_pcd.points = o3d.utility.Vector3dVector(last_message)
-        self.new_pcd.colors = o3d.utility.Vector3dVector(self.get_colors(last_message))
+        # A fresh geometry per update so successive scans accumulate into a
+        # map; reusing one object made every call replace the previous scan.
+        points = np.asarray(last_message)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points[:, :3])
+        pcd.colors = o3d.utility.Vector3dVector(self.get_colors(points))
 
-        self.new_pcd.transform(odom_transform)
-        self.vis.add_geometry(self.new_pcd)
+        pcd.transform(odom_transform)
+        self.vis.add_geometry(pcd)
         self.vis.poll_events()
         self.vis.update_renderer()
 

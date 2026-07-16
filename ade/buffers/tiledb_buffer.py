@@ -329,6 +329,10 @@ class TileDBBuffer:
         return False
 
     def append_buffer(self, msg: dict) -> None:
+        # An explicit append is a write intent: leave read-only mode so the
+        # updated counts and metadata are persisted on close. Otherwise data
+        # appended to a reopened store would be silently invisible on reload.
+        self.read_only = False
         topic = msg['topic']
         array_uri = self._get_array_uri(topic)
 

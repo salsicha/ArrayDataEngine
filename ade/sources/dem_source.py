@@ -18,6 +18,8 @@ class DEMSource(BaseSource):
     Returns:
     """
 
+    DEFAULT_BASE_URL = "https://e4ftl01.cr.usgs.gov//DP109/SRTM/SRTMGL1.003/2000.02.11/"
+
     def __init__(
         self,
         north: list[int],
@@ -25,6 +27,7 @@ class DEMSource(BaseSource):
         timeout: float = 30.0,
         cache_dir: str | os.PathLike | None = None,
         refresh_cache: bool = False,
+        base_url: str | None = None,
     ):
         """Constructor
 
@@ -36,6 +39,7 @@ class DEMSource(BaseSource):
         self.timeout = timeout
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self.refresh_cache = bool(refresh_cache)
+        self.base_url = base_url or os.getenv("ADE_DEM_BASE_URL") or self.DEFAULT_BASE_URL
 
 
     def get_count(self, axis="Images"):
@@ -78,7 +82,8 @@ class DEMSource(BaseSource):
         try:
             for n in range(self.north[0], self.north[-1]):
                 for w in range(self.west[0], self.west[-1]):
-                    name = f"N{n}W{w}"
+                    # SRTM tile names are zero-padded: 2-digit lat, 3-digit lon
+                    name = f"N{n:02d}W{w:03d}"
                     hgt_content = self._read_cached_hgt(name)
                     if hgt_content is None:
                         if session is None:
@@ -112,7 +117,7 @@ class DEMSource(BaseSource):
 
     def _download_hgt(self, session, credentials: tuple[str, str], name: str) -> bytes:
         username, password = credentials
-        url = f"https://e4ftl01.cr.usgs.gov//DP109/SRTM/SRTMGL1.003/2000.02.11/{name}.SRTMGL1.hgt.zip"
+        url = f"{self.base_url.rstrip('/')}/{name}.SRTMGL1.hgt.zip"
         r1 = session.request("get", url, timeout=self.timeout)
         r = session.get(r1.url, auth=(username, password), timeout=self.timeout)
         r.raise_for_status()

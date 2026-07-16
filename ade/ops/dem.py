@@ -61,6 +61,13 @@ def mosaic_dem_tiles(tiles, fill_value=np.nan, return_index: bool = False):
     present_lons = {lon for _, lon in keyed_tiles}
     latitudes = np.arange(max(present_lats), min(present_lats) - 1, -1, dtype=np.int64)
     longitudes = np.arange(min(present_lons), max(present_lons) + 1, dtype=np.int64)
+    grid_cells = int(latitudes.size) * int(longitudes.size)
+    if grid_cells > max(64, 8 * len(keyed_tiles)):
+        raise ValueError(
+            f"tile grid spans {latitudes.size} x {longitudes.size} cells for only "
+            f"{len(keyed_tiles)} tiles; filling the gaps would allocate an enormous "
+            "raster. Mosaic contiguous tile subsets instead."
+        )
     dtype = np.result_type(*(tile.dtype for tile in keyed_tiles.values()), np.asarray(fill_value).dtype)
     tile_rows, tile_cols = tile_shape
     mosaic = np.full(
@@ -163,19 +170,40 @@ def read_dem_cache(cache_dir, name: str, return_metadata: bool = False):
     return (data, metadata) if return_metadata else data
 
 
-def slope_aspect(elevation: np.ndarray, resolution: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+def slope_aspect(
+    elevation: np.ndarray,
+    resolution: float = 1.0,
+    north_up: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slope and compass aspect (0 = north, pi/2 = east) of a DEM grid.
+
+    The module's native grid convention is row = +y = north (matching
+    `terrain_normals` and `sample_elevation_at_navsat`). Pass `north_up=True`
+    for GIS-style rasters where row 0 is the northernmost row — including the
+    output of `mosaic_dem_tiles`."""
+
     if resolution <= 0:
         raise ValueError("resolution must be positive")
     dz_dx, dz_dy = terrain_gradients(elevation, resolution=resolution)
+    if north_up:
+        dz_dy = -dz_dy
     slope = np.arctan(np.hypot(dz_dx, dz_dy))
     # Compass bearing of the downslope direction (-dz_dx, -dz_dy) with
-    # 0 = north (+y, increasing row) and pi/2 = east, matching terrain_normals.
+    # 0 = north and pi/2 = east.
     aspect = np.arctan2(-dz_dx, -dz_dy)
     return slope, aspect
 
 
-def hillshade(elevation: np.ndarray, azimuth: float = 315.0, altitude: float = 45.0, resolution: float = 1.0) -> np.ndarray:
-    slope, aspect = slope_aspect(elevation, resolution)
+def hillshade(
+    elevation: np.ndarray,
+    azimuth: float = 315.0,
+    altitude: float = 45.0,
+    resolution: float = 1.0,
+    north_up: bool = False,
+) -> np.ndarray:
+    """Hillshade a DEM grid; see `slope_aspect` for the `north_up` convention."""
+
+    slope, aspect = slope_aspect(elevation, resolution, north_up=north_up)
     # aspect is already a compass bearing, so the sun azimuth can be compared
     # directly; cos() of the relative angle is convention-independent.
     azimuth_rad = np.deg2rad(azimuth)

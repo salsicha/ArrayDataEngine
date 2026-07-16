@@ -247,7 +247,7 @@ def _dem_zip_bytes():
     with zipfile.ZipFile(buffer, "w") as zip_file:
         for n in range(1, 3):
             for w in range(1, 3):
-                zip_file.writestr(f"N{n}W{w}.hgt", hgt)
+                zip_file.writestr(f"N{n:02d}W{w:03d}.hgt", hgt)
     return buffer.getvalue()
 
 

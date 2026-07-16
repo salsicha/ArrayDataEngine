@@ -78,9 +78,9 @@ def fft_filter(data):
     y_size = data.shape[2]
 
     sig = data[-10:, :, :]
-    
+
     rfft = scipy.fftpack.rfft(sig, axis=0)
-    amps = 2.0 / 20.0 * rfft
+    amps = 2.0 / sig.shape[0] * rfft
 
     rfft[0, :, :] = 0
     res = scipy.fftpack.irfft(rfft, axis=0)
@@ -109,10 +109,10 @@ def fft_filter_id(data, stage):
     sig = data[-10:, :, :]
     
     freqs = scipy.fftpack.rfftfreq(sig.shape[0], d=0.1)
-    
+
     rfft = scipy.fftpack.rfft(sig, axis=0)
-    amps = 2.0 / 20.0 * rfft
-    
+    amps = 2.0 / sig.shape[0] * rfft
+
     rfft[0, :, :] = 0
     res = scipy.fftpack.irfft(rfft, axis=0)
     
@@ -134,6 +134,18 @@ def fft_filter_id(data, stage):
     freq_img = max_f.astype(int)
     
     return output_img, freq_img
+
+
+def _paste_patch(canvas, patch, x_0, y_0):
+    """Write patch onto canvas at (x_0, y_0), clipping at the canvas borders."""
+    x_start = max(x_0, 0)
+    y_start = max(y_0, 0)
+    x_stop = min(x_0 + patch.shape[0], canvas.shape[0])
+    y_stop = min(y_0 + patch.shape[1], canvas.shape[1])
+    if x_stop > x_start and y_stop > y_start:
+        canvas[x_start:x_stop, y_start:y_stop] = patch[
+            x_start - x_0:x_stop - x_0, y_start - y_0:y_stop - y_0
+        ]
 
 
 def create_synth_image_moving():
@@ -172,12 +184,12 @@ def create_synth_image_moving():
                 x_ind = int(x[0] * scale + x_off)
                 y_ind = int(x[1] * scale + y_off + i * 16)
                 x_0 = int(x_ind-side/2)
-                x_1 = int(x_ind+side/2)
                 y_0 = int(y_ind-side/2)
-                y_1 = int(y_ind+side/2)
-    
-                synth_img[x_0:x_1, y_0:y_1] = make_beacon()
-    
+
+                # The drift walks beacons off the canvas; clip instead of
+                # letting the broadcast assignment crash.
+                _paste_patch(synth_img, make_beacon(), x_0, y_0)
+
         images.append(synth_img)
         img = cv2.resize(synth_img, (y_size, x_size))
 
@@ -242,11 +254,9 @@ def create_synth_image(t, pose):
             x_ind = int(x[0] * scale + x_off + shift)
             y_ind = int(x[1] * scale + y_off)
             x_0 = int(x_ind-side/2)
-            x_1 = int(x_ind+side/2)
             y_0 = int(y_ind-side/2)
-            y_1 = int(y_ind+side/2)
 
-            synth_img[x_0:x_1, y_0:y_1] = make_beacon()
+            _paste_patch(synth_img, make_beacon(), x_0, y_0)
 
     # cv2 dsize is (width, height); match create_synth_image_moving's (32, 40)
     img = cv2.resize(synth_img, (y_size, x_size))

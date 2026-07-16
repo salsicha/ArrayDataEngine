@@ -139,8 +139,14 @@ class DataBuffer:
         if self._axis not in self.topics:
             raise ValueError(f"Axis: {self._axis} not in topics: {self.topics}")
 
-        for i in range(self._get_preload_count(preload)):
-            self.roll_buffer(self._axis)
+        for _ in range(self._get_preload_count(preload)):
+            try:
+                self.roll_buffer(self._axis)
+            except StopIteration:
+                # Sources with fewer messages than preload should not leak a
+                # bare StopIteration out of the constructor.
+                _logger.info("Data source exhausted during preload")
+                break
 
     def close(self, closed: bool | None = None) -> None:
         buffer_impl = getattr(self, "buffer_impl", None)
@@ -172,6 +178,10 @@ class DataBuffer:
         return self.topics
 
     def get_size(self):
+        """Message count for the current axis: the number of buffered
+        messages on the numpy backend, or the topic's expected total count
+        (equal to buffered messages after a full ingest) on the TileDB
+        backend."""
         return self.msg_len.get(self._axis, 0)
 
     def load_data_db(self, axis: str) -> None:

@@ -19,7 +19,6 @@ class VisTool:
         self.repeat_delay = 1000
         self.animated = True
 
-        self.fig, self.ax = plt.subplots()
         self.images = []
 
 

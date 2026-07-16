@@ -123,8 +123,9 @@ def test_pointcloud_sensor_pads_points_and_rejects_oversized_clouds(monkeypatch)
     msg.header.stamp.nanosec = 500000000
     msg.__class__.__name__ = "PointCloud2"
     xyz = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    # ros2_numpy's real API: pointcloud2_to_xyz_array returns an (N, 3) array
     fake_rnp = SimpleNamespace(
-        point_cloud2=SimpleNamespace(point_cloud2_to_array=lambda msg: {"xyz": xyz})
+        point_cloud2=SimpleNamespace(pointcloud2_to_xyz_array=lambda msg: xyz)
     )
     monkeypatch.setitem(sys.modules, "ros2_numpy", fake_rnp)
 

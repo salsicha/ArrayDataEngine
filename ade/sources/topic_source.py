@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import os
-
 from .base_source import BaseSource
-
-import rclpy
 
 
 class TopicSource(BaseSource):
@@ -20,5 +16,3 @@ class TopicSource(BaseSource):
 
         """
         super().__init__(data_path)
-
-        self.data_path = os.path.dirname(data_path)

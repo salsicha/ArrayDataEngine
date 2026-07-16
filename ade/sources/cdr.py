@@ -205,8 +205,13 @@ def pointcloud_xyz(
 
     byteorder = ">" if is_bigendian else "<"
     # Organized clouds may pad each row; honor row_step when it is larger
-    # than the packed row size, otherwise treat the buffer as dense.
-    padded_rows = height > 1 and row_step > width * point_step
+    # than the packed row size AND the buffer is actually big enough for the
+    # padded layout — some writers lie about row_step but serialize densely.
+    padded_rows = (
+        height > 1
+        and row_step > width * point_step
+        and len(point_bytes) >= (height - 1) * row_step + width * point_step
+    )
     for column, name in enumerate(("x", "y", "z")):
         field = by_name[name]
         dtype = point_field_dtype(int(field["datatype"]), byteorder)

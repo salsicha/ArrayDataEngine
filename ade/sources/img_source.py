@@ -6,6 +6,12 @@ from glob import glob
 
 import cv2
 import os
+import re
+
+
+def _natural_key(path: str):
+    """Sort frame_2 before frame_10 by comparing embedded numbers numerically."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path)]
 
 
 class ImgSource(BaseSource):
@@ -28,7 +34,7 @@ class ImgSource(BaseSource):
         self.file_type = file_type
 
         images = glob(data_path)
-        images.sort()
+        images.sort(key=_natural_key)
 
         self.images = images 
 

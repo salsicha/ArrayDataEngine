@@ -18,13 +18,6 @@ class OdomSensor(BaseSensor):
     """
 
 
-    def __init__(self, rawdata, msgtype):
-        """Constructor
-
-        """
-        super().__init__(rawdata, msgtype)
-
-
     def numpyify(self) -> tuple:
         """
         8 x 4 matrix:

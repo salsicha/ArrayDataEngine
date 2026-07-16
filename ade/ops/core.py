@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -239,6 +240,7 @@ class TopicView:
         copy: bool = True,
         chunk_size: int | None = None,
     ) -> Any:
+        chunk_size = _validated_chunk_size(chunk_size) if chunk_size is not None else None
         iterator = self._iter_rows(chunk_size)
         if initial is None:
             try:
@@ -473,13 +475,20 @@ class TopicPipeline:
                 max_workers=max_workers,
             )
 
-        for message_id, timestamp, value in processed_rows:
-            ids.append(message_id)
-            timestamps.append(timestamp)
-            values.append(value.copy() if copy else value)
-            if len(values) == chunk_size:
+        try:
+            for message_id, timestamp, value in processed_rows:
+                ids.append(message_id)
+                timestamps.append(timestamp)
+                values.append(value.copy() if copy else value)
+                if len(values) == chunk_size:
+                    yield self._make_chunk(ids, timestamps, values, copy=copy)
+                    ids, timestamps, values = [], [], []
+        except PipelineCancelled:
+            # Rows buffered here are already recorded in the checkpoint;
+            # flush them so cancel + resume does not silently lose them.
+            if values:
                 yield self._make_chunk(ids, timestamps, values, copy=copy)
-                ids, timestamps, values = [], [], []
+            raise
 
         if values:
             yield self._make_chunk(ids, timestamps, values, copy=copy)
@@ -495,6 +504,12 @@ class TopicPipeline:
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
     ) -> Any:
+        if _checkpoint_processed(checkpoint) > 0:
+            raise ValueError(
+                "reduce cannot resume from a checkpoint: the accumulator state "
+                "is not persisted, so the result would be silently wrong. "
+                "Restart with a fresh checkpoint or use collect()/iter_rows()."
+            )
         iterator = self._iter_processed_rows(
             chunk_size=chunk_size,
             copy=copy,
@@ -537,6 +552,7 @@ class TopicPipeline:
     ) -> dict:
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
+        chunk_lengths = []
         ts_parts = []
         data_parts = []
         output = None if out is None else np.asarray(out)
@@ -556,8 +572,8 @@ class TopicPipeline:
             collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
             _check_collect_limits(offset, collected_bytes, max_rows, max_bytes, allow_large)
 
-            if chunk.ids is not None:
-                ids_parts.append(chunk.ids.copy() if copy else chunk.ids)
+            chunk_lengths.append(len(chunk))
+            ids_parts.append(None if chunk.ids is None else (chunk.ids.copy() if copy else chunk.ids))
             ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
             if output is None:
                 data_parts.append(chunk.data.copy() if copy else chunk.data)
@@ -566,7 +582,7 @@ class TopicPipeline:
                     raise ValueError("out is too small for collected pipeline output")
                 output[offset - len(chunk):offset] = chunk.data
 
-        ids = np.concatenate(ids_parts) if ids_parts else None
+        ids = _concat_chunk_ids(ids_parts, chunk_lengths)
         timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
         if output is None:
             if data_parts:
@@ -796,6 +812,26 @@ class TopicPipeline:
                 result = future.result()
                 next_yield += 1
 
+                # Check cancellation with the pre-chunk progress and advance
+                # the checkpoint only after this chunk's rows were delivered;
+                # otherwise cancel/resume permanently drops undelivered rows.
+                pre_progress = PipelineProgress(
+                    processed=processed,
+                    emitted=emitted,
+                    skipped=skipped,
+                    topic=self.metadata.topic,
+                    checkpoint=_checkpoint_snapshot(checkpoint),
+                )
+                _raise_if_cancelled(
+                    cancel_token,
+                    checkpoint,
+                    pre_progress,
+                    operation_counters=operation_counters,
+                )
+
+                for row in result.rows:
+                    yield row
+
                 processed += result.processed
                 emitted += result.emitted
                 skipped += result.skipped
@@ -810,15 +846,6 @@ class TopicPipeline:
                 )
                 _update_checkpoint(checkpoint, last_progress, operation_counters=operation_counters)
                 _notify_progress(progress_callback, last_progress, progress_interval)
-                _raise_if_cancelled(
-                    cancel_token,
-                    checkpoint,
-                    last_progress,
-                    operation_counters=operation_counters,
-                )
-
-                for row in result.rows:
-                    yield row
 
                 submit_ready(executor, source_iter)
 
@@ -904,6 +931,13 @@ class TopicWindowPipeline:
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
     ) -> Iterable[TopicView]:
+        if _checkpoint_processed(checkpoint) > 0:
+            raise ValueError(
+                "window pipelines cannot resume from a checkpoint: the rolling "
+                "window state is not persisted, so resumed windows would "
+                "silently differ from an uninterrupted run. Restart with a "
+                "fresh checkpoint."
+            )
         ids = deque()
         timestamps = deque()
         values = deque()
@@ -1021,6 +1055,8 @@ class DatasetQuery:
         for topic, pipeline in self._pipelines.items():
             metadata_frame_id = pipeline.metadata.frame_id
             if metadata_frame_id is not None:
+                # Selection semantics (pinned by tests): topics whose known
+                # frame does not match are dropped from the dataset entirely.
                 if _decode_text(metadata_frame_id) in targets:
                     selected[topic] = pipeline
                 continue
@@ -1130,6 +1166,7 @@ class DatasetQuery:
 
         for topic, pipeline in self._pipelines.items():
             ids_parts = []
+            chunk_lengths = []
             ts_parts = []
             data_parts = []
             for chunk in pipeline.iter_chunks(chunk_size=chunk_size, copy=copy, max_workers=max_workers):
@@ -1137,12 +1174,12 @@ class DatasetQuery:
                 total_bytes += _topic_view_nbytes(chunk)
                 _check_collect_limits(total_rows, total_bytes, max_rows, max_bytes, allow_large)
 
-                if chunk.ids is not None:
-                    ids_parts.append(chunk.ids.copy() if copy else chunk.ids)
+                chunk_lengths.append(len(chunk))
+                ids_parts.append(None if chunk.ids is None else (chunk.ids.copy() if copy else chunk.ids))
                 ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
                 data_parts.append(chunk.data.copy() if copy else chunk.data)
 
-            ids = np.concatenate(ids_parts) if ids_parts else None
+            ids = _concat_chunk_ids(ids_parts, chunk_lengths)
             timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
             if data_parts:
                 data = np.concatenate(data_parts, axis=0)
@@ -2305,6 +2342,27 @@ def _slice_contains(index: int, start: int | None, stop: int | None, step: int |
     return (index - start) % step == 0
 
 
+def _callable_code(fn: Callable):
+    """The code object of fn's Python body, unwrapping partials and wrappers."""
+
+    seen = set()
+    while id(fn) not in seen:
+        seen.add(id(fn))
+        if isinstance(fn, functools.partial):
+            fn = fn.func
+            continue
+        wrapped = getattr(fn, "__wrapped__", None)
+        if wrapped is not None:
+            fn = wrapped
+            continue
+        break
+    code = getattr(getattr(fn, "__func__", fn), "__code__", None)
+    if code is None:
+        call = getattr(fn, "__call__", None)
+        code = getattr(getattr(call, "__func__", call), "__code__", None)
+    return code
+
+
 def _type_error_from_inside(exc: TypeError, fn: Callable) -> bool:
     """True when the TypeError was raised inside fn's own body (its frame ran).
 
@@ -2312,10 +2370,7 @@ def _type_error_from_inside(exc: TypeError, fn: Callable) -> bool:
     re-invoking a function that already executed masks the user's real error
     and can duplicate side effects."""
 
-    code = getattr(getattr(fn, "__func__", fn), "__code__", None)
-    if code is None:
-        call = getattr(fn, "__call__", None)
-        code = getattr(getattr(call, "__func__", call), "__code__", None)
+    code = _callable_code(fn)
     if code is None:
         return False
     traceback = exc.__traceback__
@@ -2324,6 +2379,18 @@ def _type_error_from_inside(exc: TypeError, fn: Callable) -> bool:
             return True
         traceback = traceback.tb_next
     return False
+
+
+def _concat_chunk_ids(ids_parts: list, chunk_lengths: list[int]):
+    """Concatenate per-chunk id arrays, backfilling id-less chunks with None
+    entries when any sibling chunk carries ids; None when no chunk does."""
+
+    if not ids_parts or all(part is None for part in ids_parts):
+        return None
+    return np.concatenate([
+        part if part is not None else np.full(length, None, dtype=object)
+        for part, length in zip(ids_parts, chunk_lengths)
+    ])
 
 
 def _call_with_metadata(fn: Callable, data: np.ndarray, ts: float, message_id: Any) -> Any:

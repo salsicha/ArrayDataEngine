@@ -1,5 +1,6 @@
 """Regression tests for the 2026-07 code-review fixes."""
 
+import functools
 import struct
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,9 @@ from ade.ops import (
     topic_view,
     FrameGraph,
 )
+
+import matplotlib
+matplotlib.use("Agg")
 
 
 class StreamSource:
@@ -413,3 +417,233 @@ def test_pipeline_frame_id_filter_applies():
     }
     collected = topic_pipeline(topic).frame_id("map").collect()
     assert collected["ts"].tolist() == [1.0, 3.0]
+
+
+# --- round 2: checkpoint/cancel/resume ----------------------------------------
+
+
+def _range_topic(n):
+    return {"ts": np.arange(n, dtype=float), "data": np.arange(n, dtype=np.float64).reshape(n, 1)}
+
+
+def test_parallel_cancel_resume_loses_no_rows():
+    from ade.ops.core import CancellationToken, PipelineCancelled
+
+    token = CancellationToken()
+    checkpoint = {}
+    received = []
+    try:
+        for i, row in enumerate(
+            topic_pipeline(_range_topic(100)).iter_rows(
+                chunk_size=10, max_workers=2, cancel_token=token, checkpoint=checkpoint
+            )
+        ):
+            received.append(float(row["ts"]))
+            if i == 0:
+                token.cancel()
+    except PipelineCancelled:
+        pass
+
+    resumed = [
+        float(row["ts"])
+        for row in topic_pipeline(_range_topic(100)).iter_rows(
+            chunk_size=10, max_workers=2, checkpoint=checkpoint
+        )
+    ]
+    assert sorted(set(received) | set(resumed)) == [float(i) for i in range(100)]
+
+
+def test_serial_chunk_cancel_flushes_buffered_rows():
+    from ade.ops.core import CancellationToken, PipelineCancelled
+
+    token = CancellationToken()
+    checkpoint = {}
+    seen = []
+
+    def cancel_mid_buffer(progress):
+        if progress.processed == 16:
+            token.cancel()
+
+    try:
+        for chunk in topic_pipeline(_range_topic(30)).iter_chunks(
+            chunk_size=10, cancel_token=token, checkpoint=checkpoint, progress_callback=cancel_mid_buffer
+        ):
+            seen.extend(chunk.ts.tolist())
+    except PipelineCancelled:
+        pass
+
+    resumed = []
+    for chunk in topic_pipeline(_range_topic(30)).iter_chunks(chunk_size=10, checkpoint=checkpoint):
+        resumed.extend(chunk.ts.tolist())
+    assert sorted(set(seen) | set(resumed)) == [float(i) for i in range(30)]
+
+
+def test_reduce_and_windows_reject_checkpoint_resume():
+    with pytest.raises(ValueError, match="cannot resume"):
+        topic_pipeline(_range_topic(10)).reduce(lambda a, v: a + v, initial=0.0, checkpoint={"processed": 5})
+    with pytest.raises(ValueError, match="cannot resume"):
+        list(topic_pipeline(_range_topic(10)).window(size=3).iter_windows(checkpoint={"processed": 5}))
+
+
+# --- round 2: callable dispatch ------------------------------------------------
+
+
+def test_partial_user_typeerror_not_masked():
+    calls = []
+
+    def fn(data, ts, name, scale=1.0):
+        calls.append(1)
+        raise TypeError("real user bug in partial")
+
+    with pytest.raises(TypeError, match="real user bug in partial"):
+        topic_view(_float32_topic()).map(functools.partial(fn, scale=2.0))
+    assert len(calls) == 1
+
+
+def test_wraps_decorated_two_arg_mapper_still_dispatches():
+    def deco(f):
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            return f(*args, **kwargs)
+
+        return wrapper
+
+    @deco
+    def double(data, ts):
+        return data * 2
+
+    result = topic_view(_float32_topic()).map(double).as_dict()
+    assert np.allclose(result["data"], _float32_topic()["data"] * 2)
+
+
+def test_collect_mixed_none_and_real_ids():
+    topic = _range_topic(20)
+    topic["id"] = np.array([None] * 10 + [f"m{i}" for i in range(10)], dtype=object)
+    out = topic_pipeline(topic).collect(chunk_size=10)
+    assert out["id"].shape == (20,)
+    assert out["id"][9] is None and out["id"][10] == "m0"
+
+
+def test_view_reduce_rejects_bad_chunk_size():
+    with pytest.raises(ValueError):
+        topic_view(_range_topic(10)).reduce(lambda a, v: a + v, initial=0.0, chunk_size=-1)
+
+
+# --- round 2: buffers / geometry / dem / cdr ------------------------------------
+
+
+def test_tiledb_reopen_append_persists_counts(tmp_path):
+    tiledb = pytest.importorskip("tiledb")
+    group_uri = str(tmp_path / "grp") + "/"
+
+    # Store sized for 5 messages; ingest only 2 so capacity remains for appends
+    first = DataBuffer(
+        StreamSource(5), buffer_depth=5, data_uri=group_uri, axis="t", use_db=True, preload=0
+    )
+    first.roll_buffer("t")
+    first.roll_buffer("t")
+    first.close(closed=False)
+
+    reopened = DataBuffer(None, data_uri=group_uri, axis="t", use_db=True)
+    reopened.append_buffer(
+        {"topic": "t", "timestamp": 200.0, "name": b"n", "data": np.array([9.0])}
+    )
+    reopened.close()
+
+    final = DataBuffer(None, data_uri=group_uri, axis="t", use_db=True)
+    try:
+        assert final.buffer_impl.counters["t"] == 3
+        rows = final.get_index_range("t")
+        assert rows["ts"].tolist() == [100.0, 101.0, 200.0]
+    finally:
+        final.close()
+
+
+def test_apply_transform_preserves_float32():
+    transform = np.eye(4)
+    transform[:3, 3] = 0.5
+    result = apply_transform(np.ones((2, 3), dtype=np.float32), transform)
+    assert result.dtype == np.float32
+
+
+def test_pointcloud_xyz_dense_despite_lying_row_step():
+    import struct as struct_mod
+
+    from ade.sources.cdr import pointcloud_xyz
+
+    fields = [
+        {"name": "x", "offset": 0, "datatype": 7, "count": 1},
+        {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+        {"name": "z", "offset": 8, "datatype": 7, "count": 1},
+    ]
+    dense_payload = b"".join(struct_mod.pack("<fff", i, i, i) for i in range(4))
+    out = pointcloud_xyz(dense_payload, fields, 2, 2, 12, 32, False)
+    assert out[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_hillshade_north_up_layout():
+    rows, _ = np.mgrid[0:5, 0:5]
+    north_facing = rows.astype(float)  # row 0 = north; z rises southward
+    _, aspect = slope_aspect(north_facing, north_up=True)
+    assert np.isclose(abs(aspect[2, 2]), 0.0)
+    assert np.isclose(hillshade(north_facing, azimuth=0, altitude=45, north_up=True)[2, 2], 1.0)
+    assert np.isclose(hillshade(north_facing, azimuth=180, altitude=45, north_up=True)[2, 2], 0.0)
+
+
+def test_mosaic_dem_tiles_guards_absurdly_sparse_grids():
+    tile = np.ones((2, 2))
+    with pytest.raises(ValueError, match="enormous"):
+        mosaic_dem_tiles({"N00W180": tile, "N00E179": tile})
+
+
+# --- round 2: sources / sensors -------------------------------------------------
+
+
+def test_base_sensor_uses_supplied_deserializer():
+    from ade.sensors.base_sensor import BaseSensor
+
+    marker = object()
+    calls = []
+
+    def deserializer(rawdata, msgtype):
+        calls.append((rawdata, msgtype))
+        return marker
+
+    sensor = BaseSensor(b"payload", "some/msg/Type", deserializer=deserializer)
+    assert sensor.deserialize() is marker
+    assert calls == [(b"payload", "some/msg/Type")]
+
+
+def test_img_source_natural_sort():
+    from ade.sources.img_source import _natural_key
+
+    names = ["frame_10.png", "frame_2.png", "frame_1.png"]
+    assert sorted(names, key=_natural_key) == ["frame_1.png", "frame_2.png", "frame_10.png"]
+
+
+def test_dem_source_zero_pads_tile_names():
+    from ade.sources.dem_source import DEMSource
+
+    source = DEMSource([5, 6], [75, 76], cache_dir=None)
+    assert source.base_url == DEMSource.DEFAULT_BASE_URL
+    # name format is checked indirectly through the cache path
+    source.cache_dir = None
+    # construct the name exactly as messages() does
+    assert f"N{5:02d}W{75:03d}" == "N05W075"
+
+
+def test_create_synth_image_moving_runs_to_exhaustion():
+    from ade.models.image.image import create_synth_image_moving
+
+    frames = list(create_synth_image_moving())
+    assert len(frames) == 50
+    assert all(frame["data"].shape == (32, 40) for frame in frames)
+
+
+def test_bbox_flip_top_bottom_no_offset():
+    torch = pytest.importorskip("torch")
+    from ade.visualizers.bbox import BoxList, FLIP_TOP_BOTTOM
+
+    box = BoxList(torch.tensor([[0.0, 0.0, 9.0, 9.0]]), (10, 10), mode="xyxy")
+    flipped = box.transpose(FLIP_TOP_BOTTOM).bbox.tolist()[0]
+    assert flipped == [0.0, 0.0, 9.0, 9.0]

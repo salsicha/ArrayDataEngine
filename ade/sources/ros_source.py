@@ -12,21 +12,27 @@ class RosSource(BaseSource):
 
     SENSOR_TYPES = {}
 
-    def _sensor_for(self, connection, rawdata):
+    def _sensor_for(self, connection, rawdata, deserializer=None):
         type_name = connection.msgtype.rsplit("/", 1)[1].lower()
         sensor_cls = self.SENSOR_TYPES.get(type_name)
         if sensor_cls is None:
             if self._debug:
                 _logger.debug("Message type not supported: %s", type_name)
             return None
-        return sensor_cls(rawdata, connection.msgtype)
+        if deserializer is None:
+            return sensor_cls(rawdata, connection.msgtype)
+        return sensor_cls(rawdata, connection.msgtype, deserializer=deserializer)
 
     def messages(self):
         """Yield NumPy-oriented messages from a ROS source."""
 
         with self.reader() as reader:
+            # AnyReader.deserialize knows whether payloads are ROS1- or
+            # CDR-serialized; without it ROS1 .bag payloads would be
+            # mis-parsed as CDR.
+            deserializer = getattr(reader, "deserialize", None)
             for connection, timestamp, rawdata in reader.messages():
-                sensor = self._sensor_for(connection, rawdata)
+                sensor = self._sensor_for(connection, rawdata, deserializer=deserializer)
                 if sensor is None:
                     continue
 

@@ -44,6 +44,22 @@ class DB3Source(RosSource):
             self.data_path = os.path.dirname(data_path) or "."
 
     def messages(self):
+        if self._standalone_db3_input():
+            # Mirror _metadata(): the sqlite reader sees exactly the requested
+            # chunk, while rosbags would open the surrounding directory and
+            # could silently stream a different bag's messages.
+            iterator = self._sqlite_messages()
+            try:
+                first = next(iterator)
+            except StopIteration:
+                return
+            except sqlite3.Error:
+                pass  # not actually sqlite; fall through to rosbags
+            else:
+                yield first
+                yield from iterator
+                return
+
         try:
             iterator = super().messages()
             first = next(iterator)
@@ -52,11 +68,6 @@ class DB3Source(RosSource):
                 raise
         except StopIteration:
             return
-        except Exception:
-            # rosbags cannot open standalone .db3 chunks that lack a
-            # metadata.yaml; only those may fall back to the raw sqlite reader.
-            if not self._standalone_db3_input():
-                raise
         else:
             yield first
             yield from iterator

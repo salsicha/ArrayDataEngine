@@ -2,17 +2,14 @@ import cv2
 import numpy as np
 from matplotlib import cm
 
-from .bbox import BoxList
-
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LogNorm
 
-from IPython.display import display, Image, HTML
-import tkinter as Tk
-
 from PIL import Image as PILImage
+
+# BoxList (torch) and IPython.display are imported lazily so the visualizer
+# stays usable without the full ML/notebook stack.
 
 
 class VisTool:
@@ -56,6 +53,12 @@ class VisTool:
         self.images.append([im])
 
 
+    def update(self, frame, *args, **kwargs):
+        # The Visualizer facade delegates update(); collect frames for the
+        # animation shown by show_animation().
+        self.append_img(frame)
+
+
     def show(self, image):
         if type(image) == np.ndarray:
             plt.imshow(image, interpolation='nearest')
@@ -68,6 +71,8 @@ class VisTool:
 
     def _show_animation_embed(self):
         ## Notebook embedded, called from library:
+        from IPython.display import display, Image
+
         ani = animation.ArtistAnimation(self.fig, self.images, interval=self.interval, blit=self.blit, repeat_delay=self.repeat_delay)
         ani.save('filename.gif', writer='ffmpeg')
         plt.close(ani._fig)
@@ -77,9 +82,12 @@ class VisTool:
 
     def _show_animation_native(self):
         ## Pop out:
-        ani = animation.ArtistAnimation(self.fig, self.images, interval=self.interval, blit=self.blit, repeat_delay=self.repeat_delay)
-        ani
-        Tk.mainloop()
+        # Keep a reference so the animation is not garbage-collected, and
+        # show the figure — the animation only starts on its first draw.
+        self._animation = animation.ArtistAnimation(
+            self.fig, self.images, interval=self.interval, blit=self.blit, repeat_delay=self.repeat_delay
+        )
+        plt.show()
 
 
     @staticmethod
@@ -100,7 +108,7 @@ class VisTool:
         return colors
 
 
-    def normalize_output(self, frame, results: BoxList):
+    def normalize_output(self, frame, results: "BoxList"):
         if self._vis_height is not None:
             boxlist_height = results.size[1]
             frame_height, frame_width = frame.shape[:2]
@@ -116,7 +124,9 @@ class VisTool:
         return frame, results
 
 
-    def frame_vis_generator(self, frame, results: BoxList = None):
+    def frame_vis_generator(self, frame, results: "BoxList" = None):
+        if results is None:
+            return frame
         frame, results = self.normalize_output(frame, results)
         ids = results.get_field('ids')
         results = results[ids >= 0]
@@ -127,7 +137,11 @@ class VisTool:
 
         for i, entity_id in enumerate(ids):
             color = self.colors[entity_id % self.num_colors]
-            class_name = self.class_names[labels[i] - 1]
+            label = labels[i]
+            if 0 < label <= len(self.class_names):
+                class_name = self.class_names[label - 1]
+            else:
+                class_name = f"class_{label}"
             text_width = len(class_name) * 20
             x1, y1, x2, y2 = (np.round(bbox[i, :])).astype(int)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=3)

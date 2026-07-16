@@ -19,11 +19,11 @@ class PointCloudSensor(BaseSensor):
 
     DEFAULT_MAX_POINTS = 30000
 
-    def __init__(self, rawdata, msgtype, max_points: int | None = None):
+    def __init__(self, rawdata, msgtype, max_points: int | None = None, deserializer=None):
         """Constructor
 
         """
-        super().__init__(rawdata, msgtype)
+        super().__init__(rawdata, msgtype, deserializer=deserializer)
 
         # PointCloud2 message has variable length due to sensor dropping some points
         # The max number of points in a scan for the vlp-16 should be 30000
@@ -34,7 +34,9 @@ class PointCloudSensor(BaseSensor):
 
         msg = self.deserialize()
         self._capture_header_metadata(msg)
-        pc_2_np = rnp.point_cloud2.point_cloud2_to_array(msg)["xyz"]
+        # ros2_numpy names this pointcloud2_to_xyz_array; it returns an (N, 3)
+        # float array (there is no point_cloud2_to_array / "xyz"-keyed dict).
+        pc_2_np = rnp.point_cloud2.pointcloud2_to_xyz_array(msg)
         if pc_2_np.shape[0] > self.max_points:
             raise ValueError(
                 f"PointCloud2 has {pc_2_np.shape[0]} points, which exceeds max_points={self.max_points}"

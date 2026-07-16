@@ -18,13 +18,6 @@ class NavSensor(BaseSensor):
     """
 
 
-    def __init__(self, rawdata, msgtype):
-        """Constructor
-
-        """
-        super().__init__(rawdata, msgtype)
-
-
     def numpyify(self) -> tuple:
         msg = self.deserialize()
         self._capture_header_metadata(msg)

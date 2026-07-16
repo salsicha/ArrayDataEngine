@@ -177,9 +177,13 @@ def _transform_xyz(xyz: np.ndarray, transform: np.ndarray) -> np.ndarray:
 def apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply a 3x3, 3x4, or 4x4 transform to point XYZ columns."""
 
-    arr = np.asarray(_as_points(points), dtype=np.float64)
-    xyz = _transform_xyz(arr[:, :3], transform)
+    arr = _as_points(points)
+    if not np.issubdtype(arr.dtype, np.floating):
+        # Integer inputs would silently truncate the transformed coordinates;
+        # floating inputs keep their dtype (e.g. float32 lidar clouds).
+        arr = arr.astype(np.float64)
 
+    xyz = _transform_xyz(arr[:, :3], transform)
     result = arr.copy()
     result[:, :3] = xyz
     return result
