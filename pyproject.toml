@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arraydataengine"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
   { name="Alex Moran", email="salsicha@gmail.com" },
 ]
@@ -81,6 +81,9 @@ visualization = [
     "open3d",
     "Pillow",
 ]
+
+[project.scripts]
+ade = "ade.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/salsicha/ArrayDataEngine"

@@ -67,12 +67,114 @@ class CDRReader:
 
 
 def decode_supported_cdr_message(rawdata: bytes, msgtype: str) -> DecodedMessage | None:
+    # Bags recorded through rosbridge/foxglove can carry JSON envelopes
+    # instead of CDR; route those to the JSON decoder.
+    if rawdata[:1] in (b"{", b" ") and _looks_like_json(rawdata):
+        return decode_rosbridge_json_message(rawdata, msgtype)
     if msgtype == "geometry_msgs/msg/PoseStamped":
         return decode_pose_stamped(rawdata)
     if msgtype == "sensor_msgs/msg/PointCloud2":
         return decode_pointcloud2(rawdata)
     if msgtype == "mapeverything_msgs/msg/DepthAnythingCalibration":
         return decode_depth_anything_calibration(rawdata)
+    return None
+
+
+def _looks_like_json(rawdata: bytes) -> bool:
+    stripped = rawdata.lstrip()
+    return stripped.startswith(b"{") and stripped.rstrip().endswith(b"}")
+
+
+def decode_rosbridge_json_message(rawdata: bytes, msgtype: str) -> DecodedMessage | None:
+    """Decode a rosbridge-style JSON envelope ({"op": "publish", "msg": ...})."""
+
+    import json
+
+    try:
+        envelope = json.loads(rawdata.decode(errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    msg = envelope.get("msg", envelope)
+    if not isinstance(msg, dict):
+        return None
+
+    header = msg.get("header", {})
+    stamp = header.get("stamp", {})
+    timestamp = float(stamp.get("sec", 0)) + float(stamp.get("nanosec", stamp.get("nsec", 0))) * 1e-9
+    frame_id = header.get("frame_id")
+
+    if msgtype == "geometry_msgs/msg/PoseStamped":
+        pose = msg.get("pose", {})
+        position = pose.get("position", {})
+        orientation = pose.get("orientation", {})
+        values = np.array(
+            [
+                float(position.get("x", 0.0)),
+                float(position.get("y", 0.0)),
+                float(position.get("z", 0.0)),
+                float(orientation.get("x", 0.0)),
+                float(orientation.get("y", 0.0)),
+                float(orientation.get("z", 0.0)),
+                float(orientation.get("w", 1.0)),
+            ],
+            dtype=np.float64,
+        )
+        return DecodedMessage(values, "PoseStamped", timestamp, frame_id)
+
+    if msgtype == "sensor_msgs/msg/NavSatFix":
+        values = np.array(
+            [
+                float(msg.get("latitude", 0.0)),
+                float(msg.get("longitude", 0.0)),
+                float(msg.get("altitude", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+        return DecodedMessage(values, "NavSatFix", timestamp, frame_id)
+
+    if msgtype == "sensor_msgs/msg/PointCloud2":
+        import base64
+
+        data_field = msg.get("data", "")
+        if isinstance(data_field, str):
+            point_bytes = base64.b64decode(data_field)
+        else:
+            point_bytes = bytes(data_field)
+        fields = [dict(field) for field in msg.get("fields", [])]
+        points = pointcloud_xyz(
+            point_bytes,
+            fields,
+            int(msg.get("height", 0)),
+            int(msg.get("width", 0)),
+            int(msg.get("point_step", 0)),
+            int(msg.get("row_step", 0)),
+            bool(msg.get("is_bigendian", False)),
+        )
+        return DecodedMessage(points, "PointCloud2", timestamp, frame_id)
+
+    if msgtype == "mapeverything_msgs/msg/DepthAnythingCalibration":
+        scale = float(msg.get("scale", 0.0))
+        offset = float(msg.get("offset", 0.0))
+        values = np.array(
+            [
+                scale,
+                offset,
+                float(msg.get("relative_depth_width", 0.0)),
+                float(msg.get("relative_depth_height", 0.0)),
+                float(msg.get("image_width", 0.0)),
+                float(msg.get("image_height", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+        extra_keys = (
+            "schema_version", "source", "relative_pointcloud_topic", "overlay_mesh_source",
+            "frame_id", "relative_depth_width", "relative_depth_height", "image_width",
+            "image_height", "scale", "offset", "equation", "relative_depth_units",
+            "metric_depth_units", "calibration_source", "metadata_json",
+        )
+        extra = {key: msg[key] for key in extra_keys if key in msg}
+        return DecodedMessage(values, "DepthAnythingCalibration", timestamp, frame_id, extra)
+
     return None
 
 

@@ -16,7 +16,11 @@ The project is aimed at robotics and perception workflows where algorithms need 
 ## Features
 
 - NumPy-oriented message dictionaries with `data`, `timestamp`, `topic`, and `name` fields.
-- Source adapters for image folders, `.bag`, `.db3`, split rosbag2 directories, and DEM data.
+- Source adapters for image folders, `.bag`, `.db3`, `.mcap`, split rosbag2 directories, and DEM data — including bags recorded through rosbridge/foxglove with JSON payloads.
+- `ade` command-line interface: inspect, export, ingest, and visualize bags without writing code.
+- Synthetic data source with a geometrically consistent trajectory for demos and tests — no data files needed.
+- Topic statistics (`describe_topic`/`describe_dataset`) and portable `.npz` topic round-trips.
+- TUM and KITTI trajectory export (compatible with `evo` and SLAM evaluation tooling).
 - Cached ROS topic metadata, so repeated topic and count lookups do not reopen the same bag.
 - Rolling in-memory buffers for recent context windows.
 - Optional TileDB-backed storage for datasets larger than memory, with timestamps stored in queryable sidecar arrays.
@@ -55,14 +59,33 @@ python -m pip install -e ".[visualization]"
 
 The full Docker/notebook environment still uses `requirements.txt`, which includes the heavier ROS, ML, notebook, and visualization dependencies.
 
+## Command line
+
+Installing the package also installs the `ade` command:
+
+```bash
+ade demo -o demo/                 # end-to-end synthetic showcase, no data needed:
+                                  # stitched point-cloud map (HTML), TUM trajectory, NPZ export
+ade info my_bag.db3 --messages 500   # topics, counts, duration, rates, jitter
+ade topics my_bag.db3
+ade export my_bag.db3 -t /points -o points.npz
+ade viewer my_bag.db3 -t /points -o viewer.html --stride 5
+ade ingest my_bag.db3 -o /tmp/tiledb/my_bag/   # persist every topic to TileDB
+```
+
+`ade viewer` and `ade demo` write self-contained HTML files that render in any
+browser with no extra dependencies. Exported `.npz` files load back with
+`ade.ops.load_topic_npz` and plug straight into the ops pipelines.
+
 ## Supported Sources
 
 | Input | Adapter | Topic(s) | Notes |
 | --- | --- | --- | --- |
-| `*.png`, `*.jpg`, `*.jpeg`, `*.tiff` | `ImgSource` | `images` | Reads sorted image paths from a glob. |
-| `.bag` | `BagSource` | Bag topics | Supports image and point cloud messages today. |
-| `.db3` file or rosbag2 directory | `DB3Source` | Bag topics | Supports single and split ROS 2 bags with image, point cloud, IMU, odometry, and navsat messages. |
+| `*.png`, `*.jpg`, `*.jpeg`, `*.tiff` | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob. |
+| `.bag` | `BagSource` | Bag topics | ROS1 bags with image, point cloud, IMU, odometry, navsat, and pose messages. |
+| `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, point cloud, IMU, odometry, and navsat messages; also decodes rosbridge/foxglove JSON payloads. |
 | `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles using Earthdata credentials. |
+| `SyntheticSource` | (import directly) | configurable | Deterministic synthetic IMU/odometry/point-cloud/navsat/image streams on a circular trajectory. |
 
 Each yielded message has this shape:
 

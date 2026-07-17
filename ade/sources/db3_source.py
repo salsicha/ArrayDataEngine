@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
+import struct
 from contextlib import closing
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 from .ros_source import RosSource
 from ..sensors.pointcloud2_sensor import PointCloudSensor
 from ..sensors.image_sensor import ImageSensor
@@ -90,7 +94,15 @@ class DB3Source(RosSource):
                     """
                 )
                 for fallback_timestamp, topic, msgtype, rawdata in rows:
-                    decoded = decode_supported_cdr_message(bytes(rawdata), str(msgtype))
+                    try:
+                        decoded = decode_supported_cdr_message(bytes(rawdata), str(msgtype))
+                    except (struct.error, ValueError) as exc:
+                        # A malformed payload should not make the whole bag
+                        # unreadable; skip the row and keep streaming.
+                        _logger.warning(
+                            "Skipping undecodable %s message on %s: %s", msgtype, topic, exc
+                        )
+                        continue
                     if decoded is None:
                         continue
                     timestamp = decoded.timestamp
@@ -211,7 +223,7 @@ class DB3Source(RosSource):
         paths = []
         for raw_line in metadata_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
-            if not line.startswith("- ") or ".db3" not in line:
+            if not line.startswith("- ") or (".db3" not in line and ".mcap" not in line):
                 continue
             value = line[2:].strip()
             if value.startswith("'") and value.endswith("'"):
@@ -229,4 +241,4 @@ class DB3Source(RosSource):
         if os.path.exists(os.path.join(self.data_path, "metadata.yaml")):
             return True
 
-        return any(name.lower().endswith(".db3") for name in os.listdir(self.data_path))
+        return any(name.lower().endswith((".db3", ".mcap")) for name in os.listdir(self.data_path))

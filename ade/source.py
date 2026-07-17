@@ -39,7 +39,7 @@ class DataSources:
             from .sources.bag_source import BagSource
 
             self.source = BagSource(data_path)
-        elif self.file_type == ".db3" or self._is_rosbag2_dir(data_path):
+        elif self.file_type in (".db3", ".mcap") or self._is_rosbag2_dir(data_path):
             from .sources.db3_source import DB3Source
 
             self.source = DB3Source(data_path)
@@ -59,7 +59,8 @@ class DataSources:
             )
         else:
             raise ValueError(
-                f"{self.file_type} is not supported file type: [.bag, .db3, rosbag2 directory, .png, .jpg, .jpeg, .tiff]"
+                f"{self.file_type} is not supported file type: "
+                "[.bag, .db3, .mcap, rosbag2 directory, .png, .jpg, .jpeg, .tiff]"
             )
 
         if not self.source.data_exists():
@@ -85,7 +86,7 @@ class DataSources:
         if os.path.exists(os.path.join(data_path, "metadata.yaml")):
             return True
 
-        return any(name.lower().endswith(".db3") for name in os.listdir(data_path))
+        return any(name.lower().endswith((".db3", ".mcap")) for name in os.listdir(data_path))
 
 
     def get_topics(self):
