@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 
 from ade.buffer import DataBuffer
 from ade.ops import (
@@ -451,3 +452,32 @@ def test_benchmark_tiledb_topic_pipeline_time_range(tmp_path):
 
     assert count == 100
     _print_benchmark("TileDB.TopicPipeline.time_range", count, elapsed)
+
+
+def test_benchmark_arrow_topic_pipeline_time_range(tmp_path):
+    pytest.importorskip("pyarrow")
+    group_uri = str(tmp_path / "arrow_pipeline_benchmark_group")
+    with DataBuffer(
+        data_source=_PipelineSource(TILEDB_PIPELINE_MESSAGE_COUNT),
+        buffer_depth=TILEDB_PIPELINE_MESSAGE_COUNT,
+        data_uri=group_uri,
+        axis="sensor_topic",
+        use_db=True,
+        backend="arrow",
+        preload=0,
+    ) as buffer:
+        buffer.load_data_db("sensor_topic")
+
+        pipeline = (
+            buffer.topic("sensor_topic")
+            .time_range(0.5, 1.49)
+            .map(lambda data: data + 1.0)
+        )
+
+        def process_all():
+            return sum(len(chunk) for chunk in pipeline.iter_chunks(chunk_size=32))
+
+        elapsed, count = _time_best(process_all)
+
+    assert count == 100
+    _print_benchmark("Arrow.TopicPipeline.time_range", count, elapsed)

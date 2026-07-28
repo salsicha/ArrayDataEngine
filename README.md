@@ -659,28 +659,45 @@ cached_elevation, metadata = read_dem_cache("/tmp/ade-dem-cache", tile["name"], 
 
 ## Benchmarks
 
-Run the source adapter, synthetic operation, lazy pipeline, and TileDB benchmarks with:
+Run the source adapter, synthetic operation, lazy pipeline, and storage backend benchmarks with:
 
 ```bash
 python -m pytest tests/test_source_benchmarks.py -q -s
 ```
 
-Results below were measured on 2026-06-21 with Python 3.14.5 on arm64. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so those rows measure adapter overhead without requiring ROS bag files or Earthdata access.
+Results below were measured on 2026-07-28 with Python 3.14 on arm64 (Apple Silicon), NumPy 2.4.6, pyarrow 25.0.0, tiledb 0.36.1. Each result is the best of three runs. Bag, DB3, and DEM use mocked readers/network responses, so those rows measure adapter overhead without requiring ROS bag files or Earthdata access.
 
 | Benchmark | Workload | Items | Elapsed | Throughput | Latency |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.006395s | 31,274 items/s | 32.0 us/item |
-| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000125s | 1,600,000 items/s | 0.6 us/item |
-| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000124s | 1,609,657 items/s | 0.6 us/item |
-| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000048s | 82,616 items/s | 12.1 us/item |
-| `ImageOps.synthetic` | resize, normalize, and grayscale 96x96 RGB image frames | 64 | 0.001120s | 57,153 frames/s | 17.5 us/frame |
-| `PointCloudOps.synthetic` | voxel downsample, KNN search, and normal estimation on XYZ+intensity points | 1,024 | 0.010514s | 97,395 points/s | 10.3 us/point |
-| `IMUOps.synthetic` | resample synthetic IMU samples and dead-reckon the trajectory | 2,000 | 0.027607s | 72,445 samples/s | 13.8 us/sample |
-| `OdometryOps.synthetic` | resample synthetic odometry samples and dead-reckon the trajectory | 2,000 | 0.027660s | 72,306 samples/s | 13.8 us/sample |
-| `NavSatOps.synthetic` | convert and resample synthetic WGS84 NavSat samples into local trajectory arrays | 2,000 | 0.012711s | 157,349 samples/s | 6.4 us/sample |
-| `DEMOps.synthetic` | terrain normals, roughness, traversability, and point-cloud conversion over a DEM grid | 16,384 | 0.006353s | 2,579,024 cells/s | 0.4 us/cell |
-| `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.031245s | 320,053 items/s | 3.1 us/item |
-| `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.192457s | 520 items/s | 1924.6 us/item |
+| `ImgSource.messages` | temporary 64x64 PNG files read through OpenCV | 200 | 0.006641s | 30,114 items/s | 33.2 us/item |
+| `BagSource.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000168s | 1,191,363 items/s | 0.8 us/item |
+| `DB3Source.messages` | mocked `AnyReader` and image sensor conversion | 200 | 0.000275s | 727,603 items/s | 1.4 us/item |
+| `DEMSource.messages` | mocked Earthdata zip response with 32x32 HGT tiles | 4 | 0.000074s | 54,237 items/s | 18.4 us/item |
+| `ImageOps.synthetic` | resize, normalize, and grayscale 96x96 RGB image frames | 64 | 0.001132s | 56,543 frames/s | 17.7 us/frame |
+| `PointCloudOps.synthetic` | voxel downsample, KNN search, and normal estimation on XYZ+intensity points | 1,024 | 0.010418s | 98,287 points/s | 10.2 us/point |
+| `IMUOps.synthetic` | resample synthetic IMU samples and dead-reckon the trajectory | 2,000 | 0.026483s | 75,520 samples/s | 13.2 us/sample |
+| `OdometryOps.synthetic` | resample synthetic odometry samples and dead-reckon the trajectory | 2,000 | 0.027236s | 73,433 samples/s | 13.6 us/sample |
+| `NavSatOps.synthetic` | convert and resample synthetic WGS84 NavSat samples into local trajectory arrays | 2,000 | 0.012295s | 162,666 samples/s | 6.1 us/sample |
+| `DEMOps.synthetic` | terrain normals, roughness, traversability, and point-cloud conversion over a DEM grid | 16,384 | 0.005833s | 2,808,726 cells/s | 0.4 us/cell |
+| `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.035091s | 284,972 items/s | 3.5 us/item |
+| `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.205731s | 486 items/s | 2057.3 us/item |
+| `Arrow.TopicPipeline.time_range` | same pipeline over the Arrow/Parquet backend | 100 | 0.001433s | 69,796 items/s | 14.3 us/item |
+
+`voxel_downsample` groups 1M points at 0.5 m resolution in ~70 ms (packed int64 voxel keys; ~7-9x faster than the previous row-wise grouping).
+
+### Storage backends
+
+Identical workload — 1,500 lidar-sized point clouds of shape (30000, 3) float64, 1.08 GB of data — through each persistent backend, reads in a fresh process:
+
+| Operation | TileDB | Arrow (default) | Arrow advantage |
+| --- | ---: | ---: | ---: |
+| Ingest (excluding data generation) | 18.2 s | 1.3 s | 14x |
+| On-disk footprint | 1,952 MB | 1,066 MB | 1.8x |
+| Full 1.1 GB chunked scan | 2.6 s | 0.3 s | ~9x |
+| Time-range read (151 messages) | 514 ms | 17 ms | 30x |
+| Single-message fetch | 180 ms | 5 ms | 35x |
+
+Both backends stream with bounded memory on larger-than-memory datasets: the 1.1 GB Arrow ingest peaked at 314 MB RSS (staged fragment writes) and the full scan at 228 MB RSS with the default `batch_readahead`/`fragment_readahead` of 1 (raising readahead trades memory for throughput). This workload is incompressible random data; real sensor streams compress further under the Arrow backend's default zstd codec.
 
 ## Development
 
