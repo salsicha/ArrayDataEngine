@@ -297,6 +297,28 @@ def test_statistical_outlier_filter_keeps_single_point():
     assert np.allclose(statistical_outlier_filter(point), point)
 
 
+def test_voxel_downsample_packed_key_matches_rowwise_unique():
+    from ade.ops.point_cloud import voxel_downsample
+
+    def rowwise_reference(points, voxel_size):
+        arr = np.asarray(points)
+        voxels = np.floor(arr[:, :3] / voxel_size).astype(np.int64)
+        _, inverse = np.unique(voxels, axis=0, return_inverse=True)
+        out = np.zeros((inverse.max() + 1, arr.shape[1]), dtype=np.float64)
+        counts = np.bincount(inverse)
+        for dim in range(arr.shape[1]):
+            out[:, dim] = np.bincount(inverse, weights=arr[:, dim]) / counts
+        return out.astype(arr.dtype, copy=False)
+
+    rng = np.random.default_rng(3)
+    # packed fast path: xyz + extra channel, coords straddling zero
+    cloud = rng.uniform(-50.0, 50.0, size=(5000, 4))
+    assert np.array_equal(voxel_downsample(cloud, 0.5), rowwise_reference(cloud, 0.5))
+    # fallback path: voxel coordinates beyond the int64-packing range
+    far = rng.uniform(-3e6, 3e6, size=(2000, 3))
+    assert np.array_equal(voxel_downsample(far, 1.0), rowwise_reference(far, 1.0))
+
+
 # --- DEM ---------------------------------------------------------------------
 
 

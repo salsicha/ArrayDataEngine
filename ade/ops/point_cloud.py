@@ -10,6 +10,12 @@ from .geometry import _as_points, _as_transform_matrix, apply_transform, crop_bo
 from .nav import quaternion_to_rotation_matrix
 
 
+# Voxel coordinates within +/-2^20 (about 1e6 voxels per axis) can be packed
+# into a single int64 grouping key; anything beyond falls back to row-wise
+# unique.
+_VOXEL_PACK_LIMIT = 1 << 20
+
+
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     if voxel_size <= 0:
         raise ValueError("voxel_size must be positive")
@@ -19,7 +25,17 @@ def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
         return arr.copy()
 
     voxels = np.floor(arr[:, :3] / voxel_size).astype(np.int64)
-    _, inverse = np.unique(voxels, axis=0, return_inverse=True)
+    if ((voxels > -_VOXEL_PACK_LIMIT) & (voxels < _VOXEL_PACK_LIMIT)).all():
+        # Packing the three coordinates into one int64 turns the slow
+        # row-wise unique into a 1-D integer unique. The shift keeps every
+        # component non-negative, so key order == lexicographic voxel order
+        # and the output matches the unique(axis=0) path exactly.
+        shifted = voxels + _VOXEL_PACK_LIMIT
+        keys = (shifted[:, 0] << 42) | (shifted[:, 1] << 21) | shifted[:, 2]
+        _, inverse = np.unique(keys, return_inverse=True)
+    else:
+        _, inverse = np.unique(voxels, axis=0, return_inverse=True)
+
     downsampled = np.zeros((inverse.max() + 1, arr.shape[1]), dtype=np.float64)
     counts = np.bincount(inverse)
     for dim in range(arr.shape[1]):
