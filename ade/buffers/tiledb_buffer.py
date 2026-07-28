@@ -6,68 +6,16 @@ from contextlib import suppress
 import numpy as np
 import tiledb
 
+from .common import (
+    SPATIAL_INDEX_DIMS,
+    decode_frame_id as _decode_frame_id,
+    encode_frame_id as _encode_frame_id,
+    encode_name as _encode_name,
+    slice_contains as _slice_contains,
+    spatial_bounds_for_data as _spatial_bounds_for_data,
+)
+
 _logger = logging.getLogger(__name__)
-SPATIAL_INDEX_DIMS = 3
-
-
-def _encode_name(name) -> bytes:
-    if isinstance(name, bytes):
-        return name[:256]
-    return str(name).encode()[:256]
-
-
-def _decode_frame_id(value) -> str | None:
-    if isinstance(value, np.ndarray):
-        if value.ndim != 0:
-            return None
-        value = value.item()
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    if isinstance(value, str):
-        return value
-    return None
-
-
-def _encode_frame_id(value) -> bytes:
-    decoded = _decode_frame_id(value)
-    if decoded is None:
-        return b""
-    return decoded.encode()[:256]
-
-
-def _spatial_bounds_for_data(data) -> tuple[bool, np.ndarray, np.ndarray]:
-    mins = np.full(SPATIAL_INDEX_DIMS, np.nan, dtype=np.float64)
-    maxs = np.full(SPATIAL_INDEX_DIMS, np.nan, dtype=np.float64)
-    values = np.asarray(data)
-    if values.size == 0 or values.ndim == 0 or values.ndim > 2 or values.shape[-1] < 1:
-        return False, mins, maxs
-
-    dims = min(int(values.shape[-1]), SPATIAL_INDEX_DIMS)
-    try:
-        coords = values.astype(np.float64, copy=False).reshape((-1, int(values.shape[-1])))[:, :dims]
-    except (TypeError, ValueError):
-        return False, mins, maxs
-
-    finite = np.isfinite(coords).all(axis=1)
-    if not finite.any():
-        return False, mins, maxs
-
-    valid_coords = coords[finite]
-    mins[:dims] = np.min(valid_coords, axis=0)
-    maxs[:dims] = np.max(valid_coords, axis=0)
-    return True, mins, maxs
-
-
-def _slice_contains(index: int, start: int | None, stop: int | None, step: int | None) -> bool:
-    start = 0 if start is None else start
-    step = 1 if step is None else step
-    if index < start:
-        return False
-    if stop is not None and index >= stop:
-        return False
-    return (index - start) % step == 0
 
 
 def _concat_topic_parts(parts: list[dict]) -> dict:

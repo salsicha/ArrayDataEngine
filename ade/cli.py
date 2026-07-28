@@ -190,6 +190,7 @@ def _cmd_ingest(args) -> int:
         data_uri=args.out,
         axis=topics[0],
         use_db=True,
+        backend=args.backend,
         preload=0,
     ) as buffer:
         buffer.load_data_db(topics[0])
@@ -294,9 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--stride", type=int, default=1, help="keep every k-th message")
     p_export.set_defaults(fn=_cmd_export)
 
-    p_ingest = sub.add_parser("ingest", help="ingest a source into a TileDB group")
+    p_ingest = sub.add_parser("ingest", help="ingest a source into a persistent store")
     p_ingest.add_argument("path")
-    p_ingest.add_argument("-o", "--out", required=True, help="TileDB group directory")
+    p_ingest.add_argument("-o", "--out", required=True, help="store directory")
+    p_ingest.add_argument("--backend", choices=("arrow", "tiledb"), default="arrow",
+                          help="storage engine (default: arrow)")
     p_ingest.set_defaults(fn=_cmd_ingest)
 
     p_viewer = sub.add_parser("viewer", help="write an interactive HTML point-cloud viewer")

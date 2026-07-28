@@ -20,6 +20,8 @@ class DataBuffer:
     Returns:
     """
 
+    BACKENDS = ("memory", "arrow", "tiledb")
+
     def __init__(
         self,
         data_source: DataSources,
@@ -29,9 +31,27 @@ class DataBuffer:
         axis="",
         use_db=False,
         preload=1,
+        backend: str | None = None,
+        backend_options: dict | None = None,
     ):
         """Constructor
-        
+
+        `backend` selects the storage engine:
+
+        - ``"memory"``: rolling in-memory NumPy ring buffer (no persistence).
+        - ``"arrow"``: persistent Apache Arrow / Parquet fragments at
+          `data_uri` — the default for new persistent stores.
+        - ``"tiledb"``: persistent TileDB dense arrays at `data_uri`
+          (supports in-place `__setitem__` writes, unlike arrow).
+
+        When `backend` is omitted, `use_db=False` means ``"memory"`` and
+        `use_db=True` picks ``"arrow"`` — unless `data_uri` already holds a
+        TileDB store, which keeps opening as ``"tiledb"`` for compatibility.
+
+        `backend_options` is passed through to the backend constructor. The
+        arrow backend accepts `flush_bytes`, `row_group_bytes`,
+        `compression`, `batch_readahead`, `fragment_readahead`, and
+        `use_threads` (see `ade.buffers.arrow_buffer` for defaults).
         """
         if buffer_depth < 1:
             raise ValueError("buffer_depth must be at least 1")
@@ -39,12 +59,16 @@ class DataBuffer:
         self.buffer_depth = buffer_depth
         self._axis = axis
         self.topics = [] if topics is None else list(topics)
-        self.use_db = use_db
         self._init_source = data_source
         self.group_uri = data_uri
         self.preload = preload
+        self.backend = self._resolve_backend(backend, use_db, data_uri)
+        self.use_db = self.backend != "memory"
+        self._backend_options = dict(backend_options or {})
+        if self._backend_options and self.backend != "arrow":
+            raise ValueError(f"backend_options are only supported by the arrow backend, not {self.backend!r}")
 
-        if self.use_db:
+        if self.backend == "tiledb":
             import tiledb
 
             if not os.path.exists(self.group_uri):
@@ -53,6 +77,24 @@ class DataBuffer:
 
         self.set_methods()
         self.reset()
+
+    @classmethod
+    def _resolve_backend(cls, backend: str | None, use_db: bool, data_uri) -> str:
+        if backend is not None:
+            if backend not in cls.BACKENDS:
+                raise ValueError(f"backend must be one of {cls.BACKENDS}, got {backend!r}")
+            return backend
+        if not use_db:
+            return "memory"
+        return "tiledb" if cls._is_tiledb_store(data_uri) else "arrow"
+
+    @staticmethod
+    def _is_tiledb_store(data_uri) -> bool:
+        try:
+            entries = set(os.listdir(data_uri))
+        except OSError:
+            return False
+        return bool(entries & {"__tiledb_group.tdb", "__group", "__meta"})
 
     @property
     def counters(self):
@@ -126,8 +168,20 @@ class DataBuffer:
         self.close()
         self.data_source = self._get_data_source()
 
-        if not self.use_db:
+        if self.backend == "memory":
             self.buffer_impl = NumpyBuffer(self.data_source, self.buffer_depth, self._axis, self.topics)
+        elif self.backend == "arrow":
+            from .buffers.arrow_buffer import ArrowBuffer
+
+            self.buffer_impl = ArrowBuffer(
+                self.data_source,
+                self._init_source,
+                self.group_uri,
+                self._axis,
+                self.topics,
+                **self._backend_options,
+            )
+            self.topics = self.buffer_impl.topics
         else:
             from .buffers.tiledb_buffer import TileDBBuffer
 

@@ -22,7 +22,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # opencv-python-headless instead of the [image] extra: CI has no libGL
-          python -m pip install -e .[dev,tiledb] \
+          python -m pip install -e .[dev,tiledb,arrow] \
             opencv-python-headless scipy matplotlib pillow scikit-image rosbags
       - name: Run tests
         run: python -m pytest tests/ -q

@@ -193,7 +193,8 @@ def test_tiledb_buffer():
             data_uri=group_uri,
             topics=["sensor_topic"],
             axis="sensor_topic",
-            use_db=True
+            use_db=True,
+            backend="tiledb",
         )
 
         # Roll to load all messages
@@ -235,7 +236,8 @@ def test_tiledb_buffer_time_ranges():
             data_uri=group_uri,
             topics=["sensor_topic"],
             axis="sensor_topic",
-            use_db=True
+            use_db=True,
+            backend="tiledb",
         )
 
         for _ in range(4):
@@ -274,7 +276,8 @@ def test_tiledb_buffer_context_manager_and_timestamp_sidecar():
             data_uri=group_uri,
             topics=["sensor_topic"],
             axis="sensor_topic",
-            use_db=True
+            use_db=True,
+            backend="tiledb",
         ) as buf:
             for _ in range(4):
                 buf.roll_buffer("sensor_topic")
@@ -312,7 +315,8 @@ def test_tiledb_buffer_lazy_pipeline_pushes_time_and_index_ranges_to_backend(tmp
         data_uri=group_uri,
         topics=["sensor_topic"],
         axis="sensor_topic",
-        use_db=True
+        use_db=True,
+            backend="tiledb",
     ) as buf:
         for _ in range(4):
             buf.roll_buffer("sensor_topic")
@@ -348,6 +352,7 @@ def test_tiledb_buffer_persists_frame_and_spatial_indexes_for_pushdown(tmp_path)
         topics=["sensor_topic"],
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     ) as buf:
         buf.load_data_db("sensor_topic")
@@ -367,6 +372,7 @@ def test_tiledb_buffer_persists_frame_and_spatial_indexes_for_pushdown(tmp_path)
         data_uri=group_uri,
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
     )
     try:
         assert reopened.topic("sensor_topic").metadata.frame_id is None
@@ -417,6 +423,7 @@ def test_tiledb_spatial_pushdown_preserves_index_order_after_exact_filter(tmp_pa
         topics=["sensor_topic"],
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     ) as buf:
         buf.load_data_db("sensor_topic")
@@ -426,6 +433,7 @@ def test_tiledb_spatial_pushdown_preserves_index_order_after_exact_filter(tmp_pa
         data_uri=group_uri,
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
     )
     try:
         result = (
@@ -449,6 +457,7 @@ def test_tiledb_buffer_reopens_without_original_source(tmp_path):
         topics=["sensor_topic"],
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     ) as buf:
         buf.load_data_db("sensor_topic")
@@ -458,6 +467,7 @@ def test_tiledb_buffer_reopens_without_original_source(tmp_path):
         data_uri=group_uri,
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
     )
     try:
         assert reopened.get_topics() == ["sensor_topic"]
@@ -486,6 +496,7 @@ def test_tiledb_buffer_resumes_partial_ingest(tmp_path):
         topics=["sensor_topic"],
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     )
     first.roll_buffer("sensor_topic")
@@ -499,6 +510,7 @@ def test_tiledb_buffer_resumes_partial_ingest(tmp_path):
         topics=["sensor_topic"],
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     )
     try:
@@ -526,6 +538,7 @@ def test_tiledb_buffer_synthetic_multitopic_persistence(tmp_path):
         data_uri=group_uri,
         axis="/camera/image",
         use_db=True,
+        backend="tiledb",
         preload=0,
     ) as buf:
         buf.load_data_db("/camera/image")

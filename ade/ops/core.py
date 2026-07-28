@@ -1455,12 +1455,17 @@ class SourcePipeline:
         use_db: bool = False,
         axis: str | None = None,
         buffer=None,
+        backend: str | None = None,
         progress_callback: Callable[[PipelineProgress], Any] | None = None,
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
     ):
-        """Stream processed messages into a `DataBuffer`."""
+        """Stream processed messages into a `DataBuffer`.
+
+        `backend` follows DataBuffer semantics: None picks memory for
+        `use_db=False` and arrow (or an existing TileDB store) for
+        `use_db=True`."""
 
         if buffer is not None:
             return self._append_to_buffer(
@@ -1493,6 +1498,7 @@ class SourcePipeline:
             topics=list(self.topics),
             axis=selected_axis,
             use_db=use_db,
+            backend=backend,
             preload=0,
         )
         try:
@@ -1523,6 +1529,7 @@ class SourcePipeline:
             buffer_depth=buffer_depth,
             data_uri=data_uri,
             use_db=True,
+            backend="tiledb",
             axis=axis,
             progress_callback=progress_callback,
             cancel_token=cancel_token,

@@ -244,7 +244,8 @@ def test_tiledb_readonly_reopen_does_not_write(tmp_path):
     group_uri = str(tmp_path / "grp") + "/"
 
     first = DataBuffer(
-        StreamSource(), buffer_depth=5, data_uri=group_uri, axis="t", use_db=True, preload=0
+        StreamSource(), buffer_depth=5, data_uri=group_uri, axis="t", use_db=True,
+        backend="tiledb", preload=0
     )
     first.roll_buffer("t")
     first.roll_buffer("t")
@@ -560,7 +561,8 @@ def test_tiledb_reopen_append_persists_counts(tmp_path):
 
     # Store sized for 5 messages; ingest only 2 so capacity remains for appends
     first = DataBuffer(
-        StreamSource(5), buffer_depth=5, data_uri=group_uri, axis="t", use_db=True, preload=0
+        StreamSource(5), buffer_depth=5, data_uri=group_uri, axis="t", use_db=True,
+        backend="tiledb", preload=0
     )
     first.roll_buffer("t")
     first.roll_buffer("t")

@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-28
+
+### Added
+
+- **Apache Arrow / Parquet storage backend** — the new default for
+  persistent stores. Each topic is a directory of Parquet fragments with a
+  `fixed_shape_tensor` data column plus timestamp/name/frame-id/spatial-AABB
+  columns and a JSON manifest for resume. Staged writes and bounded-readahead
+  streaming keep both ingest and scans within a fixed memory budget
+  regardless of dataset size. Measured against the TileDB backend on a
+  1.1 GB point-cloud workload: ~14x faster ingest, ~9x faster full scans,
+  ~30x faster time-range reads, and ~45% less disk.
+- `DataBuffer(backend=...)`: `"memory"`, `"arrow"`, or `"tiledb"`. When
+  omitted, `use_db=True` selects Arrow for new stores and auto-detects
+  existing TileDB stores so previously written datasets keep working.
+- `DataBuffer(backend_options=...)` exposes the Arrow tuning knobs:
+  `flush_bytes` (default 32 MB), `row_group_bytes` (16 MB), `compression`
+  (`"zstd"`), `batch_readahead`/`fragment_readahead` (1), `use_threads`
+  (False). Documented in the README and `ade.buffers.arrow_buffer`.
+- `ade ingest --backend {arrow,tiledb}` (default arrow) and
+  `SourcePipeline.to_buffer(backend=...)`; `persist_to_tiledb()` keeps
+  writing TileDB as its name promises.
+- `arrow` optional dependency extra (`pip install "arraydataengine[arrow]"`).
+
+### Changed
+
+- Persisted Arrow topics are directly readable by Polars, DuckDB, pandas,
+  and any other Parquet consumer.
+- The Arrow backend rejects `buffer[i] = ...` in-place writes (immutable
+  fragments); use `backend="tiledb"` when cell updates are needed.
+
 ## [0.2.0] - 2026-07-16
 
 ### Added
@@ -56,5 +87,6 @@ First public release on PyPI.
 - Two rounds of full-codebase review fixes (~60 correctness bugs) with a
   regression test suite (123 tests).
 
+[0.3.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.3.0
 [0.2.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.2.0
 [0.1.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.1.0

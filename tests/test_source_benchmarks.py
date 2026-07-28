@@ -433,6 +433,7 @@ def test_benchmark_tiledb_topic_pipeline_time_range(tmp_path):
         data_uri=group_uri,
         axis="sensor_topic",
         use_db=True,
+        backend="tiledb",
         preload=0,
     ) as buffer:
         buffer.load_data_db("sensor_topic")

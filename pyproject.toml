@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arraydataengine"
-version = "0.2.0"
+version = "0.3.0"
 authors = [
   { name="Alex Moran", email="salsicha@gmail.com" },
 ]
@@ -41,6 +41,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+arrow = [
+    "pyarrow",
+]
 dem = [
     "rasterio",
     "requests",

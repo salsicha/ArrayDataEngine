@@ -23,7 +23,7 @@ The project is aimed at robotics and perception workflows where algorithms need 
 - TUM and KITTI trajectory export (compatible with `evo` and SLAM evaluation tooling).
 - Cached ROS topic metadata, so repeated topic and count lookups do not reopen the same bag.
 - Rolling in-memory buffers for recent context windows.
-- Optional TileDB-backed storage for datasets larger than memory, with timestamps stored in queryable sidecar arrays.
+- Persistent storage for larger-than-memory datasets: Apache Arrow/Parquet fragments (default — directly queryable from Polars/DuckDB/pandas) or TileDB dense arrays, both with timestamp/frame/spatial metadata and query pushdown.
 - Lazy dataset-level selection by topic, time, message index, frame id, geographic bounds, and spatial bounds.
 - Lazy optional imports so lightweight workflows do not need the full ROS, DEM, or visualization stack.
 - Notebook examples for demos, iterators, terrain, INS, MOT, and TileDB workflows.
@@ -70,7 +70,7 @@ ade info my_bag.db3 --messages 500   # topics, counts, duration, rates, jitter
 ade topics my_bag.db3
 ade export my_bag.db3 -t /points -o points.npz
 ade viewer my_bag.db3 -t /points -o viewer.html --stride 5
-ade ingest my_bag.db3 -o /tmp/tiledb/my_bag/   # persist every topic to TileDB
+ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by default, --backend tiledb)
 ```
 
 `ade viewer` and `ade demo` write self-contained HTML files that render in any
@@ -512,9 +512,14 @@ TileDB persistence uses `source.get_count(topic)` to size the destination arrays
 
 Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, ML-ready iterators/NumPy/PyTorch adapters/splits/augmentations/collation, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
 
-## TileDB Persistence
+## Persistent Storage
 
-Set `use_db=True` to persist messages to a TileDB group. This is intended for full-source ingest and larger-than-memory datasets.
+Set `use_db=True` to persist messages to disk. This is intended for full-source ingest and larger-than-memory datasets. Two storage engines are available via the `backend` parameter:
+
+- **`"arrow"`** (the default for new stores): Apache Arrow / Parquet fragment files. Fast, compressed, dependency-light (`pip install "arraydataengine[arrow]"`), and every persisted topic is directly readable by Polars, DuckDB, pandas, and anything else that speaks Parquet.
+- **`"tiledb"`**: TileDB dense arrays (`pip install "arraydataengine[tiledb]"`). Supports in-place cell updates (`buffer[i] = ...`), which the immutable Arrow fragments do not.
+
+When `backend` is omitted and `use_db=True`, new stores use Arrow; a `data_uri` that already holds a TileDB store keeps opening with TileDB, so existing datasets are unaffected.
 
 ```python
 from ade.buffer import DataBuffer
@@ -525,24 +530,44 @@ source = DataSources("/data/rosbag2/split_recording/")
 
 with DataBuffer(
     data_source=source,
-    data_uri="/tmp/tiledb/my_dataset/",
+    data_uri="/data/stores/my_dataset/",
     axis=axis,
-    use_db=True,
+    use_db=True,          # backend="arrow" is the default for new stores
 ) as buffer:
     buffer.load_data_db(axis)
     print(buffer.get_group_uri())
 ```
 
-Using `DataBuffer` as a context manager closes TileDB arrays cleanly and marks completed topic arrays as closed.
+Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed.
 
-TileDB-backed topics keep timestamps, message names, frame ids, and per-message spatial bounds in sidecar arrays. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads.
+Both backends keep timestamps, message names, frame ids, and per-message spatial bounds alongside the data. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads. Streaming reads and staged writes keep memory bounded regardless of dataset size.
 
-Existing TileDB groups can be reopened without the original source:
+The Arrow backend exposes its tuning knobs through `backend_options` (reasonable defaults shown):
+
+```python
+buffer = DataBuffer(
+    data_source=source,
+    data_uri="/data/stores/my_dataset/",
+    axis=axis,
+    use_db=True,
+    backend="arrow",
+    backend_options={
+        "flush_bytes": 32 * 1024 * 1024,      # staged bytes per topic before a fragment is written
+        "row_group_bytes": 16 * 1024 * 1024,  # target Parquet row-group size (random-access granularity)
+        "compression": "zstd",                # any Parquet codec: zstd, snappy, lz4, none...
+        "batch_readahead": 1,                 # scanner prefetch depth; raise for throughput,
+        "fragment_readahead": 1,              #   keep at 1 for minimal scan memory
+        "use_threads": False,                 # parallel scans (off preserves order + bounds memory)
+    },
+)
+```
+
+Existing stores can be reopened without the original source:
 
 ```python
 reopened = DataBuffer(
     data_source=None,
-    data_uri="/tmp/tiledb/my_dataset/",
+    data_uri="/data/stores/my_dataset/",
     axis=axis,
     use_db=True,
 )
@@ -551,7 +576,7 @@ for chunk in reopened.topic(axis).time_range(12.0, 20.0).iter_chunks(chunk_size=
     process(chunk.data)
 ```
 
-Interrupted ingests can be resumed by constructing a new `DataBuffer` with the same source and `data_uri`. Stored per-topic counts are loaded from TileDB metadata, previously written messages are skipped during source replay, and remaining messages are appended.
+Interrupted ingests can be resumed by constructing a new `DataBuffer` with the same source and `data_uri`. Stored per-topic counts are loaded from the store's metadata, previously written messages are skipped during source replay, and remaining messages are appended.
 
 ## DEM Tiles
 
