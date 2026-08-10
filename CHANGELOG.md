@@ -5,7 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-07-28
+Versions 0.1.0 and 0.2.0 were repository development milestones. They were not
+published to PyPI or tagged as GitHub releases. Version 0.3.0 is the planned
+first registry release.
+
+## 0.3.0 - Unreleased
 
 ### Added
 
@@ -39,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Arrow backend rejects `buffer[i] = ...` in-place writes (immutable
   fragments); use `backend="tiledb"` when cell updates are needed.
 
-## [0.2.0] - 2026-07-16
+## 0.2.0 (development milestone) - 2026-07-16
 
 ### Added
 
@@ -69,9 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Topic persistence**: `save_topic_npz` / `load_topic_npz` — portable,
   pickle-free `.npz` round-trip for buffered topics with metadata.
 
-## [0.1.0] - 2026-07-16
+## 0.1.0 (development milestone) - 2026-07-16
 
-First public release on PyPI.
+Initial packaged development milestone; not published to PyPI.
 
 ### Added
 
@@ -79,8 +83,8 @@ First public release on PyPI.
   chunks and split rosbag2 directories), and SRTM DEM tiles.
 - `DataBuffer` rolling in-memory buffers (NumPy backend) and persistent
   TileDB-backed storage with resumable ingest.
-- `arraydataengine.ops`: NumPy-first operations for topics and datasets — lazy pipelines
-  with map/filter/reduce, time/index/frame/spatial selection pushdown,
+- `arraydataengine.ops`: NumPy-first operations for topics and datasets — lazy
+  pipelines with map/filter/reduce, time/index/frame/spatial selection pushdown,
   chunked iteration, checkpoint/cancel/resume, point-cloud processing
   (voxel/outlier filters, ICP registration, ground segmentation), navigation
   math (IMU integration, ENU/NED, navsat conversion), DEM utilities
@@ -88,8 +92,4 @@ First public release on PyPI.
   small ML dataset helpers.
 - Point-cloud (native/embedded/HTML) and video visualizers.
 - Two rounds of full-codebase review fixes (~60 correctness bugs) with a
-  regression test suite (123 tests).
-
-[0.3.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.3.0
-[0.2.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.2.0
-[0.1.0]: https://github.com/salsicha/ArrayDataEngine/releases/tag/v0.1.0
+  regression test suite.

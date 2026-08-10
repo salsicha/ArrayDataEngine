@@ -1,19 +1,22 @@
 # Publishing to PyPI
 
-Everything mechanical is already prepared:
+## Current release state
 
-- `pyproject.toml` has complete metadata (SPDX license, keywords, classifiers,
-  URLs) and version `0.1.0`; the name `arraydataengine` is unclaimed on PyPI.
+- `pyproject.toml` declares version `0.3.0`. This is the planned first PyPI
+  and GitHub release; the `0.1.0` and `0.2.0` changelog entries describe
+  repository development milestones, not published releases.
 - `python -m build` produces a clean sdist + wheel (no data files leak in);
   both pass `twine check`, and the wheel was smoke-tested in a clean venv with
   only NumPy installed.
 - `.github/workflows/publish.yml` builds and publishes via **PyPI Trusted
-  Publishing** whenever a GitHub release is published.
+  Publishing** when a GitHub release is published or the workflow is manually
+  dispatched.
 - `.github/workflows/tests.yml` runs the test suite on pushes and PRs
-  (the exact dependency set was verified locally: 122 passed, 1 skipped).
+  using Python 3.12 and 3.13.
 
-Two manual paths remain — pick one. Trusted Publishing (Option A) is
-recommended: no long-lived API token to store or leak.
+Use one publishing path only. Trusted Publishing (Option A) is recommended:
+it avoids a long-lived API token and keeps production publication behind the
+`pypi` GitHub environment.
 
 ## Option A — Trusted Publishing via GitHub Actions (recommended)
 
@@ -29,21 +32,29 @@ One-time setup:
    - Workflow name: `publish.yml`
    - Environment name: `pypi`
 3. On GitHub, go to the repo's **Settings → Environments → New environment**
-   and create one named `pypi` (no secrets needed; optionally add yourself as
-   a required reviewer so publishes need a manual approval click).
+   and create one named `pypi` (no secrets needed). Add yourself as a required
+   reviewer so each production upload needs a manual approval click.
 
-Release:
+For the first release, confirm that `pyproject.toml` still declares `0.3.0`,
+that CI is green on the release commit, and that the working tree is clean.
+Then create and push an annotated tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git status --short
+git tag -a v0.3.0 -m "arraydataengine 0.3.0"
+git push origin main
+git push origin v0.3.0
 ```
 
-Then on GitHub: **Releases → Draft a new release → choose tag v0.1.0 →
+Then on GitHub: **Releases → Draft a new release → choose tag v0.3.0 →
 Publish release**. The `publish` workflow builds, checks, and uploads to PyPI.
-Verify at <https://pypi.org/project/arraydataengine/>.
+Approve the `pypi` environment deployment when prompted, then verify at
+<https://pypi.org/project/arraydataengine/>.
 
-## Option B — manual upload with twine
+## Option B — manual upload with twine (fallback)
+
+Do not use this path if the GitHub release workflow will also run for the same
+version.
 
 ```bash
 python -m pip install --upgrade build twine
@@ -58,20 +69,36 @@ When prompted, use username `__token__` and an API token created at
 
 ## Optional: dry run against TestPyPI
 
+Build and check the artifacts first, then upload and install the exact candidate
+version in a fresh environment:
+
 ```bash
+rm -rf dist/
+python -m build
+python -m twine check dist/*
 python -m twine upload --repository testpypi dist/*
-python -m pip install --index-url https://test.pypi.org/simple/ \
-    --extra-index-url https://pypi.org/simple/ arraydataengine
+python -m venv /tmp/arraydataengine-testpypi
+/tmp/arraydataengine-testpypi/bin/python -m pip install --upgrade pip
+/tmp/arraydataengine-testpypi/bin/python -m pip install \
+    --index-url https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ \
+    "arraydataengine==0.3.0"
+/tmp/arraydataengine-testpypi/bin/python -c \
+    "import arraydataengine; print(arraydataengine.__version__)"
 ```
 
-(TestPyPI needs its own account at <https://test.pypi.org>.)
+(TestPyPI needs its own account and token at <https://test.pypi.org>.)
 
 ## Future releases
 
 1. Bump `version` in `pyproject.toml` (semantic versioning).
 2. Add a section to `CHANGELOG.md`.
-3. Commit, tag `vX.Y.Z`, push the tag, and publish a GitHub release
-   (Option A) or rebuild and `twine upload` (Option B).
+3. Run the tests, build both artifacts, run `twine check`, and smoke-test the
+   wheel in a clean environment.
+4. Commit the release, create an annotated `vX.Y.Z` tag, and explicitly push
+   `main` and that tag.
+5. Publish a GitHub release and approve the `pypi` environment deployment, or
+   use the manual fallback. Do not run both publication paths for one version.
 
 ## Notes
 
@@ -82,3 +109,4 @@ python -m pip install --index-url https://test.pypi.org/simple/ \
   or any bag/mesh data.
 - PyPI uploads are immutable: a version number can never be reused, even
   after deletion. If an upload goes out broken, bump the patch version.
+- PyPI and TestPyPI are separate registries with separate accounts and tokens.

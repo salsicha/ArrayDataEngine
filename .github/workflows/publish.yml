@@ -1,7 +1,7 @@
 name: publish
 
 # Publishes to PyPI via Trusted Publishing (no API token stored in GitHub).
-# Trigger: publishing a GitHub release (create a tag like v0.1.0 first).
+# Trigger: publishing a GitHub release from its matching vX.Y.Z tag.
 # One-time setup required on pypi.org — see PUBLISHING.md.
 
 on:

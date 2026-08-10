@@ -122,6 +122,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 - [ ] Build the source distribution and wheel:
 
   ```bash
+  rm -rf dist/
   python -m build
   ```
 
@@ -142,35 +143,39 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 - [ ] Verify the TestPyPI install in a fresh virtual environment:
 
   ```bash
-  python -m venv /tmp/ade-testpypi
-  /tmp/ade-testpypi/bin/python -m pip install --upgrade pip
-  /tmp/ade-testpypi/bin/python -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ arraydataengine
-  /tmp/ade-testpypi/bin/python -c "import arraydataengine; print(arraydataengine.__file__)"
+  python -m venv /tmp/arraydataengine-testpypi
+  /tmp/arraydataengine-testpypi/bin/python -m pip install --upgrade pip
+  /tmp/arraydataengine-testpypi/bin/python -m pip install \
+      --index-url https://test.pypi.org/simple/ \
+      --extra-index-url https://pypi.org/simple/ \
+      "arraydataengine==X.Y.Z"
+  /tmp/arraydataengine-testpypi/bin/python -c \
+      "import arraydataengine; print(arraydataengine.__version__)"
   ```
 
 - [ ] Create and push the release commit and tag:
 
   ```bash
-  git add pyproject.toml README.md TODO.md
+  git status --short
+  git add pyproject.toml CHANGELOG.md README.md \
+      PUBLISHING.md TODO.md
   git commit -m "Release vX.Y.Z"
-  git tag vX.Y.Z
-  git push origin main --tags
+  git tag -a vX.Y.Z -m "arraydataengine X.Y.Z"
+  git push origin main
+  git push origin vX.Y.Z
   ```
 
-- [ ] Publish the same checked artifacts to PyPI:
-
-  ```bash
-  python -m twine upload dist/*
-  ```
+- [ ] Create a GitHub release from the pushed tag, approve the `pypi`
+  environment deployment, and let `.github/workflows/publish.yml` upload the
+  package. See `PUBLISHING.md` for the manual fallback; do not run both paths.
 
 - [ ] Verify the PyPI install in a fresh virtual environment:
 
   ```bash
-  python -m venv /tmp/ade-pypi
-  /tmp/ade-pypi/bin/python -m pip install --upgrade pip
-  /tmp/ade-pypi/bin/python -m pip install arraydataengine
-  /tmp/ade-pypi/bin/python -c "import arraydataengine; print(arraydataengine.__file__)"
+  python -m venv /tmp/arraydataengine-pypi
+  /tmp/arraydataengine-pypi/bin/python -m pip install --upgrade pip
+  /tmp/arraydataengine-pypi/bin/python -m pip install "arraydataengine==X.Y.Z"
+  /tmp/arraydataengine-pypi/bin/python -c "import arraydataengine; print(arraydataengine.__version__)"
   ```
 
-- [ ] Create a GitHub release from the pushed tag and attach the generated `dist/` artifacts.
 - [ ] Record the released version, PyPI URL, TestPyPI URL, and release notes in the project README or GitHub release notes.
