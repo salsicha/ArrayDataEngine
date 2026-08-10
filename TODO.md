@@ -100,82 +100,73 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 
 ## Package And Publish To Python Registries
 
-- [ ] Confirm the package metadata in `pyproject.toml`:
-  - [ ] Package name is correct for the registry: `arraydataengine`.
-  - [ ] Version is bumped for the release.
-  - [ ] Description, README, license, authors, URLs, classifiers, and `requires-python` are accurate.
-  - [ ] Optional dependency groups cover supported installs: `dev`, `image`, `ros`, `dem`, `tiledb`, `visualization`, `notebook`, and `ml`.
-- [ ] Add release tooling if it is not already installed:
+Automated release safeguards:
+
+- [x] Build exactly one sdist and wheel and run strict metadata/content checks.
+- [x] Verify the canonical package, facade, CLI, annotated tag/version match,
+  and dated changelog entry.
+- [x] Smoke-test the built wheel on Python 3.12, 3.13, and 3.14 before upload.
+- [x] Separate unprivileged build/test jobs from OIDC publishing jobs.
+- [x] Restrict production publishing to matching `v*` tags and a protected
+  `pypi` environment with required review.
+- [x] Provide an explicit protected TestPyPI Trusted Publishing rehearsal.
+- [x] Pin every external action to a full commit SHA and let Dependabot maintain
+  those pins.
+- [x] Require SHA-pinned actions, read-only default workflow permissions, and
+  immutable GitHub releases in repository settings.
+
+One-time registry setup:
+
+- [ ] Configure the pending Trusted Publisher on PyPI for `publish.yml` and
+  environment `pypi`.
+- [ ] Optionally configure the separate pending Trusted Publisher on TestPyPI
+  for environment `testpypi`.
+- [ ] Confirm both registry accounts use 2FA and no legacy registry-token
+  secrets remain in GitHub.
+
+For every release:
+
+- [ ] Confirm `pyproject.toml` metadata and supported dependency extras are
+  accurate, then bump the version.
+- [ ] Replace the current changelog's `Unreleased` marker with the release
+  date.
+- [ ] Run the local release checks from a clean working tree:
 
   ```bash
   python -m pip install --upgrade build twine
-  ```
-
-- [ ] Run the pre-release checks from a clean working tree:
-
-  ```bash
-  python -m pytest -q
-  python -m compileall -q arraydataengine ArrayDataEngine tests
-  git diff --check
-  ```
-
-- [ ] Build the source distribution and wheel:
-
-  ```bash
+  python scripts/check_release.py --tag vX.Y.Z
+  python -m pytest -q --strict-config --strict-markers tests/
+  python -m compileall -q arraydataengine ArrayDataEngine scripts tests
   rm -rf dist/
   python -m build
-  ```
-
-- [ ] Validate the built artifacts:
-
-  ```bash
-  python -m twine check dist/*
-  python -m pip install --force-reinstall dist/*.whl
-  python -m pytest -q
-  ```
-
-- [ ] Publish to TestPyPI first:
-
-  ```bash
-  python -m twine upload --repository testpypi dist/*
-  ```
-
-- [ ] Verify the TestPyPI install in a fresh virtual environment:
-
-  ```bash
-  python -m venv /tmp/arraydataengine-testpypi
-  /tmp/arraydataengine-testpypi/bin/python -m pip install --upgrade pip
-  /tmp/arraydataengine-testpypi/bin/python -m pip install \
-      --index-url https://test.pypi.org/simple/ \
-      --extra-index-url https://pypi.org/simple/ \
-      "arraydataengine==X.Y.Z"
-  /tmp/arraydataengine-testpypi/bin/python -c \
-      "import arraydataengine; print(arraydataengine.__version__)"
-  ```
-
-- [ ] Create and push the release commit and tag:
-
-  ```bash
+  python -m twine check --strict dist/*
+  python scripts/check_dist.py dist
+  git diff --check
   git status --short
-  git add pyproject.toml CHANGELOG.md README.md \
-      PUBLISHING.md TODO.md
-  git commit -m "Release vX.Y.Z"
+  ```
+
+- [ ] Optionally run **Actions → release → Run workflow** with TestPyPI enabled,
+  approve `testpypi`, and verify an exact-version install.
+- [ ] Commit the intentional release files, wait for the `tests` workflow,
+  create an annotated tag, and explicitly push the branch and tag:
+
+  ```bash
   git tag -a vX.Y.Z -m "arraydataengine X.Y.Z"
   git push origin main
   git push origin vX.Y.Z
   ```
 
-- [ ] Create a GitHub release from the pushed tag, approve the `pypi`
-  environment deployment, and let `.github/workflows/publish.yml` upload the
-  package. See `PUBLISHING.md` for the manual fallback; do not run both paths.
-
-- [ ] Verify the PyPI install in a fresh virtual environment:
+- [ ] Inspect the release workflow's build and Python 3.12–3.14 verification
+  jobs, then approve the `pypi` deployment.
+- [ ] Verify the exact PyPI version in a fresh environment:
 
   ```bash
   python -m venv /tmp/arraydataengine-pypi
   /tmp/arraydataengine-pypi/bin/python -m pip install --upgrade pip
   /tmp/arraydataengine-pypi/bin/python -m pip install "arraydataengine==X.Y.Z"
-  /tmp/arraydataengine-pypi/bin/python -c "import arraydataengine; print(arraydataengine.__version__)"
+  /tmp/arraydataengine-pypi/bin/python -c \
+      "import arraydataengine; print(arraydataengine.__version__)"
   ```
 
-- [ ] Record the released version, PyPI URL, TestPyPI URL, and release notes in the project README or GitHub release notes.
+- [ ] Create the immutable GitHub release from the existing tag and record the
+  PyPI/TestPyPI URLs and release notes.
