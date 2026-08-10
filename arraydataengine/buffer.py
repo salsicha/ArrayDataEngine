@@ -51,7 +51,7 @@ class DataBuffer:
         `backend_options` is passed through to the backend constructor. The
         arrow backend accepts `flush_bytes`, `row_group_bytes`,
         `compression`, `batch_readahead`, `fragment_readahead`, and
-        `use_threads` (see `ade.buffers.arrow_buffer` for defaults).
+        `use_threads` (see `arraydataengine.buffers.arrow_buffer` for defaults).
         """
         if buffer_depth < 1:
             raise ValueError("buffer_depth must be at least 1")

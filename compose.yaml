@@ -5,7 +5,7 @@ services:
     volumes:
       - ./notebooks:/notebooks
       - "/tmp/.X11-unix:/tmp/.X11-unix"
-      - ./ade:/dataengine/ade
+      - ./arraydataengine:/dataengine/arraydataengine
       - /data:/data
     environment:
       - "DISPLAY=${DISPLAY}"

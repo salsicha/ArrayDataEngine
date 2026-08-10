@@ -3,8 +3,8 @@ import types
 
 import numpy as np
 
-from ade.buffer import DataBuffer
-from ade.ops import (
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.ops import (
     align_bounded,
     align_exact,
     align_image,

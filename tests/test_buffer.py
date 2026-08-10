@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 import tiledb
 
-from ade.buffer import DataBuffer
+from arraydataengine.buffer import DataBuffer
 
 # Mock Data Source
 class MockDataSource:

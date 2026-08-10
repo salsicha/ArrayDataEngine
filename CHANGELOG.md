@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DataBuffer(backend_options=...)` exposes the Arrow tuning knobs:
   `flush_bytes` (default 32 MB), `row_group_bytes` (16 MB), `compression`
   (`"zstd"`), `batch_readahead`/`fragment_readahead` (1), `use_threads`
-  (False). Documented in the README and `ade.buffers.arrow_buffer`.
+  (False). Documented in the README and `arraydataengine.buffers.arrow_buffer`.
 - `ade ingest --backend {arrow,tiledb}` (default arrow) and
   `SourcePipeline.to_buffer(backend=...)`; `persist_to_tiledb()` keeps
   writing TileDB as its name promises.
@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The canonical import package is now `arraydataengine`; the distribution no
+  longer ships the conflicting `ade` import package. The `ade` CLI command is
+  unchanged, and `ArrayDataEngine` remains as a convenience facade.
 - Persisted Arrow topics are directly readable by Polars, DuckDB, pandas,
   and any other Parquet consumer.
 - The Arrow backend rejects `buffer[i] = ...` in-place writes (immutable
@@ -76,7 +79,7 @@ First public release on PyPI.
   chunks and split rosbag2 directories), and SRTM DEM tiles.
 - `DataBuffer` rolling in-memory buffers (NumPy backend) and persistent
   TileDB-backed storage with resumable ingest.
-- `ade.ops`: NumPy-first operations for topics and datasets — lazy pipelines
+- `arraydataengine.ops`: NumPy-first operations for topics and datasets — lazy pipelines
   with map/filter/reduce, time/index/frame/spatial selection pushdown,
   chunked iteration, checkpoint/cancel/resume, point-cloud processing
   (voxel/outlier filters, ICP registration, ground segmentation), navigation

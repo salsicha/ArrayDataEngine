@@ -7,8 +7,8 @@ import numpy as np
 class PoseStamped(SimpleNamespace):
     pass
 
-from ade.ops import apply_transform, calibrate_depth_anything_point_cloud, pose_to_matrix, source_pipeline, valid_point_cloud_points
-from ade.sensors.pose_sensor import PoseSensor
+from arraydataengine.ops import apply_transform, calibrate_depth_anything_point_cloud, pose_to_matrix, source_pipeline, valid_point_cloud_points
+from arraydataengine.sensors.pose_sensor import PoseSensor
 
 
 def test_pose_sensor_numpyifies_pose_stamped():
@@ -84,8 +84,8 @@ def test_source_pipeline_nearest_topic_pairs():
 
 
 def test_db3_source_sqlite_metadata_fallback_without_rosbags(monkeypatch, tmp_path):
-    from ade.sources.db3_source import DB3Source
-    from ade.sources import base_source
+    from arraydataengine.sources.db3_source import DB3Source
+    from arraydataengine.sources import base_source
 
     monkeypatch.setattr(base_source, "AnyReader", None)
 

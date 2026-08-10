@@ -4,9 +4,9 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from ade.sensors.image_sensor import ImageSensor
-from ade.sensors.imu_sensor import IMUSensor
-from ade.sensors.pointcloud2_sensor import PointCloudSensor
+from arraydataengine.sensors.image_sensor import ImageSensor
+from arraydataengine.sensors.imu_sensor import IMUSensor
+from arraydataengine.sensors.pointcloud2_sensor import PointCloudSensor
 
 
 def test_image_sensor_numpyify():

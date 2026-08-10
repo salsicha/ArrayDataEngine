@@ -34,12 +34,12 @@ The project is aimed at robotics and perception workflows where algorithms need 
 python -m pip install arraydataengine
 ```
 
-The distribution name is `arraydataengine`; the import names are `ade` (the
-library) and `ArrayDataEngine` (a convenience facade):
+The distribution and canonical import name are both `arraydataengine`.
+`ArrayDataEngine` remains available as a convenience facade:
 
 ```python
-from ade.buffer import DataBuffer
-from ade.source import DataSources
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.source import DataSources
 ```
 
 For editable local development:
@@ -75,7 +75,7 @@ ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by d
 
 `ade viewer` and `ade demo` write self-contained HTML files that render in any
 browser with no extra dependencies. Exported `.npz` files load back with
-`ade.ops.load_topic_npz` and plug straight into the ops pipelines.
+`arraydataengine.ops.load_topic_npz` and plug straight into the ops pipelines.
 
 ## Supported Sources
 
@@ -103,7 +103,7 @@ Each yielded message has this shape:
 Read an image sequence directly:
 
 ```python
-from ade.source import DataSources
+from arraydataengine.source import DataSources
 
 source = DataSources("/data/frames/*.png", period=0.1)
 
@@ -119,7 +119,7 @@ for message in source.get_message():
 Read a ROS bag, ROS 2 database, or split rosbag2 directory:
 
 ```python
-from ade.source import DataSources
+from arraydataengine.source import DataSources
 
 bag_source = DataSources("/data/recording.bag")
 ros2_source = DataSources("/data/rosbag2/split_recording/")
@@ -135,8 +135,8 @@ For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the c
 `DataBuffer` keeps a recent window for each topic and exposes NumPy-like indexing on the selected axis topic.
 
 ```python
-from ade.buffer import DataBuffer
-from ade.source import DataSources
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.source import DataSources
 
 axis = "images"
 source = DataSources("/data/frames/*.png", period=0.1)
@@ -184,10 +184,10 @@ Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for b
 
 ## Array Operations
 
-The `ade.ops` package provides NumPy-first helpers for common robotics data operations. They work on topic arrays returned by `DataBuffer.get_buffer()`, `get_time_range()`, and `get_last_seconds()`.
+The `arraydataengine.ops` package provides NumPy-first helpers for common robotics data operations. They work on topic arrays returned by `DataBuffer.get_buffer()`, `get_time_range()`, and `get_last_seconds()`.
 
 ```python
-from ade.ops import map_topic, random_downsample, select_time_range, voxel_downsample
+from arraydataengine.ops import map_topic, random_downsample, select_time_range, voxel_downsample
 
 window = buffer.get_buffer()
 images = select_time_range(window["images"], start=12.0, end=12.5)
@@ -203,7 +203,7 @@ Image and depth sequences can be resized, cropped, padded, normalized, color-con
 ```python
 import numpy as np
 
-from ade.ops import align_images, calibrate_depth_metric_scale, convert_color, convert_image_dtype, crop_images, depth_to_normals, frame_to_frame_optical_flow, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, motion_compensated_rolling_windows, normalize_images, open_mask, resize_images
+from arraydataengine.ops import align_images, calibrate_depth_metric_scale, convert_color, convert_image_dtype, crop_images, depth_to_normals, frame_to_frame_optical_flow, fuse_rgbd_frames, image_gradients, image_mask, image_pyramid, iter_rgbd_frame_points, local_statistics, motion_compensated_rolling_windows, normalize_images, open_mask, resize_images
 
 frames = window["images"]["data"]
 depth_frames = window["depth"]["data"]
@@ -229,7 +229,7 @@ depth_calibration, metric_depth = calibrate_depth_metric_scale(relative_depth, l
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
-from ade.ops import calibrate_point_cloud_metric_scale, connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample, verify_loop_closures
+from arraydataengine.ops import calibrate_point_cloud_metric_scale, connected_components, curvature_descriptors, farthest_point_downsample, hybrid_search, multi_scale_icp, nearest_neighbor_distance_stats, segment_ground, to_open3d_point_cloud, uniform_downsample, verify_loop_closures
 
 uniform_points = uniform_downsample(points, every_k=4)
 keypoints = farthest_point_downsample(points, count=2_048)
@@ -248,7 +248,7 @@ scale_calibration, metric_points = calibrate_point_cloud_metric_scale(relative_p
 SE(3) coordinate-frame helpers work across common robotics arrays:
 
 ```python
-from ade.ops import apply_transform, transform_navsat, transform_odometry
+from arraydataengine.ops import apply_transform, transform_navsat, transform_odometry
 
 points_in_map = apply_transform(points_in_lidar, lidar_to_map)
 odom_in_map = transform_odometry(odom_message_array, odom_to_map)
@@ -258,7 +258,7 @@ gps_in_map_frame = transform_navsat(gps_samples, enu_transform, ref_lat=37.0, re
 Use `FrameGraph` when transforms need to be composed by frame name. Static transforms are used directly; time-varying transforms are interpolated by timestamp, including rotation SLERP.
 
 ```python
-from ade.ops import FrameGraph
+from arraydataengine.ops import FrameGraph
 
 frames = FrameGraph()
 frames.add_static_transform("base_link", "odom", base_to_odom)
@@ -275,7 +275,7 @@ points_in_odom = frames.transform_points(points_in_lidar, "lidar", "odom", times
 Projection helpers connect point clouds, depth images, RGB images, DEM grids, and camera frames with pinhole intrinsics.
 
 ```python
-from ade.ops import backproject_pixels, camera_model, colorize_points, depth_to_point_grid, distort_pixels, points_to_depth_image, project_camera_points, project_dem_to_image, rectify_image, rgbd_to_points, scale_camera_matrix
+from arraydataengine.ops import backproject_pixels, camera_model, colorize_points, depth_to_point_grid, distort_pixels, points_to_depth_image, project_camera_points, project_dem_to_image, rectify_image, rgbd_to_points, scale_camera_matrix
 
 camera = camera_model(fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2], distortion=distortion_coeffs)
 small_camera_matrix = scale_camera_matrix(camera.camera_matrix, scale_x=0.5)
@@ -293,7 +293,7 @@ dem_pixels, dem_mask = project_dem_to_image(elevation, fx=525.0, fy=525.0, cx=31
 Crop/select helpers cover row masks, axis-aligned bounds, oriented 3D bounds, and geographic bounding boxes.
 
 ```python
-from ade.ops import crop_bounds, crop_geographic_bounds, crop_oriented_bounds, select_mask
+from arraydataengine.ops import crop_bounds, crop_geographic_bounds, crop_oriented_bounds, select_mask
 
 valid_points = select_mask(points, valid_mask)
 nearby_points = crop_bounds(points, min_bound=[-10, -10, -2], max_bound=[10, 10, 3])
@@ -304,7 +304,7 @@ gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, m
 IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing.
 
 ```python
-from ade.ops import (
+from arraydataengine.ops import (
     compensate_imu_gravity,
     correct_imu_bias,
     add_trajectory_quality_mask,
@@ -419,7 +419,7 @@ point_chunks = (
 Topic alignment helpers cover exact timestamp joins, nearest-neighbor joins, bounded-tolerance joins, fixed-rate resampling, and rolling window joins.
 
 ```python
-from ade.ops import align_topic, resample_topic, rolling_window_join
+from arraydataengine.ops import align_topic, resample_topic, rolling_window_join
 
 imu_at_image_times = align_topic(images, imu, mode="bounded", tolerance=0.02)
 gps_10hz = resample_topic(gps, rate_hz=10.0)
@@ -429,7 +429,7 @@ recent_points = rolling_window_join(images, points, seconds=0.25)
 `TopicView` is still available when the data is already in memory and you want eager, metadata-aware operations. It keeps message ids, timestamps, data, topic name, frame id, source URI, dtype, shape, and time bounds together while exposing the same operations as methods.
 
 ```python
-from ade.ops import topic_view
+from arraydataengine.ops import topic_view
 
 view = topic_view(window["images"], topic="images")
 normalized = view.map(lambda frame: frame.astype(np.float32) / 255.0).as_dict()
@@ -446,7 +446,7 @@ recent_windows = list(buffer.window_topic("images", size=5))
 ML-ready helpers turn lazy topic windows into plain iterator datasets, materialized NumPy datasets, or optional PyTorch datasets. They also provide deterministic split helpers, lightweight augmentations, and padding collation for mixed-rate windows and variable-size point clouds.
 
 ```python
-from ade.ops import (
+from arraydataengine.ops import (
     augment_image,
     augment_point_cloud,
     collate_samples,
@@ -474,8 +474,8 @@ Use `source_pipeline()` when you want operations to run while messages stream fr
 ```python
 import json
 
-from ade.ops import CancellationToken, PipelineCancelled, source_pipeline, voxel_downsample
-from ade.source import DataSources
+from arraydataengine.ops import CancellationToken, PipelineCancelled, source_pipeline, voxel_downsample
+from arraydataengine.source import DataSources
 
 source = DataSources("/data/rosbag2/split_recording/")
 checkpoint = {}
@@ -522,8 +522,8 @@ Set `use_db=True` to persist messages to disk. This is intended for full-source 
 When `backend` is omitted and `use_db=True`, new stores use Arrow; a `data_uri` that already holds a TileDB store keeps opening with TileDB, so existing datasets are unaffected.
 
 ```python
-from ade.buffer import DataBuffer
-from ade.source import DataSources
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.source import DataSources
 
 axis = "/camera/image"
 source = DataSources("/data/rosbag2/split_recording/")
@@ -590,7 +590,7 @@ export earthdata_password="..."
 Then request north/west tile ranges:
 
 ```python
-from ade.source import DataSources
+from arraydataengine.source import DataSources
 
 north = [37, 39]
 west = [122, 124]
@@ -610,7 +610,7 @@ source = DataSources("DEM", bounds=[north, west], cache_dir="/tmp/ade-dem-cache"
 DEM helper functions operate on NumPy windows, so they can be used on individual tiles, cropped patches, or lazy pipeline chunks:
 
 ```python
-from ade.ops import (
+from arraydataengine.ops import (
     dem_to_mesh,
     dem_to_point_cloud,
     mosaic_dem_tiles,

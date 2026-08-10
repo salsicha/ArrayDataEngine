@@ -75,11 +75,9 @@ python -m pip install --index-url https://test.pypi.org/simple/ \
 
 ## Notes
 
-- The distribution name is `arraydataengine`; the *import* names are `ade`
-  and `ArrayDataEngine`. An unrelated project already owns the distribution
-  name `ade` on PyPI — if a user installs both, the `ade` import name would
-  collide. This is worth mentioning in release notes; renaming the import
-  package later would be a breaking change.
+- The distribution and canonical import name are both `arraydataengine`.
+  `ArrayDataEngine` remains available as a convenience facade. The `ade`
+  console command is unchanged.
 - The sdist intentionally includes `tests/` but not `example/`, `notebooks/`,
   or any bag/mesh data.
 - PyPI uploads are immutable: a version number can never be reused, even

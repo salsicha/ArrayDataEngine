@@ -7,12 +7,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from ade.buffer import DataBuffer
-from ade.sensors.image_sensor import ImageSensor
-from ade.sensors.imu_sensor import IMUSensor
-from ade.sensors.odom_sensor import OdomSensor
-from ade.sources.cdr import CDRReader, decode_pointcloud2
-from ade.ops import (
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.sensors.image_sensor import ImageSensor
+from arraydataengine.sensors.imu_sensor import IMUSensor
+from arraydataengine.sensors.odom_sensor import OdomSensor
+from arraydataengine.sources.cdr import CDRReader, decode_pointcloud2
+from arraydataengine.ops import (
     apply_transform,
     augment_point_cloud,
     augment_trajectory,
@@ -299,7 +299,7 @@ def test_statistical_outlier_filter_keeps_single_point():
 
 
 def test_voxel_downsample_packed_key_matches_rowwise_unique():
-    from ade.ops.point_cloud import voxel_downsample
+    from arraydataengine.ops.point_cloud import voxel_downsample
 
     def rowwise_reference(points, voxel_size):
         arr = np.asarray(points)
@@ -450,7 +450,7 @@ def _range_topic(n):
 
 
 def test_parallel_cancel_resume_loses_no_rows():
-    from ade.ops.core import CancellationToken, PipelineCancelled
+    from arraydataengine.ops.core import CancellationToken, PipelineCancelled
 
     token = CancellationToken()
     checkpoint = {}
@@ -477,7 +477,7 @@ def test_parallel_cancel_resume_loses_no_rows():
 
 
 def test_serial_chunk_cancel_flushes_buffered_rows():
-    from ade.ops.core import CancellationToken, PipelineCancelled
+    from arraydataengine.ops.core import CancellationToken, PipelineCancelled
 
     token = CancellationToken()
     checkpoint = {}
@@ -593,7 +593,7 @@ def test_apply_transform_preserves_float32():
 def test_pointcloud_xyz_dense_despite_lying_row_step():
     import struct as struct_mod
 
-    from ade.sources.cdr import pointcloud_xyz
+    from arraydataengine.sources.cdr import pointcloud_xyz
 
     fields = [
         {"name": "x", "offset": 0, "datatype": 7, "count": 1},
@@ -624,7 +624,7 @@ def test_mosaic_dem_tiles_guards_absurdly_sparse_grids():
 
 
 def test_base_sensor_uses_supplied_deserializer():
-    from ade.sensors.base_sensor import BaseSensor
+    from arraydataengine.sensors.base_sensor import BaseSensor
 
     marker = object()
     calls = []
@@ -639,14 +639,14 @@ def test_base_sensor_uses_supplied_deserializer():
 
 
 def test_img_source_natural_sort():
-    from ade.sources.img_source import _natural_key
+    from arraydataengine.sources.img_source import _natural_key
 
     names = ["frame_10.png", "frame_2.png", "frame_1.png"]
     assert sorted(names, key=_natural_key) == ["frame_1.png", "frame_2.png", "frame_10.png"]
 
 
 def test_dem_source_zero_pads_tile_names():
-    from ade.sources.dem_source import DEMSource
+    from arraydataengine.sources.dem_source import DEMSource
 
     source = DEMSource([5, 6], [75, 76], cache_dir=None)
     assert source.base_url == DEMSource.DEFAULT_BASE_URL
@@ -657,7 +657,7 @@ def test_dem_source_zero_pads_tile_names():
 
 
 def test_create_synth_image_moving_runs_to_exhaustion():
-    from ade.models.image.image import create_synth_image_moving
+    from arraydataengine.models.image.image import create_synth_image_moving
 
     frames = list(create_synth_image_moving())
     assert len(frames) == 50
@@ -666,7 +666,7 @@ def test_create_synth_image_moving_runs_to_exhaustion():
 
 def test_bbox_flip_top_bottom_no_offset():
     torch = pytest.importorskip("torch")
-    from ade.visualizers.bbox import BoxList, FLIP_TOP_BOTTOM
+    from arraydataengine.visualizers.bbox import BoxList, FLIP_TOP_BOTTOM
 
     box = BoxList(torch.tensor([[0.0, 0.0, 9.0, 9.0]]), (10, 10), mode="xyxy")
     flipped = box.transpose(FLIP_TOP_BOTTOM).bbox.tolist()[0]

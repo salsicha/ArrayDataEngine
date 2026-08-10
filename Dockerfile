@@ -56,7 +56,7 @@ RUN . /opt/ros/$ROS2_DISTRO/setup.bash && . /venv/bin/activate && \
 
 WORKDIR /dataengine
 
-COPY ade /dataengine/ade
+COPY arraydataengine /dataengine/arraydataengine
 COPY ArrayDataEngine /dataengine/ArrayDataEngine
 COPY pyproject.toml README.md /dataengine/
 

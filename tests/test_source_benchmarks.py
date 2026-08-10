@@ -8,8 +8,8 @@ import cv2
 import numpy as np
 import pytest
 
-from ade.buffer import DataBuffer
-from ade.ops import (
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.ops import (
     dead_reckon_trajectory,
     dem_to_point_cloud,
     estimate_normals,
@@ -26,11 +26,11 @@ from ade.ops import (
     traversability_map,
     voxel_downsample,
 )
-from ade.sources import base_source
-from ade.sources.bag_source import BagSource
-from ade.sources.db3_source import DB3Source
-from ade.sources.dem_source import DEMSource
-from ade.sources.img_source import ImgSource
+from arraydataengine.sources import base_source
+from arraydataengine.sources.bag_source import BagSource
+from arraydataengine.sources.db3_source import DB3Source
+from arraydataengine.sources.dem_source import DEMSource
+from arraydataengine.sources.img_source import ImgSource
 
 
 MESSAGE_COUNT = 200

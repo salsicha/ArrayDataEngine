@@ -11,12 +11,12 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
-from ade.source import DataSources
-from ade.sources.img_source import ImgSource
-from ade.sources.bag_source import BagSource
-from ade.sources.db3_source import DB3Source
-from ade.sources.dem_source import DEMSource
-from ade.sources import base_source
+from arraydataengine.source import DataSources
+from arraydataengine.sources.img_source import ImgSource
+from arraydataengine.sources.bag_source import BagSource
+from arraydataengine.sources.db3_source import DB3Source
+from arraydataengine.sources.dem_source import DEMSource
+from arraydataengine.sources import base_source
 
 
 def test_img_source():
@@ -49,7 +49,7 @@ def test_img_source():
 
 
 def test_synthetic_image_pipeline_through_data_sources_and_buffer(tmp_path):
-    from ade.buffer import DataBuffer
+    from arraydataengine.buffer import DataBuffer
 
     for i in range(5):
         image = np.full((4, 4), i, dtype=np.uint8)
@@ -76,7 +76,7 @@ def test_synthetic_image_pipeline_through_data_sources_and_buffer(tmp_path):
     assert [int(frame[0, 0]) for frame in recent["data"]] == [3, 4]
 
 
-@patch("ade.sources.base_source.AnyReader")
+@patch("arraydataengine.sources.base_source.AnyReader")
 def test_bag_source_mocked(mock_any_reader):
     # Setup mock reader behaviour
     mock_reader_instance = MagicMock()
@@ -101,7 +101,7 @@ def test_bag_source_mocked(mock_any_reader):
     assert count == 10
 
 
-@patch("ade.sources.base_source.AnyReader")
+@patch("arraydataengine.sources.base_source.AnyReader")
 def test_bag_source_caches_metadata(mock_any_reader):
     mock_reader_instance = MagicMock()
     mock_reader_instance.end_time = 2000000000
@@ -201,7 +201,7 @@ def test_db3_source_chunk_path_uses_containing_directory(monkeypatch, tmp_path):
     assert captured_paths == [[Path(tmp_path)]]
 
 
-@patch("ade.sources.base_source.AnyReader")
+@patch("arraydataengine.sources.base_source.AnyReader")
 def test_db3_source_mocked(mock_any_reader):
     mock_reader_instance = MagicMock()
     mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=5)]
@@ -223,7 +223,7 @@ def test_db3_source_mocked(mock_any_reader):
         shutil.rmtree(temp_dir)
 
 
-@patch("ade.sources.base_source.AnyReader")
+@patch("arraydataengine.sources.base_source.AnyReader")
 def test_db3_source_split_directory_mocked(mock_any_reader):
     mock_reader_instance = MagicMock()
     mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]
@@ -248,7 +248,7 @@ def test_db3_source_split_directory_mocked(mock_any_reader):
         shutil.rmtree(temp_dir)
 
 
-@patch("ade.sources.base_source.AnyReader")
+@patch("arraydataengine.sources.base_source.AnyReader")
 def test_data_sources_accepts_split_db3_directory(mock_any_reader):
     mock_reader_instance = MagicMock()
     mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]

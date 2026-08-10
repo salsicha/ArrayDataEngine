@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from ade.models.image.image import (
+from arraydataengine.models.image.image import (
     fft_filter,
     fft_filter_id,
     make_beacon,

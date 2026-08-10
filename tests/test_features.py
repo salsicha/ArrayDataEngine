@@ -9,9 +9,9 @@ import struct
 import numpy as np
 import pytest
 
-from ade.buffer import DataBuffer
-from ade.cli import main as cli_main
-from ade.ops import (
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.cli import main as cli_main
+from arraydataengine.ops import (
     describe_dataset,
     describe_topic,
     format_describe,
@@ -23,8 +23,8 @@ from ade.ops import (
     write_kitti_trajectory,
     write_tum_trajectory,
 )
-from ade.sources.cdr import decode_supported_cdr_message
-from ade.sources.synthetic_source import SyntheticSource
+from arraydataengine.sources.cdr import decode_supported_cdr_message
+from arraydataengine.sources.synthetic_source import SyntheticSource
 
 
 # --- SyntheticSource -----------------------------------------------------------
@@ -51,7 +51,7 @@ def test_synthetic_source_counts_and_buffer_roundtrip():
 
 
 def test_synthetic_scans_stitch_back_to_landmarks():
-    from ade.ops import pose_to_matrix
+    from arraydataengine.ops import pose_to_matrix
 
     source = SyntheticSource(duration=4.0)
     buffer = DataBuffer(source, buffer_depth=100000, axis="/points", use_db=False, preload=0)
@@ -207,7 +207,7 @@ def test_decode_rosbridge_json_pointcloud():
 
 
 def test_malformed_payload_does_not_kill_stream(tmp_path):
-    from ade.sources.db3_source import DB3Source
+    from arraydataengine.sources.db3_source import DB3Source
 
     db_path = tmp_path / "bag_0.db3"
     connection = sqlite3.connect(db_path)
@@ -268,7 +268,7 @@ def _write_mcap_bag(bag_dir):
 
 
 def test_mcap_rosbag2_directory(tmp_path):
-    from ade.source import DataSources
+    from arraydataengine.source import DataSources
 
     bag_dir = _write_mcap_bag(tmp_path / "mcap_bag")
     source = DataSources(str(bag_dir))
@@ -280,7 +280,7 @@ def test_mcap_rosbag2_directory(tmp_path):
 
 
 def test_mcap_file_path_routes_to_bag(tmp_path):
-    from ade.source import DataSources
+    from arraydataengine.source import DataSources
 
     bag_dir = _write_mcap_bag(tmp_path / "mcap_bag")
     mcap_file = next(bag_dir.glob("*.mcap"))
@@ -345,7 +345,7 @@ def test_cli_demo(tmp_path, capsys):
 
 
 def test_cli_stack_ragged_messages():
-    from ade.cli import _stack_messages
+    from arraydataengine.cli import _stack_messages
 
     stacked = _stack_messages([np.ones((2, 3)), np.ones((4, 3))])
     assert stacked.shape == (2, 4, 3)

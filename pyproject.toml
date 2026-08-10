@@ -86,7 +86,7 @@ visualization = [
 ]
 
 [project.scripts]
-ade = "ade.cli:main"
+ade = "arraydataengine.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/salsicha/ArrayDataEngine"
@@ -95,4 +95,4 @@ Issues = "https://github.com/salsicha/ArrayDataEngine/issues"
 Changelog = "https://github.com/salsicha/ArrayDataEngine/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
-include = ["ade*", "ArrayDataEngine*"]
+include = ["arraydataengine*", "ArrayDataEngine*"]

@@ -115,7 +115,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
 
   ```bash
   python -m pytest -q
-  python -m compileall -q ade tests
+  python -m compileall -q arraydataengine ArrayDataEngine tests
   git diff --check
   ```
 
@@ -145,7 +145,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   python -m venv /tmp/ade-testpypi
   /tmp/ade-testpypi/bin/python -m pip install --upgrade pip
   /tmp/ade-testpypi/bin/python -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ arraydataengine
-  /tmp/ade-testpypi/bin/python -c "import ade; print(ade.__file__)"
+  /tmp/ade-testpypi/bin/python -c "import arraydataengine; print(arraydataengine.__file__)"
   ```
 
 - [ ] Create and push the release commit and tag:
@@ -169,7 +169,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   python -m venv /tmp/ade-pypi
   /tmp/ade-pypi/bin/python -m pip install --upgrade pip
   /tmp/ade-pypi/bin/python -m pip install arraydataengine
-  /tmp/ade-pypi/bin/python -c "import ade; print(ade.__file__)"
+  /tmp/ade-pypi/bin/python -c "import arraydataengine; print(arraydataengine.__file__)"
   ```
 
 - [ ] Create a GitHub release from the pushed tag and attach the generated `dist/` artifacts.

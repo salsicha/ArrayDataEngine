@@ -7,8 +7,8 @@ import pytest
 
 pytest.importorskip("pyarrow")
 
-from ade.buffer import DataBuffer
-from ade.buffers.arrow_buffer import ArrowBuffer
+from arraydataengine.buffer import DataBuffer
+from arraydataengine.buffers.arrow_buffer import ArrowBuffer
 
 
 class StreamSource:
@@ -299,7 +299,7 @@ def test_backend_options_rejected_for_other_backends(tmp_path):
 
 
 def test_source_pipeline_to_buffer_defaults_to_arrow(tmp_path):
-    from ade.ops import source_pipeline
+    from arraydataengine.ops import source_pipeline
 
     group_uri = str(tmp_path / "pipe_grp") + "/"
     buf = source_pipeline(StreamSource()).to_buffer(data_uri=group_uri, use_db=True)
