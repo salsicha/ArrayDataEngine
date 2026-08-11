@@ -9,7 +9,7 @@ Versions 0.1.0 and 0.2.0 were repository development milestones. They were not
 published to PyPI or tagged as GitHub releases. Version 0.3.0 is the planned
 first registry release.
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-08-11
 
 ### Added
 
