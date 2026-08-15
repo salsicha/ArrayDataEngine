@@ -2,8 +2,8 @@
 
 ## Current release state
 
-- `pyproject.toml` declares version `0.3.0`. This is the planned first PyPI
-  and GitHub release; the `0.1.0` and `0.2.0` changelog entries are
+- `pyproject.toml` declares version `0.3.1`. Version `0.3.0` was the first
+  PyPI release and release tag; the `0.1.0` and `0.2.0` changelog entries are
   repository development milestones, not published releases.
 - `.github/workflows/publish.yml` builds and verifies every `v*` tag. A
   manual dispatch is build-only unless TestPyPI is explicitly selected.
@@ -54,7 +54,7 @@ does not configure the other.
 
 ## Optional TestPyPI rehearsal
 
-A TestPyPI version can be uploaded only once. Confirm that `0.3.0` is still
+A TestPyPI version can be uploaded only once. Confirm that `0.3.1` is still
 available there, then:
 
 1. Open **GitHub → Actions → release → Run workflow**.
@@ -70,7 +70,7 @@ python -m venv /tmp/arraydataengine-testpypi
 /tmp/arraydataengine-testpypi/bin/python -m pip install \
     --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
-    "arraydataengine==0.3.0"
+    "arraydataengine==0.3.1"
 /tmp/arraydataengine-testpypi/bin/python -c \
     "import arraydataengine; print(arraydataengine.__version__)"
 ```
@@ -80,12 +80,12 @@ it cannot publish to either registry.
 
 ## Production release
 
-Before creating the tag, replace `## 0.3.0 - Unreleased` in
+Before creating the tag, replace `## 0.3.1 - Unreleased` in
 `CHANGELOG.md` with the actual release date. From a clean checkout, run:
 
 ```bash
 python -m pip install --upgrade build twine
-python scripts/check_release.py --tag v0.3.0
+python scripts/check_release.py --tag v0.3.1
 python -m pytest -q --strict-config --strict-markers tests/
 rm -rf dist/
 python -m build
@@ -100,9 +100,9 @@ the `tests` workflow to pass on that commit, then create and explicitly push
 an annotated tag:
 
 ```bash
-git tag -a v0.3.0 -m "arraydataengine 0.3.0"
+git tag -a v0.3.1 -m "arraydataengine 0.3.1"
 git push origin main
-git push origin v0.3.0
+git push origin v0.3.1
 ```
 
 The tag starts the `release` workflow. Its production job cannot run for a
@@ -114,7 +114,7 @@ After publication:
 
 1. Verify <https://pypi.org/project/arraydataengine/> and install the exact
    version in a fresh environment.
-2. Create a GitHub release from the existing `v0.3.0` tag and publish it.
+2. Create a GitHub release from the existing `v0.3.1` tag and publish it.
    Immutable releases then prevent the tag or release assets from being
    silently replaced.
 3. Confirm the PyPI page displays attestations for both the wheel and sdist.

@@ -30,6 +30,23 @@ from arraydataengine.sources.synthetic_source import SyntheticSource
 # --- SyntheticSource -----------------------------------------------------------
 
 
+def test_canonical_package_exports_public_facade():
+    import arraydataengine as ade
+
+    from arraydataengine.source import DataSources
+    from arraydataengine.visualizer import Visualizer
+
+    assert ade.DataBuffer is DataBuffer
+    assert ade.DataSources is DataSources
+    assert ade.Visualizer is Visualizer
+    assert ade.describe_topic is describe_topic
+    assert ade.ops.describe_topic is describe_topic
+    expected_exports = {
+        "DataBuffer", "DataSources", "Visualizer", "ops", "describe_topic"
+    }
+    assert expected_exports <= set(ade.__all__)
+
+
 def test_synthetic_source_is_deterministic_and_ordered():
     first = list(SyntheticSource(seed=7, duration=2.0).messages())
     second = list(SyntheticSource(seed=7, duration=2.0).messages())

@@ -127,6 +127,10 @@ jobs:
           import arraydataengine
           import ArrayDataEngine
           assert arraydataengine.__version__ == metadata.version("arraydataengine")
+          assert arraydataengine.DataBuffer is ArrayDataEngine.DataBuffer
+          assert arraydataengine.DataSources is ArrayDataEngine.DataSources
+          assert arraydataengine.Visualizer is ArrayDataEngine.Visualizer
+          assert arraydataengine.describe_topic is ArrayDataEngine.describe_topic
           assert importlib.util.find_spec("ade") is None
           PY
           ade --help >/dev/null
