@@ -9,7 +9,7 @@
 [![tests](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml/badge.svg)](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to TileDB.
+Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to Apache Arrow/Parquet (the default) or TileDB.
 
 The project is aimed at robotics and perception workflows where algorithms need synchronized windows of image, point cloud, navigation, odometry, IMU, and terrain-like array data.
 
@@ -34,12 +34,16 @@ The project is aimed at robotics and perception workflows where algorithms need 
 python -m pip install arraydataengine
 ```
 
-The distribution and canonical import name are both `arraydataengine`.
-`ArrayDataEngine` remains available as a convenience facade:
+The distribution and canonical import name are both `arraydataengine`:
 
 ```python
-from arraydataengine.buffer import DataBuffer
-from arraydataengine.source import DataSources
+from arraydataengine import DataBuffer, DataSources
+```
+
+The legacy-cased `ArrayDataEngine` package remains available as a convenience facade:
+
+```python
+import ArrayDataEngine as ADE
 ```
 
 For editable local development:
@@ -48,13 +52,25 @@ For editable local development:
 python -m pip install -e .
 ```
 
-Install optional feature groups as needed:
+The base install keeps NumPy-only workflows lightweight. Install feature extras for the source adapters and storage backends you use:
+
+| Extra | Adds |
+| --- | --- |
+| `arrow` | Default persistent Arrow/Parquet storage |
+| `tiledb` | Alternative TileDB persistent storage |
+| `image` | Image sequence loading and image-processing dependencies |
+| `ros` | ROS 1, rosbag2, MCAP, and message-conversion dependencies |
+| `dem` | DEM downloads and raster processing |
+| `visualization` | Matplotlib, Open3D, Pillow, and IPython visualization support |
+| `ml` | PyTorch and model/dataset integrations |
+| `notebook` | JupyterLab |
+| `dev` | Test tooling |
+
+Extras can be combined for either a registry or editable install:
 
 ```bash
-python -m pip install -e ".[dev,image,tiledb]"
-python -m pip install -e ".[ros]"
-python -m pip install -e ".[dem]"
-python -m pip install -e ".[visualization]"
+python -m pip install "arraydataengine[ros,arrow]"
+python -m pip install -e ".[dev,image,ros,arrow]"
 ```
 
 The full Docker/notebook environment still uses `requirements.txt`, which includes the heavier ROS, ML, notebook, and visualization dependencies.
@@ -76,6 +92,9 @@ ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by d
 `ade viewer` and `ade demo` write self-contained HTML files that render in any
 browser with no extra dependencies. Exported `.npz` files load back with
 `arraydataengine.ops.load_topic_npz` and plug straight into the ops pipelines.
+Commands that open ROS recordings require the `ros` extra; `ade ingest` also
+requires the extra for its selected storage backend (`arrow` by default or
+`tiledb`).
 
 ## Supported Sources
 
@@ -180,7 +199,7 @@ images = time_range["data"]
 timestamps = time_range["ts"]
 ```
 
-Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for both in-memory and TileDB-backed buffers.
+Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for in-memory, Arrow-backed, and TileDB-backed buffers.
 
 ## Array Operations
 
@@ -379,7 +398,7 @@ for chunk in pipeline.iter_chunks(chunk_size=32, max_workers=4):
     process(chunk.data, chunk.timestamps)
 ```
 
-Use `DataBuffer.dataset()` when the query spans multiple topics. Topic, timestamp, and message-index constraints are applied before later row filters. On TileDB-backed buffers, leading timestamp and index ranges are pushed down before payload arrays are read.
+Use `DataBuffer.dataset()` when the query spans multiple topics. Topic, timestamp, and message-index constraints are applied before later row filters. On persistent Arrow- and TileDB-backed buffers, leading timestamp and index ranges are pushed down before payload arrays are read.
 
 ```python
 selection = (
@@ -469,7 +488,7 @@ collated = collate_samples([{"points": augmented_points}, {"points": augmented_p
 torch_dataset = to_torch_dataset(iter_ml_windows(buffer.dataset(["images"]), size=2), iterable=True)
 ```
 
-Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist directly to TileDB. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row.
+Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist through the default Arrow/Parquet backend or the TileDB backend. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row.
 
 ```python
 import json
@@ -479,7 +498,7 @@ from arraydataengine.source import DataSources
 
 source = DataSources("/data/rosbag2/split_recording/")
 checkpoint = {}
-tiledb_checkpoint = {}
+persistent_checkpoint = {}
 cancel_token = CancellationToken()
 
 def report(progress):
@@ -505,10 +524,14 @@ except PipelineCancelled:
     with open("filtered_points.checkpoint.json", "w") as checkpoint_file:
         json.dump(checkpoint, checkpoint_file)
 
-tiledb_buffer = pipeline.persist_to_tiledb("/tmp/tiledb/filtered_points/", checkpoint=tiledb_checkpoint)
+persistent_buffer = pipeline.to_buffer(
+    data_uri="/tmp/ade/filtered_points/",
+    use_db=True,
+    checkpoint=persistent_checkpoint,
+)
 ```
 
-TileDB persistence uses `source.get_count(topic)` to size the destination arrays, then records the actual filtered message count as metadata.
+Persistent output uses Arrow/Parquet by default. Pass `backend="tiledb"` to `to_buffer()`, or use the `persist_to_tiledb()` convenience method, when TileDB is preferred. Persistent source pipelines require `source.get_count(topic)`; TileDB uses that count to size its dense destination arrays, while both backends record the actual filtered message count in store metadata.
 
 Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, ML-ready iterators/NumPy/PyTorch adapters/splits/augmentations/collation, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
 
