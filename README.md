@@ -563,6 +563,8 @@ with DataBuffer(
 
 Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed.
 
+New stores use escaped topic directory names so topics such as `/a/b` and `/a_b` remain distinct. Existing stores retain their original directories when reopened. Query results expose each topic's location as `source_uri`.
+
 Both backends keep timestamps, message names, frame ids, and per-message spatial bounds alongside the data. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads. Streaming reads and staged writes keep memory bounded regardless of dataset size.
 
 The Arrow backend exposes its tuning knobs through `backend_options` (reasonable defaults shown):

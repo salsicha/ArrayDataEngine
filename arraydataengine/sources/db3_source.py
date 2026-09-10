@@ -80,7 +80,7 @@ class DB3Source(RosSource):
         yield from self._sqlite_messages()
 
     def _sqlite_messages(self):
-        from .cdr import decode_supported_cdr_message
+        from .cdr import DecodedMessage, decode_supported_cdr_message, _looks_like_json
 
         for db_path in self._db3_paths():
             connection = sqlite3.connect(db_path)
@@ -96,6 +96,14 @@ class DB3Source(RosSource):
                 for fallback_timestamp, topic, msgtype, rawdata in rows:
                     try:
                         decoded = decode_supported_cdr_message(bytes(rawdata), str(msgtype))
+                        if decoded is None and not _looks_like_json(bytes(rawdata)):
+                            sensor_cls = self.SENSOR_TYPES.get(str(msgtype).rsplit("/", 1)[-1].lower())
+                            if sensor_cls is not None:
+                                # Keep reads scoped to this SQLite file while
+                                # reusing the bag reader's sensor converters.
+                                sensor = sensor_cls(bytes(rawdata), str(msgtype))
+                                data, name, timestamp = sensor.numpyify()
+                                decoded = DecodedMessage(data, name, timestamp, sensor.frame_id)
                     except (struct.error, ValueError) as exc:
                         # A malformed payload should not make the whole bag
                         # unreadable; skip the row and keep streaming.

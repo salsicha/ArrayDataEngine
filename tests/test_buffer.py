@@ -287,8 +287,8 @@ def test_tiledb_buffer_context_manager_and_timestamp_sidecar():
             assert data_dict["sensor_topic"]["name"].tolist() == [b"sensor_frame"] * 5
             assert buf.buffer_impl.timestamps == {}
 
-        array_uri = group_uri + "sensor_topic"
-        timestamp_uri = group_uri + "sensor_topic__timestamps"
+        array_uri = buf.buffer_impl._get_array_uri("sensor_topic")
+        timestamp_uri = buf.buffer_impl._get_timestamp_array_uri("sensor_topic")
         assert os.path.exists(timestamp_uri)
 
         with tiledb.open(array_uri, "r") as array:
@@ -357,7 +357,7 @@ def test_tiledb_buffer_persists_frame_and_spatial_indexes_for_pushdown(tmp_path)
     ) as buf:
         buf.load_data_db("sensor_topic")
 
-    timestamp_uri = group_uri + "sensor_topic__timestamps"
+    timestamp_uri = buf.buffer_impl._get_timestamp_array_uri("sensor_topic")
     with tiledb.open(timestamp_uri, "r") as index_array:
         attr_names = set(index_array.schema.attr_names)
         assert {"frame_id", "spatial_valid", "spatial_min_0", "spatial_max_2"}.issubset(attr_names)
@@ -554,8 +554,8 @@ def test_tiledb_buffer_synthetic_multitopic_persistence(tmp_path):
         assert np.allclose(imu_range["ts"], np.array([10.15]))
         assert np.allclose(imu_range["data"], np.array([[101.0, 101.5]]))
 
-    image_ts_uri = group_uri + "_camera_image__timestamps"
-    imu_ts_uri = group_uri + "_imu__timestamps"
+    image_ts_uri = buf.buffer_impl._get_timestamp_array_uri("/camera/image")
+    imu_ts_uri = buf.buffer_impl._get_timestamp_array_uri("/imu")
     assert os.path.exists(image_ts_uri)
     assert os.path.exists(imu_ts_uri)
 

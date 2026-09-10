@@ -179,7 +179,7 @@ def test_arrow_multitopic_persistence_and_closed_flags(tmp_path):
         assert np.allclose(buffer["/imu"]["ts"], np.array([10.05, 10.15]))
 
     manifest = json.loads(
-        (tmp_path / "multi_grp" / "_camera_image" / "manifest.json").read_text()
+        buf.buffer_impl._manifest_path("/camera/image").read_text()
     )
     assert manifest["closed"] is True
     assert manifest["count"] == 3
@@ -215,7 +215,7 @@ def test_arrow_readonly_reopen_does_not_write(tmp_path):
         reopened.get_time_range("sensor_topic", 0.0, 1e12)
 
     manifest = json.loads(
-        (tmp_path / "ro_grp" / "sensor_topic" / "manifest.json").read_text()
+        first.buffer_impl._manifest_path("sensor_topic").read_text()
     )
     assert manifest["closed"] is False
     assert manifest["count"] == 2
@@ -286,7 +286,7 @@ def test_arrow_options_and_many_fragments_preserve_order(tmp_path):
         streamed = np.concatenate([chunk.ts for chunk in chunks])
         assert np.allclose(streamed, rows["ts"])
 
-    fragments = list((tmp_path / "frag_grp" / "sensor_topic").glob("part-*.parquet"))
+    fragments = list(buf.buffer_impl._topic_dir("sensor_topic").glob("part-*.parquet"))
     assert len(fragments) == 50  # flush_bytes=1 forces one fragment per message
 
 

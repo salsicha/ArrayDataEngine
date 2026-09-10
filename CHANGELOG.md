@@ -9,6 +9,24 @@ Versions 0.1.0 and 0.2.0 were repository development milestones. They were not
 published to PyPI or tagged as GitHub releases. Version 0.3.0 was the first
 registry release.
 
+## Unreleased
+
+### Fixed
+
+- Distinct escaped storage paths and TileDB group member names prevent topic
+  collisions; existing stores retain their original locations when reopened.
+- Persistent source pipelines resume from checkpoints without skipping rows twice,
+  including filtered, multi-topic ingests.
+- Standalone SQLite ROS bags use the existing sensor converters for standard CDR
+  messages unsupported by the lightweight decoder, including IMU, image,
+  odometry, and NavSatFix messages (requires the `ros` extra).
+- Arrow appends copy staged arrays so reusing an input array cannot change
+  messages waiting to be flushed.
+- Source pipelines can append into empty Arrow buffers without invoking TileDB
+  initialization.
+- In-memory buffers retain each message's frame ID through ring wrapping,
+  views, maps, filters, windows, and sequential or parallel topic collection.
+
 ## 0.3.1 - 2026-08-14
 
 ### Fixed

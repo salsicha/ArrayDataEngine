@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 
-from ..ops.core import _decode_text, _row_frame_id, _spatial_value_in_bounds
+from ..ops.core import _row_frame_id, _spatial_value_in_bounds
 
 
 def _decode_frame_id(value) -> str | None:
@@ -27,6 +27,7 @@ class NumpyBuffer:
         self._write_indices = {}
         self._counts = {}
         self.frame_ids = {}
+        self._frame_counts = {}
         self.data_source = data_source
 
     def reset(self) -> None:
@@ -34,15 +35,17 @@ class NumpyBuffer:
         self._write_indices = {}
         self._counts = {}
         self.frame_ids = {}
+        self._frame_counts = {}
 
     def _init_topic(self, msg: dict) -> None:
         topic = msg['topic']
         self._data_buffer[topic] = np.zeros(
             self.buffer_depth,
-            dtype=[('ts', '<f8'), ('id', 'S256'), ('data', msg['data'].dtype, msg['data'].shape)]
+            dtype=[('ts', '<f8'), ('id', 'S256'), ('frame_id', object), ('data', msg['data'].dtype, msg['data'].shape)]
         )
         self._write_indices[topic] = 0
         self._counts[topic] = 0
+        self._frame_counts[topic] = {}
 
     def _logical_indices(self, topic: str) -> np.ndarray:
         depth = self.buffer_depth
@@ -96,11 +99,11 @@ class NumpyBuffer:
         if topic not in self._data_buffer:
             self._init_topic(msg)
 
-        self._record_frame_id(msg)
         write_index = self._write_indices[topic]
         self._data_buffer[topic]['data'][write_index] = msg['data']
         self._data_buffer[topic]['ts'][write_index] = msg['timestamp']
         self._data_buffer[topic]['id'][write_index] = msg['name']
+        self._record_frame_id(msg)
 
         self._write_indices[topic] = (write_index + 1) % self.buffer_depth
         self._counts[topic] = min(self._counts[topic] + 1, self.buffer_depth)
@@ -121,6 +124,7 @@ class NumpyBuffer:
                 "ts": selected["ts"].copy() if copy else selected["ts"],
                 "data": selected["data"].copy() if copy else selected["data"],
                 "topic": axis,
+                "frame_ids": selected["frame_id"].copy() if copy else selected["frame_id"],
                 **self._metadata_for_topic(axis),
             }
 
@@ -133,6 +137,7 @@ class NumpyBuffer:
             "ts": selected['ts'].copy(),
             "data": selected['data'].copy(),
             "topic": axis,
+            "frame_ids": selected["frame_id"].copy(),
             **self._metadata_for_topic(axis),
         }
 
@@ -146,6 +151,7 @@ class NumpyBuffer:
             "ts": selected['ts'].copy(),
             "data": selected['data'].copy(),
             "topic": axis,
+            "frame_ids": selected["frame_id"].copy(),
             **self._metadata_for_topic(axis),
         }
 
@@ -164,17 +170,21 @@ class NumpyBuffer:
         return self.get_time_range(axis, end - seconds, end)
 
     def _record_frame_id(self, msg: dict) -> None:
-        if "frame_id" not in msg or msg["frame_id"] is None:
-            return
-
         topic = msg["topic"]
-        frame_id = _decode_frame_id(msg["frame_id"])
-        if frame_id is None:
-            return
-        if topic not in self.frame_ids:
-            self.frame_ids[topic] = frame_id
-        elif self.frame_ids[topic] != frame_id:
-            self.frame_ids[topic] = None
+        index = self._write_indices[topic]
+        frames = self._data_buffer[topic]["frame_id"]
+        counts = self._frame_counts[topic]
+        if self._counts[topic] == self.buffer_depth:
+            previous = frames[index]
+            counts[previous] -= 1
+            if counts[previous] == 0:
+                del counts[previous]
+        frame = _decode_frame_id(msg.get("frame_id"))
+        if frame is None:
+            frame = _row_frame_id(msg["data"], msg.get("name"))
+        frames[index] = frame
+        counts[frame] = counts.get(frame, 0) + 1
+        self.frame_ids[topic] = next(iter(counts)) if len(counts) == 1 else None
 
     def _metadata_for_topic(self, topic: str) -> dict:
         frame_id = self.frame_ids.get(topic)
@@ -194,16 +204,9 @@ class NumpyBuffer:
                 selected = selected[slice(*operation.args)]
             elif operation.kind == "frame_id":
                 targets = operation.args[0]
-                frame_id = _decode_text(self.frame_ids.get(axis))
-                if frame_id is not None:
-                    if frame_id not in targets:
-                        selected = selected[:0]
-                else:
-                    mask = np.array([
-                        _row_frame_id(value, message_id) in targets
-                        for value, message_id in zip(selected["data"], selected["id"])
-                    ], dtype=bool)
-                    selected = selected[mask]
+                selected = selected[np.array([
+                    frame in targets for frame in selected["frame_id"]
+                ], dtype=bool)]
             elif operation.kind == "spatial_bounds":
                 min_bound, max_bound = operation.args
                 columns = operation.kwargs["columns"]

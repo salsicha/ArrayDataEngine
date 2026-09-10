@@ -44,6 +44,7 @@ from .common import (
     decode_frame_id,
     encode_frame_id,
     encode_name,
+    resolve_topic_path,
     slice_contains,
     spatial_bounds_for_data,
 )
@@ -95,6 +96,7 @@ class ArrowBuffer:
         self._fragments: dict[str, list[Path]] = {}
         self._staged: dict[str, dict] = {}
         self._schemas: dict[str, tuple[tuple[int, ...], str]] = {}
+        self._topic_paths: dict[str, str] = {}
 
         self.read_only = data_source is None or init_source is None
         self._hydrate_existing_topics()
@@ -109,7 +111,7 @@ class ArrowBuffer:
     # -- topic layout --------------------------------------------------------
 
     def _topic_dir(self, topic: str) -> Path:
-        return Path(self.group_uri) / topic.replace("/", "_")
+        return Path(resolve_topic_path(self.group_uri, topic, self._topic_paths))
 
     def _manifest_path(self, topic: str) -> Path:
         return self._topic_dir(topic) / MANIFEST_NAME
@@ -130,6 +132,7 @@ class ArrowBuffer:
                 _logger.warning("Skipping unreadable manifest %s: %s", manifest_path, exc)
                 continue
             topic = manifest.get("topic", entry.name)
+            self._topic_paths[topic] = str(entry)
             fragments = sorted(entry.glob("part-*.parquet"))
             count = int(manifest.get("count", 0))
             self.counters[topic] = count
@@ -165,6 +168,7 @@ class ArrowBuffer:
         self._fragments = {}
         self._staged = {}
         self._schemas = {}
+        self._topic_paths = {}
         self._hydrate_existing_topics()
 
     # -- write path ----------------------------------------------------------
@@ -228,7 +232,8 @@ class ArrowBuffer:
         staged["ts"].append(float(msg["timestamp"]))
         staged["name"].append(encode_name(msg.get("name", topic)))
         staged["frame_id"].append(encode_frame_id(msg.get("frame_id")))
-        staged["data"].append(data)
+        # Own staged payloads: sources may immediately reuse their arrays.
+        staged["data"].append(data.copy())
         staged["bytes"] += data.nbytes
         self.counters[topic] += 1
 

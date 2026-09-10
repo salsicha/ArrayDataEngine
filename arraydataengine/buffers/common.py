@@ -3,8 +3,28 @@
 from __future__ import annotations
 
 import numpy as np
+from pathlib import Path
+from urllib.parse import quote
 
 SPATIAL_INDEX_DIMS = 3
+
+
+def resolve_topic_path(group_uri, topic: str, paths: dict[str, str]) -> str:
+    """Allocate an escaped topic path, retaining hydrated legacy locations.
+
+    The suffix keeps data arrays separate from TileDB timestamp sidecars.
+    Existing directories are reserved even when their legacy name happens
+    to match the new encoding.
+    """
+    if topic not in paths:
+        base = Path(group_uri) / ("topic-" + quote(topic, safe="") + ".data")
+        candidate = base
+        suffix = 0
+        while str(candidate) in paths.values() or candidate.exists():
+            suffix += 1
+            candidate = Path(str(base) + f".{suffix}")
+        paths[topic] = str(candidate)
+    return paths[topic]
 
 
 def encode_name(name) -> bytes:

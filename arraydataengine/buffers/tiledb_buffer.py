@@ -11,6 +11,7 @@ from .common import (
     decode_frame_id as _decode_frame_id,
     encode_frame_id as _encode_frame_id,
     encode_name as _encode_name,
+    resolve_topic_path,
     slice_contains as _slice_contains,
     spatial_bounds_for_data as _spatial_bounds_for_data,
 )
@@ -52,6 +53,7 @@ class TileDBBuffer:
         self._open_arrays = {}
         self._open_timestamp_arrays = {}
         self.timestamps = {}
+        self._topic_paths = {}
         # DataBuffer passes iter(()) (not None) for a source-less reopen, so
         # a missing init_source must also mark the buffer read-only.
         self.read_only = data_source is None or init_source is None
@@ -127,10 +129,11 @@ class TileDBBuffer:
         self.closed_topics = {}
         self._resume_seen = {}
         self.timestamps = {}
+        self._topic_paths = {}
         self._hydrate_existing_topics()
 
     def _get_array_uri(self, topic: str) -> str:
-        return os.path.join(self.group_uri, topic.replace("/", "_"))
+        return resolve_topic_path(self.group_uri, topic, self._topic_paths)
 
     def _get_timestamp_array_uri(self, topic: str) -> str:
         return self._get_array_uri(topic) + "__timestamps"
@@ -159,6 +162,7 @@ class TileDBBuffer:
             if topic is None:
                 return
 
+            self._topic_paths[topic] = uri
             count = int(tiledb_array.meta.get("count", 0))
             timestamp_uri = self._get_timestamp_array_uri(topic)
             if os.path.exists(timestamp_uri):
@@ -216,7 +220,7 @@ class TileDBBuffer:
         )
         os.makedirs(uri, exist_ok=True)
         tiledb.Array.create(uri, schema)
-        self._add_group_member(uri, msg['topic'])
+        self._add_group_member(uri, os.path.basename(uri))
 
         timestamp_schema = tiledb.ArraySchema(
             domain=tiledb.Domain(
@@ -240,7 +244,7 @@ class TileDBBuffer:
         )
         os.makedirs(timestamp_uri, exist_ok=True)
         tiledb.Array.create(timestamp_uri, timestamp_schema)
-        self._add_group_member(timestamp_uri, msg['topic'] + "__timestamps")
+        self._add_group_member(timestamp_uri, os.path.basename(timestamp_uri))
 
     def roll_buffer(self, axis: str) -> None:
         self._axis = axis

@@ -255,7 +255,7 @@ def test_tiledb_readonly_reopen_does_not_write(tmp_path):
         assert reopened.buffer_impl.read_only is True
         reopened.get_time_range("t", 0.0, 1e12)
 
-    with tiledb.open(group_uri + "t__timestamps") as array:
+    with tiledb.open(first.buffer_impl._get_timestamp_array_uri("t")) as array:
         assert bool(array.meta["closed"]) is False
 
 

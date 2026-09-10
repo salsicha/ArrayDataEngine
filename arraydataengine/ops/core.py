@@ -109,6 +109,7 @@ class TopicView:
         source_uri: str | None = None,
         frame_id: str | None = None,
         copy: bool = False,
+        frame_ids: np.ndarray | None = None,
     ):
         ts = np.atleast_1d(np.asarray(timestamps, dtype=np.float64))
         values = np.asarray(data)
@@ -123,6 +124,9 @@ class TopicView:
             values = values.copy()
             normalized_ids = None if normalized_ids is None else normalized_ids.copy()
 
+        self.frame_ids = _normalize_ids(frame_ids, ts.size)
+        if copy and self.frame_ids is not None:
+            self.frame_ids = self.frame_ids.copy()
         self.ids = normalized_ids
         self.timestamps = ts
         self.data = values
@@ -134,6 +138,19 @@ class TopicView:
             topic=topic,
             source_uri=source_uri,
             frame_id=frame_id,
+        )
+
+        if self.frame_ids is not None:
+            frames = {_decode_text(frame) for frame in self.frame_ids}
+            self.metadata = replace(
+                self.metadata, frame_id=next(iter(frames)) if len(frames) == 1 else None
+            )
+
+    def _frame_id_at(self, index: int) -> str | None:
+        if self.frame_ids is not None:
+            return _decode_text(self.frame_ids[index])
+        return _decode_text(self.metadata.frame_id) or _row_frame_id(
+            self.data[index], None if self.ids is None else self.ids[index]
         )
 
     @property
@@ -152,6 +169,8 @@ class TopicView:
             "ts": self.timestamps.copy() if copy else self.timestamps,
             "data": self.data.copy() if copy else self.data,
         }
+        if self.frame_ids is not None:
+            result["frame_ids"] = self.frame_ids.copy() if copy else self.frame_ids
         if self.ids is not None:
             result["id"] = self.ids.copy() if copy else self.ids
             result["name"] = self.ids.copy() if copy else self.ids
@@ -211,13 +230,13 @@ class TopicView:
                     float(timestamp),
                     message_id,
                 )
-            return TopicView(ids, ts, mapped, metadata=self.metadata)
+            return TopicView(ids, ts, mapped, metadata=self.metadata, frame_ids=self.frame_ids)
 
         mapped_values = [
             _call_with_metadata(fn, value.copy() if copy else value, float(timestamp), message_id)
             for _, timestamp, value, message_id in self._iter_rows(chunk_size)
         ]
-        return TopicView(ids, ts, np.asarray(mapped_values), metadata=self.metadata)
+        return TopicView(ids, ts, np.asarray(mapped_values), metadata=self.metadata, frame_ids=self.frame_ids)
 
     def filter(self, predicate: Callable, copy: bool = True, chunk_size: int | None = None) -> "TopicView":
         chunk_size = _validated_chunk_size(chunk_size) if chunk_size is not None else None
@@ -288,7 +307,8 @@ class TopicView:
         ids = None if self.ids is None else self.ids[selection]
         ts = self.timestamps[selection]
         data = self.data[selection]
-        return TopicView(ids, ts, data, metadata=self.metadata, copy=copy)
+        return TopicView(ids, ts, data, metadata=self.metadata, copy=copy,
+                         frame_ids=None if self.frame_ids is None else self.frame_ids[selection])
 
     def _iter_rows(self, chunk_size: int | None = None):
         if chunk_size is None:
@@ -311,7 +331,7 @@ class _PipelineOperation:
 
 @dataclass(frozen=True)
 class _ProcessedChunk:
-    rows: tuple[tuple[Any, float, np.ndarray], ...]
+    rows: tuple[tuple[Any, float, np.ndarray, str | None], ...]
     processed: int
     emitted: int
     skipped: int
@@ -415,16 +435,17 @@ class TopicPipeline:
                 progress_interval=progress_interval,
                 max_workers=max_workers,
             ):
-                for _, timestamp, value, message_id in chunk._iter_rows():
+                for row_index, timestamp, value, message_id in chunk._iter_rows():
                     yield {
                         "id": message_id,
                         "name": message_id,
+                        "frame_id": chunk._frame_id_at(row_index),
                         "ts": float(timestamp),
                         "data": value.copy() if copy else value,
                     }
             return
 
-        for message_id, timestamp, value in self._iter_processed_rows(
+        for message_id, timestamp, value, frame_id in self._iter_processed_rows(
             chunk_size=chunk_size,
             copy=copy,
             progress_callback=progress_callback,
@@ -437,6 +458,7 @@ class TopicPipeline:
                 "name": message_id,
                 "ts": timestamp,
                 "data": value,
+                "frame_id": frame_id,
             }
 
     def iter_chunks(
@@ -454,6 +476,7 @@ class TopicPipeline:
         ids: list[Any] = []
         timestamps: list[float] = []
         values: list[np.ndarray] = []
+        frame_ids: list[str | None] = []
 
         if max_workers == 1:
             processed_rows = self._iter_processed_rows(
@@ -476,22 +499,23 @@ class TopicPipeline:
             )
 
         try:
-            for message_id, timestamp, value in processed_rows:
+            for message_id, timestamp, value, frame_id in processed_rows:
+                frame_ids.append(frame_id)
                 ids.append(message_id)
                 timestamps.append(timestamp)
                 values.append(value.copy() if copy else value)
                 if len(values) == chunk_size:
-                    yield self._make_chunk(ids, timestamps, values, copy=copy)
-                    ids, timestamps, values = [], [], []
+                    yield self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
+                    ids, timestamps, values, frame_ids = [], [], [], []
         except PipelineCancelled:
             # Rows buffered here are already recorded in the checkpoint;
             # flush them so cancel + resume does not silently lose them.
             if values:
-                yield self._make_chunk(ids, timestamps, values, copy=copy)
+                yield self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
             raise
 
         if values:
-            yield self._make_chunk(ids, timestamps, values, copy=copy)
+            yield self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
 
     def reduce(
         self,
@@ -520,14 +544,14 @@ class TopicPipeline:
         )
         if initial is None:
             try:
-                _, _, value = next(iterator)
+                _, _, value, _ = next(iterator)
             except StopIteration as exc:
                 raise ValueError("cannot reduce an empty topic without an initial value") from exc
             acc = value.copy() if copy else value
         else:
             acc = initial
 
-        for message_id, timestamp, value in iterator:
+        for message_id, timestamp, value, _ in iterator:
             try:
                 acc = fn(acc, value.copy() if copy else value, float(timestamp), message_id)
             except TypeError as exc:
@@ -552,6 +576,7 @@ class TopicPipeline:
     ) -> dict:
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
+        frame_parts = []
         chunk_lengths = []
         ts_parts = []
         data_parts = []
@@ -572,6 +597,7 @@ class TopicPipeline:
             collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
             _check_collect_limits(offset, collected_bytes, max_rows, max_bytes, allow_large)
 
+            frame_parts.append(chunk.frame_ids)
             chunk_lengths.append(len(chunk))
             ids_parts.append(None if chunk.ids is None else (chunk.ids.copy() if copy else chunk.ids))
             ts_parts.append(chunk.timestamps.copy() if copy else chunk.timestamps)
@@ -592,7 +618,8 @@ class TopicPipeline:
                 data = np.array([]) if template is None else template
         else:
             data = output if offset == output.shape[0] else output[:offset]
-        return TopicView(ids, timestamps, data, metadata=self.metadata).as_dict(copy=False)
+        return TopicView(ids, timestamps, data, metadata=self.metadata,
+                         frame_ids=_concat_chunk_ids(frame_parts, chunk_lengths)).as_dict(copy=False)
 
     def window(
         self,
@@ -633,7 +660,7 @@ class TopicPipeline:
         last_progress: PipelineProgress | None = None
 
         for chunk in self._source_chunks(chunk_size=chunk_size, copy=copy):
-            for _, timestamp, value, message_id in chunk._iter_rows():
+            for row_index, timestamp, value, message_id in chunk._iter_rows():
                 processed += 1
                 if processed <= resume_processed:
                     continue
@@ -649,6 +676,9 @@ class TopicPipeline:
                     ),
                     operation_counters=index_counters,
                 )
+                current_frame_id = chunk._frame_id_at(row_index)
+                if chunk.frame_ids is None and current_frame_id is None:
+                    current_frame_id = _decode_text(self.metadata.frame_id)
                 current_value = value.copy() if copy else value
                 current_timestamp = float(timestamp)
                 current_id = message_id
@@ -687,7 +717,7 @@ class TopicPipeline:
                         keep = _slice_contains(current_index, *operation.args)
                     elif operation.kind == "frame_id":
                         targets = operation.args[0]
-                        metadata_frame_id = _decode_text(self.metadata.frame_id)
+                        metadata_frame_id = current_frame_id
                         if metadata_frame_id is not None:
                             keep = metadata_frame_id in targets
                         else:
@@ -724,7 +754,7 @@ class TopicPipeline:
                 _notify_progress(progress_callback, last_progress, progress_interval)
 
                 if keep:
-                    yield current_id, current_timestamp, current_value
+                    yield current_id, current_timestamp, current_value, current_frame_id
 
         done_progress = PipelineProgress(
             processed=max(processed, resume_processed),
@@ -892,13 +922,15 @@ class TopicPipeline:
             return None
         return None
 
-    def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool) -> TopicView:
+    def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool, frame_ids=None) -> TopicView:
         # Preserve "no ids" instead of fabricating a column of Nones so the
         # lazy path returns the same schema as the eager path.
         ids_array = None if all(i is None for i in ids) else np.asarray(ids, dtype=object)
         ts_array = np.asarray(timestamps, dtype=np.float64)
         data_array = np.asarray(values)
-        return TopicView(ids_array, ts_array, data_array, metadata=self.metadata, copy=copy)
+        return TopicView(ids_array, ts_array, data_array, metadata=self.metadata, copy=copy,
+                         frame_ids=frame_ids if frame_ids and (self.metadata.frame_id is not None or
+                                                             any(f is not None for f in frame_ids)) else None)
 
 
 class TopicWindowPipeline:
@@ -941,8 +973,9 @@ class TopicWindowPipeline:
         ids = deque()
         timestamps = deque()
         values = deque()
+        frame_ids = deque()
 
-        for message_id, timestamp, value in self.pipeline._iter_processed_rows(
+        for message_id, timestamp, value, frame_id in self.pipeline._iter_processed_rows(
             chunk_size=chunk_size,
             copy=self.copy,
             progress_callback=progress_callback,
@@ -951,6 +984,7 @@ class TopicWindowPipeline:
             progress_interval=progress_interval,
         ):
             ids.append(message_id)
+            frame_ids.append(frame_id)
             timestamps.append(timestamp)
             values.append(value.copy() if self.copy else value)
 
@@ -960,12 +994,14 @@ class TopicWindowPipeline:
                     ids.popleft()
                     timestamps.popleft()
                     values.popleft()
+                    frame_ids.popleft()
 
             if self.size is not None:
                 while len(values) > self.size:
                     ids.popleft()
                     timestamps.popleft()
                     values.popleft()
+                    frame_ids.popleft()
 
             window_ids = None if all(i is None for i in ids) else np.asarray(ids, dtype=object)
             yield TopicView(
@@ -974,6 +1010,7 @@ class TopicWindowPipeline:
                 np.asarray(values),
                 metadata=self.pipeline.metadata,
                 copy=self.copy,
+                frame_ids=np.asarray(frame_ids, dtype=object),
             )
 
     def collect(
@@ -1501,6 +1538,16 @@ class SourcePipeline:
             backend=backend,
             preload=0,
         )
+        if result.use_db and _checkpoint_processed(checkpoint) > 0:
+            # iter_messages already resumes at the checkpoint. Explicit
+            # appends bypass the backend's full-source replay skipping.
+            return self._append_to_buffer(
+                result,
+                progress_callback=progress_callback,
+                cancel_token=cancel_token,
+                checkpoint=checkpoint,
+                progress_interval=progress_interval,
+            )
         try:
             result.load_data_db(selected_axis)
         except PipelineCancelled:
@@ -1575,7 +1622,7 @@ class SourcePipeline:
                     buffer.topics.append(topic)
                 if hasattr(buffer.buffer_impl, "topics") and topic not in buffer.buffer_impl.topics:
                     buffer.buffer_impl.topics.append(topic)
-                if getattr(buffer, "use_db", False):
+                if getattr(buffer, "backend", None) == "tiledb":
                     self._prepare_tiledb_append(buffer, message)
                 buffer.append_buffer(message)
         except PipelineCancelled:
@@ -1656,6 +1703,7 @@ def topic_view(
             topic_data.ids,
             topic_data.timestamps,
             topic_data.data,
+            frame_ids=topic_data.frame_ids,
             metadata=topic_data.metadata if metadata is None else metadata,
             topic=topic,
             source_uri=source_uri,
@@ -1672,11 +1720,17 @@ def topic_view(
         if topic is None and "id" in topic_data and np.asarray(topic_data["id"]).ndim == 0:
             topic = _decode_scalar(topic_data["id"])
 
+    row_frames = None
+    if isinstance(topic_data, dict):
+        row_frames = topic_data.get("frame_ids")
+    elif isinstance(topic_data, np.ndarray) and topic_data.dtype.names and "frame_id" in topic_data.dtype.names:
+        row_frames = topic_data["frame_id"]
     ids, ts, data = topic_parts(topic_data)
     return TopicView(
         ids,
         ts,
         data,
+        frame_ids=row_frames,
         metadata=metadata if metadata is not None else inferred_metadata,
         topic=topic,
         source_uri=source_uri,
@@ -1726,7 +1780,11 @@ def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOpera
         elif operation.kind == "frame_id":
             targets = operation.args[0]
             metadata_frame_id = _decode_text(selected.metadata.frame_id)
-            if metadata_frame_id is not None:
+            if selected.frame_ids is not None:
+                selected = selected._select(np.array([
+                    selected._frame_id_at(i) in targets for i in range(len(selected))
+                ], dtype=bool), copy=False)
+            elif metadata_frame_id is not None:
                 if metadata_frame_id not in targets:
                     selected = selected._select(np.zeros(len(selected), dtype=bool), copy=False)
             else:
@@ -1764,10 +1822,11 @@ def _process_pipeline_chunk(
     skipped = 0
     last_id = None
     last_timestamp = None
-    metadata_frame_id = _decode_text(metadata.frame_id)
-
-    for _, timestamp, value, message_id in chunk._iter_rows():
+    for row_index, timestamp, value, message_id in chunk._iter_rows():
         processed += 1
+        metadata_frame_id = chunk._frame_id_at(row_index)
+        if chunk.frame_ids is None and metadata_frame_id is None:
+            metadata_frame_id = _decode_text(metadata.frame_id)
         current_value = value.copy() if copy else value
         current_timestamp = float(timestamp)
         current_id = message_id
@@ -1826,7 +1885,7 @@ def _process_pipeline_chunk(
 
         if keep:
             emitted += 1
-            rows.append((current_id, current_timestamp, current_value))
+            rows.append((current_id, current_timestamp, current_value, metadata_frame_id))
         else:
             skipped += 1
 
@@ -2307,7 +2366,8 @@ def _validated_max_workers(max_workers: int | None) -> int:
 def _topic_view_nbytes(view: TopicView, include_data: bool = True) -> int:
     ids_nbytes = 0 if view.ids is None else view.ids.nbytes
     data_nbytes = view.data.nbytes if include_data else 0
-    return int(data_nbytes + view.timestamps.nbytes + ids_nbytes)
+    frames_nbytes = 0 if view.frame_ids is None else view.frame_ids.nbytes
+    return int(data_nbytes + view.timestamps.nbytes + ids_nbytes + frames_nbytes)
 
 
 def _topic_result_nbytes(topic: Mapping[str, Any]) -> int:
@@ -2315,6 +2375,8 @@ def _topic_result_nbytes(topic: Mapping[str, Any]) -> int:
     ids = topic.get("id", topic.get("name"))
     if ids is not None:
         total += np.asarray(ids).nbytes
+    if topic.get("frame_ids") is not None:
+        total += np.asarray(topic["frame_ids"]).nbytes
     return int(total)
 
 
