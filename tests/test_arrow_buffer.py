@@ -308,3 +308,158 @@ def test_source_pipeline_to_buffer_defaults_to_arrow(tmp_path):
         assert buf.get_size() == 5
     finally:
         buf.close()
+
+
+@pytest.mark.parametrize("committed_rows", [0, 1])
+@pytest.mark.parametrize("failure", ["fragment", "manifest"])
+def test_arrow_recovers_after_process_exit(tmp_path, committed_rows, failure):
+    import subprocess
+    import sys
+
+    script = r"""
+import os
+import sys
+import numpy as np
+from arraydataengine.buffers.arrow_buffer import ArrowBuffer
+root, committed, failure = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+buf = ArrowBuffer(None, None, root, flush_bytes=1)
+def message(i):
+    return dict(topic='sensor_topic', timestamp=100.0+i*0.1, name=b'sensor_frame',
+                frame_id='map', data=np.array([float(i), float(i)*2]))
+for i in range(committed):
+    buf.append_buffer(message(i))
+replace = os.replace
+def crash_before_publish(src, dst):
+    if failure == 'fragment' and str(dst).endswith('.parquet'):
+        os._exit(73)
+    if failure == 'manifest' and len(buf._fragments['sensor_topic']) > committed:
+        os._exit(73)
+    replace(src, dst)
+os.replace = crash_before_publish
+buf.append_buffer(message(committed))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path),
+                             str(committed_rows), failure], capture_output=True, text=True)
+    assert result.returncode == 73, result.stderr
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="sensor_topic") as reader:
+        assert reader.get_size() == committed_rows
+        assert len(reader.topic("sensor_topic").collect()["ts"]) == committed_rows
+    with DataBuffer(StreamSource(3), data_uri=tmp_path, backend="arrow",
+                    axis="sensor_topic", preload=0, backend_options={"flush_bytes": 1}) as resumed:
+        resumed.load_data_db("sensor_topic")
+        assert resumed.get_size() == 3
+        expected = [[0, 0], [1, 2], [2, 4]]
+        np.testing.assert_array_equal(resumed.get_index_range("sensor_topic")["data"], expected)
+        np.testing.assert_array_equal(resumed.topic("sensor_topic").collect()["data"], expected)
+
+
+def test_arrow_reconciles_legacy_fragment_count(tmp_path):
+    with DataBuffer(StreamSource(2), data_uri=tmp_path, backend="arrow",
+                    axis="sensor_topic", preload=0, backend_options={"flush_bytes": 1}) as buf:
+        buf.load_data_db("sensor_topic")
+    manifest_path = buf.buffer_impl._manifest_path("sensor_topic")
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["fragments"]
+    manifest["count"] = 1
+    manifest_path.write_text(json.dumps(manifest))
+    # Freeze the old instance so its destructor cannot update our legacy fixture.
+    buf.buffer_impl.read_only = True
+    with DataBuffer(StreamSource(3), data_uri=tmp_path, backend="arrow",
+                    axis="sensor_topic", preload=0) as resumed:
+        assert resumed.get_size() == 2
+        resumed.load_data_db("sensor_topic")
+        np.testing.assert_array_equal(resumed.get_index_range("sensor_topic")["data"],
+                                      [[0, 0], [1, 2], [2, 4]])
+
+
+@pytest.mark.parametrize("flush_bytes", [1, 1000000])
+def test_arrow_rejects_dtype_changes_without_modifying_data(tmp_path, flush_bytes):
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow",
+                    backend_options={"flush_bytes": flush_bytes}) as buf:
+        message = dict(topic="t", timestamp=0., name="first", frame_id="map",
+                       data=np.array([1, 2], dtype=np.int32))
+        buf.append_buffer(message)
+        with pytest.raises(ValueError, match="must keep dtype"):
+            buf.append_buffer({**message, "data": np.array([1.5, 2.5])})
+        assert buf.counters["t"] == 1
+        buf.append_buffer({**message, "timestamp": 1.})
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="t") as reader:
+        rows = reader.get_index_range("t")
+        assert rows["data"].dtype == np.int32
+        np.testing.assert_array_equal(rows["data"], [[1, 2], [1, 2]])
+        with pytest.raises(ValueError, match="must keep dtype"):
+            reader.append_buffer({**message, "data": np.array([1., 2.])})
+
+
+@pytest.mark.parametrize("frames", [["map", "odom", None, "map"], ["map", None], [None, "map"]])
+@pytest.mark.parametrize("workers", [1, 2])
+def test_arrow_preserves_row_frames_through_reads_and_maps(tmp_path, frames, workers):
+    from arraydataengine.ops import topic_pipeline
+
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow") as buf:
+        for i, frame in enumerate(frames):
+            buf.append_buffer(dict(topic="t", timestamp=float(i), name=str(i),
+                                   frame_id=frame, data=np.array([float(i)])))
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="t") as reader:
+        expected = [i for i, frame in enumerate(frames) if frame == "map"]
+        assert reader.get_index_range("t")["frame_ids"].tolist() == frames
+        assert reader.get_time_range("t", 0, len(frames))["frame_ids"].tolist() == frames
+        assert reader.topic_view("t").frame_ids.tolist() == frames
+        pipeline = reader.topic("t")
+        assert pipeline.frame_id("map").collect()["ts"].tolist() == expected
+        mapped = pipeline.map(lambda data: data + 10).frame_id("map").collect(
+            chunk_size=1, max_workers=workers)
+        assert mapped["ts"].tolist() == expected
+        assert mapped["frame_ids"].tolist() == ["map"] * len(expected)
+        collected = pipeline.collect(chunk_size=1, max_workers=workers)
+        assert collected["frame_ids"].tolist() == frames
+        assert topic_pipeline(collected).frame_id("map").collect()["ts"].tolist() == expected
+
+
+def test_arrow_ignores_stale_topic_frame_metadata(tmp_path):
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow") as buf:
+        for i, frame in enumerate(["map", None]):
+            buf.append_buffer(dict(topic="t", timestamp=float(i), name=str(i),
+                                   frame_id=frame, data=np.array([float(i)])))
+    manifest_path = buf.buffer_impl._manifest_path("t")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["frame_id"] = "map"  # Metadata written by older versions.
+    manifest_path.write_text(json.dumps(manifest))
+    buf.buffer_impl.read_only = True
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="t") as reader:
+        assert reader.topic("t").frame_id("map").collect()["ts"].tolist() == [0.]
+
+
+
+def test_arrow_failed_manifest_commit_can_retry(tmp_path, monkeypatch):
+    import os
+
+    buf = ArrowBuffer(None, None, tmp_path, flush_bytes=1)
+    message = dict(topic="t", timestamp=0., name="first", data=np.array([1.]))
+    replace = os.replace
+
+    def fail_commit(src, dst):
+        if str(dst).endswith("manifest.json") and buf._persisted.get("t", 0):
+            raise OSError("simulated manifest write failure")
+        replace(src, dst)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", fail_commit)
+        with pytest.raises(OSError, match="simulated"):
+            buf.append_buffer(message)
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="t") as reader:
+        assert reader.get_size() == 0
+    buf.close()
+    with DataBuffer(None, data_uri=tmp_path, backend="arrow", axis="t") as reader:
+        assert reader.get_size() == 1
+        np.testing.assert_array_equal(reader.get_index_range("t")["data"], [[1.]])
+
+
+def test_arrow_reports_unreadable_manifest_without_rewriting(tmp_path):
+    topic_dir = tmp_path / "topic-t.data"
+    topic_dir.mkdir()
+    manifest = topic_dir / "manifest.json"
+    manifest.write_text('{"topic":')
+    with pytest.raises(ValueError, match="Unreadable Arrow manifest"):
+        DataBuffer(StreamSource(), data_uri=tmp_path, backend="arrow", preload=0)
+    assert manifest.read_text() == '{"topic":'

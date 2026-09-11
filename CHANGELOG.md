@@ -13,6 +13,14 @@ registry release.
 
 ### Fixed
 
+- Arrow stores publish fragments and manifests atomically, record committed
+  fragments, and reconcile legacy fragment counts when resuming interrupted ingests.
+- Arrow reads preserve per-message frame IDs through maps and collection, and
+  frame filters exclude messages with missing frames even in older stores.
+- Arrow appends reject dtype changes before staging incompatible messages.
+- ROS1 and rosbag2 point-cloud readers use the built-in NumPy decoder instead
+  of requiring the undeclared `ros2_numpy` dependency.
+
 - Distinct escaped storage paths and TileDB group member names prevent topic
   collisions; existing stores retain their original locations when reopened.
 - Persistent source pipelines resume from checkpoints without skipping rows twice,

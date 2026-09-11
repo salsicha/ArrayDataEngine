@@ -30,13 +30,18 @@ class PointCloudSensor(BaseSensor):
         self.max_points = self.DEFAULT_MAX_POINTS if max_points is None else max_points
 
     def numpyify(self):
-        import ros2_numpy as rnp
+        from ..sources.cdr import pointcloud_xyz
 
         msg = self.deserialize()
         self._capture_header_metadata(msg)
-        # ros2_numpy names this pointcloud2_to_xyz_array; it returns an (N, 3)
-        # float array (there is no point_cloud2_to_array / "xyz"-keyed dict).
-        pc_2_np = rnp.point_cloud2.pointcloud2_to_xyz_array(msg)
+        pc_2_np = pointcloud_xyz(
+            bytes(msg.data),
+            [dict(name=field.name, offset=field.offset, datatype=field.datatype,
+                  count=field.count) for field in msg.fields],
+            msg.height, msg.width, msg.point_step, msg.row_step, bool(msg.is_bigendian),
+        )
+        # Match the previous converter's removal of non-finite XYZ points.
+        pc_2_np = pc_2_np[np.isfinite(pc_2_np).all(axis=1)]
         if pc_2_np.shape[0] > self.max_points:
             raise ValueError(
                 f"PointCloud2 has {pc_2_np.shape[0]} points, which exceeds max_points={self.max_points}"

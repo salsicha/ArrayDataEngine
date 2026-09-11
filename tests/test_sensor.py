@@ -123,11 +123,13 @@ def test_pointcloud_sensor_pads_points_and_rejects_oversized_clouds(monkeypatch)
     msg.header.stamp.nanosec = 500000000
     msg.__class__.__name__ = "PointCloud2"
     xyz = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
-    # ros2_numpy's real API: pointcloud2_to_xyz_array returns an (N, 3) array
-    fake_rnp = SimpleNamespace(
-        point_cloud2=SimpleNamespace(pointcloud2_to_xyz_array=lambda msg: xyz)
-    )
-    monkeypatch.setitem(sys.modules, "ros2_numpy", fake_rnp)
+    msg.height, msg.width = 1, 2
+    msg.point_step, msg.row_step = 12, 24
+    msg.is_bigendian = False
+    msg.fields = [SimpleNamespace(name=name, offset=i * 4, datatype=7, count=1)
+                  for i, name in enumerate(("x", "y", "z"))]
+    msg.data = xyz.astype("<f4").tobytes()
+    monkeypatch.setitem(sys.modules, "ros2_numpy", None)
 
     sensor = PointCloudSensor(rawdata=b"", msgtype="sensor_msgs/msg/PointCloud2", max_points=4)
     with patch.object(PointCloudSensor, "deserialize", return_value=msg):
@@ -184,3 +186,49 @@ def test_imu_sensor_numpyify():
         assert np.allclose(npified[2], np.array([0.5, 0.6, 0.7, 0.0]))
         # Linear acceleration: x, y, z, 0
         assert np.allclose(npified[4], np.array([9.8, 0.1, -0.1, 0.0]))
+
+
+@pytest.mark.parametrize("is_bigendian", [False, True])
+@pytest.mark.parametrize("ros_version", [1, 2])
+def test_pointcloud_bags_without_ros2_numpy(tmp_path, monkeypatch, is_bigendian, ros_version):
+    pytest.importorskip("rosbags")
+    from rosbags.typesys import Stores, get_typestore
+    from arraydataengine.source import DataSources
+
+    store = get_typestore(Stores.ROS1_NOETIC if ros_version == 1 else Stores.ROS2_JAZZY)
+    types = store.types
+    stamp = types["builtin_interfaces/msg/Time"](3, 500000000)
+    Header = types["std_msgs/msg/Header"]
+    header = Header(0, stamp, "lidar") if ros_version == 1 else Header(stamp, "lidar")
+    Field = types["sensor_msgs/msg/PointField"]
+    # Deliberately reorder the fields and pad both points and organized rows.
+    fields = [Field("z", 8, 7, 1), Field("x", 0, 7, 1), Field("y", 4, 7, 1)]
+    xyz = np.array([[1, 2, 3], [np.nan, 5, 6], [7, 8, 9], [10, 11, 12]], dtype=np.float32)
+    raw = bytearray(80)
+    for i, point in enumerate(xyz):
+        offset = (i // 2) * 40 + (i % 2) * 16
+        raw[offset:offset + 12] = point.astype(">f4" if is_bigendian else "<f4").tobytes()
+    msg = types["sensor_msgs/msg/PointCloud2"](
+        header, 2, 2, fields, is_bigendian, 16, 40,
+        np.frombuffer(raw, dtype=np.uint8), False,
+    )
+    if ros_version == 1:
+        from rosbags.rosbag1 import Writer
+        path = tmp_path / "cloud.bag"
+        writer = Writer(path)
+        serialize = store.serialize_ros1
+    else:
+        from rosbags.rosbag2 import Writer
+        path = tmp_path / "cloud"
+        writer = Writer(path, version=9)
+        serialize = store.serialize_cdr
+    with writer:
+        connection = writer.add_connection("/points", msg.__msgtype__, typestore=store)
+        writer.write(connection, 3500000000, serialize(msg, msg.__msgtype__))
+    monkeypatch.setitem(sys.modules, "ros2_numpy", None)
+    rows = list(DataSources(str(path)).get_message())
+    assert len(rows) == 1
+    assert rows[0]["timestamp"] == 3.5
+    assert rows[0]["frame_id"] == "lidar"
+    np.testing.assert_allclose(rows[0]["data"][:3], xyz[[0, 2, 3]])
+    assert not rows[0]["data"][3:].any()

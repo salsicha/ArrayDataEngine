@@ -6,6 +6,11 @@ Each topic is a directory of Parquet fragment files plus a ``manifest.json``:
     <group_uri>/<topic>/part-00001.parquet
     <group_uri>/<topic>/manifest.json
 
+The manifest lists committed fragments. Temporary files and fragments absent
+from that list are ignored after an interrupted write; replaying the source
+replaces uncommitted fragments. Legacy stores without a fragment list reconcile
+their message counts against Parquet metadata before resuming.
+
 Appends stage in memory and flush a fragment when the staged payload reaches
 ``flush_bytes`` (or on close), so ingest memory stays bounded regardless of
 dataset size. Reads stream through ``pyarrow.dataset`` with bounded readahead,
@@ -36,6 +41,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +61,21 @@ _logger = logging.getLogger(__name__)
 DEFAULT_FLUSH_BYTES = 32 * 1024 * 1024
 DEFAULT_ROW_GROUP_BYTES = 16 * 1024 * 1024
 MANIFEST_NAME = "manifest.json"
+
+
+@contextmanager
+def _atomic_output(path: Path):
+    """Publish a complete file using a same-directory rename."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    temporary = Path(temporary)
+    try:
+        yield temporary
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class ArrowBuffer:
@@ -99,7 +121,12 @@ class ArrowBuffer:
         self._topic_paths: dict[str, str] = {}
 
         self.read_only = data_source is None or init_source is None
-        self._hydrate_existing_topics()
+        try:
+            self._hydrate_existing_topics()
+        except Exception:
+            # A failed open must not rewrite partially hydrated metadata on GC.
+            self.read_only = True
+            raise
 
     # -- properties ----------------------------------------------------------
 
@@ -129,16 +156,33 @@ class ArrowBuffer:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                _logger.warning("Skipping unreadable manifest %s: %s", manifest_path, exc)
-                continue
+                raise ValueError(f"Unreadable Arrow manifest {manifest_path}") from exc
             topic = manifest.get("topic", entry.name)
             self._topic_paths[topic] = str(entry)
-            fragments = sorted(entry.glob("part-*.parquet"))
-            count = int(manifest.get("count", 0))
+            committed = manifest.get("fragments")
+            if committed is None:
+                # Legacy manifests predate explicit commit lists. Reconcile
+                # their counters with complete fragments before replaying.
+                fragments = sorted(entry.glob("part-*.parquet"))
+            else:
+                if not isinstance(committed, list) or any(
+                    not isinstance(name, str) or Path(name).name != name
+                    or not name.startswith("part-") or not name.endswith(".parquet")
+                    for name in committed
+                ) or len(set(committed)) != len(committed):
+                    raise ValueError(f"Invalid fragment list in {manifest_path}")
+                fragments = [entry / name for name in committed]
+            import pyarrow.parquet as pq
+
+            count = sum(pq.read_metadata(path).num_rows for path in fragments)
+            if committed is not None and count != int(manifest.get("count", 0)):
+                raise ValueError(f"Fragment count disagrees with {manifest_path}")
             self.counters[topic] = count
             self._persisted[topic] = count
             self._fragments[topic] = fragments
-            self.closed_topics[topic] = bool(manifest.get("closed", False))
+            self.closed_topics[topic] = (
+                bool(manifest.get("closed", False)) and count == int(manifest.get("count", 0))
+            )
             self.frame_ids[topic] = manifest.get("frame_id")
             name = manifest.get("name")
             if name is not None:
@@ -223,6 +267,11 @@ class ArrowBuffer:
                 "pad variable-size messages to a fixed shape before appending"
             )
 
+        if data.dtype != np.dtype(self._schemas[topic][1]):
+            raise ValueError(
+                f"topic {topic} messages must keep dtype {self._schemas[topic][1]}, got {data.dtype}"
+            )
+
         self.names[topic] = encode_name(msg.get("name", topic))
         self._record_frame_id(msg)
 
@@ -241,13 +290,9 @@ class ArrowBuffer:
             self._flush_topic(topic)
 
     def _record_frame_id(self, msg: dict) -> None:
-        if "frame_id" not in msg or msg["frame_id"] is None:
-            return
         topic = msg["topic"]
-        frame_id = decode_frame_id(msg["frame_id"])
-        if frame_id is None:
-            return
-        if topic not in self.frame_ids:
+        frame_id = decode_frame_id(msg.get("frame_id")) or None
+        if self.counters.get(topic, 0) == 0 or topic not in self.frame_ids:
             self.frame_ids[topic] = frame_id
         elif self.frame_ids[topic] != frame_id:
             self.frame_ids[topic] = None
@@ -262,7 +307,6 @@ class ArrowBuffer:
 
         data = np.ascontiguousarray(np.asarray(staged["data"]))
         shape, dtype = self._schemas[topic]
-        tensor_type = pa.fixed_shape_tensor(pa.from_numpy_dtype(np.dtype(dtype)), shape)
         spatial = [spatial_bounds_for_data(value) for value in staged["data"]]
 
         columns: dict = {
@@ -287,16 +331,27 @@ class ArrowBuffer:
         topic_dir = self._topic_dir(topic)
         topic_dir.mkdir(parents=True, exist_ok=True)
         fragment_path = topic_dir / f"part-{len(self._fragments[topic]):05d}.parquet"
-        pq.write_table(
-            table,
-            fragment_path,
-            row_group_size=int(rows_per_group),
-            compression=self.compression or "none",
-        )
+        # Establish a commit list before writing, including when upgrading a
+        # legacy store. An interrupted first write retains the topic's path.
+        self._write_manifest(topic)
+        with _atomic_output(fragment_path) as temporary:
+            pq.write_table(
+                table,
+                temporary,
+                row_group_size=int(rows_per_group),
+                compression=self.compression or "none",
+            )
         self._fragments[topic].append(fragment_path)
         self._persisted[topic] += len(staged["ts"])
+        try:
+            self._write_manifest(topic)
+        except Exception:
+            self._fragments[topic].pop()
+            self._persisted[topic] -= len(staged["ts"])
+            # Keep staged rows for retry; the uncommitted file is ignored on
+            # reopen and atomically replaced by the next successful flush.
+            raise
         self._staged[topic] = {"ts": [], "name": [], "frame_id": [], "data": [], "bytes": 0}
-        self._write_manifest(topic)
 
     def _write_manifest(self, topic: str, closed: bool | None = None) -> None:
         if closed is None:
@@ -307,6 +362,7 @@ class ArrowBuffer:
         manifest = {
             "topic": topic,
             "count": self._persisted.get(topic, 0),
+            "fragments": [path.name for path in self._fragments.get(topic, [])],
             "closed": bool(closed),
             "name": self.names.get(topic, b"").decode(errors="replace"),
             "frame_id": self.frame_ids.get(topic),
@@ -315,7 +371,8 @@ class ArrowBuffer:
         }
         topic_dir = self._topic_dir(topic)
         topic_dir.mkdir(parents=True, exist_ok=True)
-        self._manifest_path(topic).write_text(json.dumps(manifest), encoding="utf-8")
+        with _atomic_output(self._manifest_path(topic)) as temporary:
+            temporary.write_text(json.dumps(manifest), encoding="utf-8")
 
     def close_topic(self, topic: str, closed: bool | None = None) -> None:
         if self.read_only:
@@ -363,6 +420,7 @@ class ArrowBuffer:
             "name": np.array([], dtype=object),
             "ts": np.array([], dtype=np.float64),
             "data": np.empty((0, *shape), dtype=np.dtype(dtype)),
+            "frame_ids": np.array([], dtype=object),
             "topic": topic,
             "source_uri": str(self._topic_dir(topic)),
         }
@@ -380,6 +438,9 @@ class ArrowBuffer:
             "name": names.copy() if copy else names,
             "ts": np.asarray(table["ts"].combine_chunks(), dtype=np.float64).copy(),
             "data": data,
+            "frame_ids": np.array([
+                decode_frame_id(frame) or None for frame in table["frame_id"].to_pylist()
+            ], dtype=object),
             "topic": topic,
             "source_uri": str(self._topic_dir(topic)),
         }
@@ -493,15 +554,10 @@ class ArrowBuffer:
                         keep[row] = slice_contains(position, *operation.args)
                 elif operation.kind == "frame_id":
                     targets = operation.args[0]
-                    topic_frame = decode_frame_id(self.frame_ids.get(axis))
-                    if topic_frame is not None:
-                        if topic_frame not in targets:
-                            keep[:] = False
-                    else:
-                        frames = table["frame_id"].to_pylist()
-                        for row, frame in enumerate(frames):
-                            if keep[row] and decode_frame_id(frame) not in targets:
-                                keep[row] = False
+                    frames = table["frame_id"].to_pylist()
+                    for row, frame in enumerate(frames):
+                        if keep[row] and (decode_frame_id(frame) or None) not in targets:
+                            keep[row] = False
                 elif operation.kind == "spatial_bounds":
                     min_bound, max_bound = operation.args
                     columns = operation.kwargs["columns"]
@@ -533,6 +589,9 @@ class ArrowBuffer:
                 "name": names.copy() if copy else names,
                 "ts": np.asarray(selected["ts"], dtype=np.float64).copy(),
                 "data": data,
+                "frame_ids": np.array([
+                    decode_frame_id(frame) or None for frame in selected["frame_id"].to_pylist()
+                ], dtype=object),
                 "topic": axis,
                 "source_uri": str(self._topic_dir(axis)),
             }
