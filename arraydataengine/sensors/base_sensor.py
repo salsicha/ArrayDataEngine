@@ -2,17 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
-import importlib
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Any
-
-try:
-    from rosbags.serde import deserialize_cdr as _deserialize_cdr
-except ImportError:
-    _deserialize_cdr = None
 
 
 @lru_cache(maxsize=1)
@@ -45,31 +39,17 @@ class BaseSensor:
         self.frame_id: str | None = None
         self._deserializer = deserializer
 
-        # ROSbags to native ROS class converter
-        self.NATIVE_CLASSES: dict[str, Any] = {}
-
 
     def deserialize(self):
         if self._deserializer is not None:
             return self._deserializer(self.rawdata, self.msgtype)
-        if _deserialize_cdr is not None:
-            msg = _deserialize_cdr(self.rawdata, self.msgtype)
-        else:
-            msg = _get_typestore().deserialize_cdr(self.rawdata, self.msgtype)
-        return msg
+        return _get_typestore().deserialize_cdr(self.rawdata, self.msgtype)
 
 
     def numpyify(self) -> tuple:
-        import ros2_numpy as rnp
+        """Return `(array, type_name, timestamp)`; implemented by each sensor."""
 
-        msg = self.deserialize()
-        self._capture_header_metadata(msg)
-        msg = self.rosbags_to_native(msg)
-        npified = rnp.numpify(msg)
-        sec = msg.header.stamp.sec
-        nanosec = msg.header.stamp.nanosec
-        ts = sec + nanosec * 1e-9
-        return npified, msg.__class__.__name__, ts
+        raise NotImplementedError(f"{type(self).__name__} does not implement numpyify()")
 
     def _capture_header_metadata(self, msg: Any) -> None:  # noqa: ANN401
         header = getattr(msg, "header", None)
@@ -87,36 +67,3 @@ class BaseSensor:
         if isinstance(value, str):
             return value
         return None
-
-
-    def rosbags_to_native(self, msg: Any) -> Any:  # noqa: ANN401
-        """Convert rosbags message to native message.
-
-        Args:
-            msg: Rosbags message.
-
-        Returns:
-            Native message.
-
-        """
-
-        msgtype: str = msg.__msgtype__
-        if msgtype not in self.NATIVE_CLASSES:
-            pkg, name = msgtype.rsplit('/', 1)
-            self.NATIVE_CLASSES[msgtype] = getattr(importlib.import_module(pkg.replace('/', '.')), name)
-
-        fields = {}
-        for name, field in msg.__dataclass_fields__.items():
-            if 'ClassVar' in field.type:
-                continue
-            value = getattr(msg, name)
-            if '__msg__' in field.type:
-                value = self.rosbags_to_native(value)
-            elif isinstance(value, list):
-                value = [self.rosbags_to_native(x) for x in value]
-            elif isinstance(value, np.ndarray):
-                value = value.tolist()
-            fields[name] = value
-
-        return self.NATIVE_CLASSES[msgtype](**fields)
-    

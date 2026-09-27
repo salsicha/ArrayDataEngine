@@ -86,6 +86,7 @@ def test_bag_source_mocked(mock_any_reader):
     mock_conn = MagicMock()
     mock_conn.topic = "/camera/image"
     mock_conn.msgcount = 10
+    mock_conn.msgtype = "sensor_msgs/msg/Image"
     mock_reader_instance.connections = [mock_conn]
 
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
@@ -110,6 +111,7 @@ def test_bag_source_caches_metadata(mock_any_reader):
     mock_conn = MagicMock()
     mock_conn.topic = "/camera/image"
     mock_conn.msgcount = 10
+    mock_conn.msgtype = "sensor_msgs/msg/Image"
     mock_reader_instance.connections = [mock_conn]
 
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
@@ -172,7 +174,8 @@ def test_synthetic_db3_multitopic_stream_filters_and_counts(monkeypatch, tmp_pat
     db3_path.write_text("dummy")
     source = DB3Source(str(db3_path))
 
-    assert source.get_topics() == ["/camera/image", "/imu", "/diagnostics"]
+    # Unsupported types are not listed: get_topics matches what messages() yields.
+    assert source.get_topics() == ["/camera/image", "/imu"]
     assert source.get_count("/camera/image") == 2
     assert source.get_count("/imu") == 1
     assert np.isclose(source.get_duration(), 3.0e-8)
@@ -204,7 +207,7 @@ def test_db3_source_chunk_path_uses_containing_directory(monkeypatch, tmp_path):
 @patch("arraydataengine.sources.base_source.AnyReader")
 def test_db3_source_mocked(mock_any_reader):
     mock_reader_instance = MagicMock()
-    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=5)]
+    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=5, msgtype="sensor_msgs/msg/Image")]
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
 
     temp_dir = tempfile.mkdtemp()
@@ -226,7 +229,7 @@ def test_db3_source_mocked(mock_any_reader):
 @patch("arraydataengine.sources.base_source.AnyReader")
 def test_db3_source_split_directory_mocked(mock_any_reader):
     mock_reader_instance = MagicMock()
-    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]
+    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8, msgtype="sensor_msgs/msg/Image")]
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
 
     temp_dir = tempfile.mkdtemp()
@@ -251,7 +254,7 @@ def test_db3_source_split_directory_mocked(mock_any_reader):
 @patch("arraydataengine.sources.base_source.AnyReader")
 def test_data_sources_accepts_split_db3_directory(mock_any_reader):
     mock_reader_instance = MagicMock()
-    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8)]
+    mock_reader_instance.connections = [MagicMock(topic="/camera/image", msgcount=8, msgtype="sensor_msgs/msg/Image")]
     mock_any_reader.return_value.__enter__.return_value = mock_reader_instance
 
     temp_dir = tempfile.mkdtemp()

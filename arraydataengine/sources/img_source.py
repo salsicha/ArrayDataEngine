@@ -39,7 +39,10 @@ class ImgSource(BaseSource):
         self.images = images 
 
 
-    def get_count(self, axis="Images"):
+    def get_count(self, axis=None):
+        # Only the synthetic "images" topic exists; other topics have no messages.
+        if axis is not None and str(axis).lower() != "images":
+            return 0
         return len(self.images)
 
 

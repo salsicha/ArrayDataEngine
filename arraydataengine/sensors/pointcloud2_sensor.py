@@ -4,10 +4,34 @@ import numpy as np
 
 from .base_sensor import BaseSensor
 
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from typing import Any
+DEFAULT_MAX_POINTS = 30000
+
+
+def fixed_size_points(points: np.ndarray, max_points: int = DEFAULT_MAX_POINTS) -> tuple[np.ndarray, int]:
+    """Apply the shared point-cloud policy to an (N, 3) XYZ array.
+
+    Rows with any non-finite coordinate are dropped and the remaining points
+    are zero-padded to a fixed ``(max_points, 3)`` array of the input dtype,
+    so every message on a topic has the same shape (ring buffers and Arrow
+    stores require it). Returns ``(padded, point_count)``.
+
+    Raises ValueError when more than ``max_points`` finite points remain;
+    sources skip such messages with a warning instead of truncating them.
+    """
+
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Point cloud must have shape (N, 3), got {points.shape}")
+    finite = points[np.isfinite(points).all(axis=1)]
+    count = int(finite.shape[0])
+    if count > max_points:
+        raise ValueError(
+            f"PointCloud2 has {count} points, which exceeds max_points={max_points}"
+        )
+    padded = np.zeros((max_points, 3), dtype=points.dtype)
+    padded[:count] = finite
+    return padded, count
 
 
 class PointCloudSensor(BaseSensor):
@@ -17,7 +41,7 @@ class PointCloudSensor(BaseSensor):
     Returns:
     """
 
-    DEFAULT_MAX_POINTS = 30000
+    DEFAULT_MAX_POINTS = DEFAULT_MAX_POINTS
 
     def __init__(self, rawdata, msgtype, max_points: int | None = None, deserializer=None):
         """Constructor
@@ -28,6 +52,8 @@ class PointCloudSensor(BaseSensor):
         # PointCloud2 message has variable length due to sensor dropping some points
         # The max number of points in a scan for the vlp-16 should be 30000
         self.max_points = self.DEFAULT_MAX_POINTS if max_points is None else max_points
+        # Number of valid (finite) points in the last converted message.
+        self.point_count: int | None = None
 
     def numpyify(self):
         from ..sources.cdr import pointcloud_xyz
@@ -40,15 +66,7 @@ class PointCloudSensor(BaseSensor):
                   count=field.count) for field in msg.fields],
             msg.height, msg.width, msg.point_step, msg.row_step, bool(msg.is_bigendian),
         )
-        # Match the previous converter's removal of non-finite XYZ points.
-        pc_2_np = pc_2_np[np.isfinite(pc_2_np).all(axis=1)]
-        if pc_2_np.shape[0] > self.max_points:
-            raise ValueError(
-                f"PointCloud2 has {pc_2_np.shape[0]} points, which exceeds max_points={self.max_points}"
-            )
-
-        npified = np.zeros((self.max_points, 3), dtype=pc_2_np.dtype)
-        npified[:pc_2_np.shape[0]] = pc_2_np
+        npified, self.point_count = fixed_size_points(pc_2_np, self.max_points)
         sec = msg.header.stamp.sec
         nanosec = msg.header.stamp.nanosec
         ts = sec + nanosec * 1e-9

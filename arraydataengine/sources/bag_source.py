@@ -2,13 +2,7 @@ from __future__ import annotations
 
 import os
 
-from .ros_source import RosSource
-from ..sensors.pointcloud2_sensor import PointCloudSensor
-from ..sensors.image_sensor import ImageSensor
-from ..sensors.imu_sensor import IMUSensor
-from ..sensors.odom_sensor import OdomSensor
-from ..sensors.nav_sensor import NavSensor
-from ..sensors.pose_sensor import PoseSensor
+from .ros_source import DEFAULT_SENSOR_TYPES, RosSource
 
 
 class BagSource(RosSource):
@@ -18,22 +12,16 @@ class BagSource(RosSource):
     Returns:
     """
 
-    SENSOR_TYPES = {
-        "pointcloud2": PointCloudSensor,
-        "image": ImageSensor,
-        "imu": IMUSensor,
-        "odometry": OdomSensor,
-        "navsatfix": NavSensor,
-        "pose": PoseSensor,
-        "posestamped": PoseSensor,
-    }
+    SENSOR_TYPES = dict(DEFAULT_SENSOR_TYPES)
 
 
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, max_points: int | None = None):
         """Constructor
 
+        `max_points` is the fixed row count PointCloud2 messages are padded to
+        (default 30000); larger clouds are skipped with a warning.
         """
-        super().__init__(data_path)
+        super().__init__(data_path, max_points=max_points)
 
         self.data_path = data_path
 

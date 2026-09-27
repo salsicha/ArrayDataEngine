@@ -202,8 +202,9 @@ def test_decode_pointcloud2_respects_row_step():
 
 
 def test_cdr_reader_detects_pl_cdr_le():
-    reader = CDRReader(b"\x00\x03\x00\x00" + struct.pack("<i", 5))
-    assert reader.read_int32() == 5
+    # PL_CDR framing is not plain CDR; decoding it as such would return garbage.
+    with pytest.raises(ValueError, match="PL_CDR_LE"):
+        CDRReader(b"\x00\x03\x00\x00" + struct.pack("<i", 5))
 
 
 # --- buffers -----------------------------------------------------------------

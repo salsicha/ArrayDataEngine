@@ -19,31 +19,36 @@ class DataSources:
         cache_dir=None,
         refresh_cache: bool = False,
         timeout: float = 30.0,
+        max_points: int | None = None,
     ):
         """Constructor
 
+        `max_points` sets the fixed row count ROS PointCloud2 messages are
+        padded to (default 30000); larger clouds are skipped with a warning.
         """
 
         # db3/bag file extension
         self.file_type = os.path.splitext(data_path)[-1]
         bounds = [[0, 0], [0, 0]] if bounds is None else bounds
 
-        img_types = [".png", ".jpg", ".jpeg", ".tiff"]
+        img_types = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+        # Image globs such as "*.PNG" match regardless of extension case.
+        is_image = self.file_type.lower() in img_types
 
         # Check file extension in [".bag", ".db3", ".png"]
         if self.file_type == ".bag" and self._is_sqlite_rosbag(data_path):
             from .sources.db3_source import DB3Source
 
-            self.source = DB3Source(data_path)
+            self.source = DB3Source(data_path, max_points=max_points)
         elif self.file_type == ".bag":
             from .sources.bag_source import BagSource
 
-            self.source = BagSource(data_path)
+            self.source = BagSource(data_path, max_points=max_points)
         elif self.file_type in (".db3", ".mcap") or self._is_rosbag2_dir(data_path):
             from .sources.db3_source import DB3Source
 
-            self.source = DB3Source(data_path)
-        elif self.file_type in img_types:
+            self.source = DB3Source(data_path, max_points=max_points)
+        elif is_image:
             from .sources.img_source import ImgSource
 
             self.source = ImgSource(data_path, period, self.file_type)
@@ -60,7 +65,7 @@ class DataSources:
         else:
             raise ValueError(
                 f"{self.file_type} is not supported file type: "
-                "[.bag, .db3, .mcap, rosbag2 directory, .png, .jpg, .jpeg, .tiff]"
+                "[.bag, .db3, .mcap, rosbag2 directory, .png, .jpg, .jpeg, .tif, .tiff]"
             )
 
         if not self.source.data_exists():
@@ -95,6 +100,13 @@ class DataSources:
 
     def get_count(self, axis):
         return self.source.get_count(axis)
+
+
+    def get_topic_types(self) -> dict:
+        """topic -> message type for ROS sources (including undecodable topics)."""
+
+        getter = getattr(self.source, "get_topic_types", None)
+        return getter() if callable(getter) else {}
 
 
     def get_message(self):
