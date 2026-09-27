@@ -11,6 +11,69 @@ registry release.
 
 ## Unreleased
 
+### Added
+
+- `max_points` option on `DataSources`, `BagSource`, and `DB3Source`; point-cloud
+  messages carry `point_count`, the number of real points before zero padding.
+- `sensor_msgs/CompressedImage` decoding for CDR and rosbridge JSON payloads
+  (requires OpenCV), and `get_topic_types()` on ROS sources.
+- `DataBuffer.close_completed()`, `DEMSource(allow_insecure_http=...)`, and
+  `.tif` image inputs.
+- `north_up` on every DEM helper that maps rows to `y`; `resolution` accepts
+  `(dx, dy)`; `mosaic_dem_tiles` merges shared SRTM edges and masks voids.
+- `twist_frame` on `transform_odometry` and `odometry_to_trajectory`,
+  `scale_camera_matrix(half_pixel_centers=...)`, `distortion=` on
+  `colorize_points`, `sample_image_at_points`, `points_to_depth_image`, and
+  `rgbd_to_points`, `refine=` on plane/ground segmentation, `channel_axis=` on
+  `image_gradients` and `augment_image`, and `from_initial=` on
+  `propagate_trajectory_covariance`.
+- `PipelineCancelled.partial` holds the rows a cancelled `collect()` gathered.
+- `describe_topic` reports `non_monotonic_count` and `nonfinite_ts_count`.
+- `ade --debug` (or `ADE_DEBUG=1`) shows tracebacks; `ade export` stores
+  per-message `lengths` for zero-padded ragged topics.
+
+### Changed
+
+- Every ROS read path returns the same messages: short type names, log-time
+  fallback for zero stamps, and point clouds with non-finite rows dropped and
+  zero-padded to `(max_points, 3)` in the field dtype (float64 stays float64).
+  Oversized or undecodable messages are skipped with a warning instead of
+  ending the stream.
+- `get_topics()`/`get_count()` list only topics whose type can be decoded.
+- Unknown image encodings raise instead of returning raw bytes; OpenCV-style
+  (`32FC1`, `16SC1`, ...), Bayer, and YUV422 encodings are decoded.
+- The DepthAnythingCalibration body `frame_id` is exposed as
+  `calibration_frame_id` instead of overwriting the header frame.
+- `transform_odometry` leaves the body-frame twist unchanged by default, and
+  `odometry_to_trajectory` rotates it into the parent frame, matching
+  `nav_msgs/Odometry` semantics.
+- NavSat conversions use exact WGS84 geodetic/ECEF/ENU math.
+- `verify_loop_closures` always gates registration (2×`voxel_size`, or 3× the
+  median point spacing when no distance is given); `inlier_rmse` is
+  point-to-point for every ICP method.
+- Undistortion iterates to a tolerance and returns NaN outside the lens
+  model's domain.
+- DEM aspect is a compass bearing in `[0, 2π)` with NaN for flat cells, and
+  `sample_grid` returns NaN outside the grid instead of clamping.
+- Memory and TileDB buffers reject messages whose shape or dtype differs from
+  the topic's instead of broadcasting or casting them.
+- TileDB batches writes, compresses attributes with Zstd, and consolidates with
+  bounded buffers on close: ingesting the example bag takes 6.5 s and 119 MB
+  instead of ~100 s and 900 MB.
+- Pipelines without row operations pass whole chunks through and copy data
+  once; `align_nearest`, quaternion interpolation, neighbour searches (SciPy
+  `cKDTree` when available, memory-bounded chunks otherwise), normals, and
+  DEM meshing are vectorized.
+- `ade ingest --backend` auto-detects an existing store (new stores still
+  default to Arrow) and refuses non-store directories; `ade demo` sizes its
+  buffer to the data.
+- Removed unused packages from the `ros` and `ml` extras; the `visualization`
+  extra now includes `opencv-python`.
+
+### Removed
+
+- Unused `TopicSource` and `ros2_numpy`-based sensor code paths.
+
 ### Fixed
 
 - Arrow stores publish fragments and manifests atomically, record committed
@@ -20,7 +83,6 @@ registry release.
 - Arrow appends reject dtype changes before staging incompatible messages.
 - ROS1 and rosbag2 point-cloud readers use the built-in NumPy decoder instead
   of requiring the undeclared `ros2_numpy` dependency.
-
 - Distinct escaped storage paths and TileDB group member names prevent topic
   collisions; existing stores retain their original locations when reopened.
 - Persistent source pipelines resume from checkpoints without skipping rows twice,
@@ -34,6 +96,72 @@ registry release.
   initialization.
 - In-memory buffers retain each message's frame ID through ring wrapping,
   views, maps, filters, windows, and sequential or parallel topic collection.
+- Leaving a `DataBuffer` context only marks complete topics closed, and Arrow
+  resumes partial topics that older versions marked closed.
+- Resuming a persistent pipeline checks the checkpoint against the stored
+  per-topic counts, so rows lost before a flush are replayed instead of skipped.
+- Checkpoints stay in step with delivered rows after errors, early stops,
+  cancellation, and parallel execution.
+- Arrow reads no longer flush or rewrite manifests, stale handles refuse to
+  overwrite another writer's commits, unsupported payloads are rejected on
+  append, `close()` attempts every topic, single-row reads load only the
+  needed row groups, and the directory is fsynced after publishing.
+- TileDB returns empty results for queries matching no rows, handles
+  out-of-order timestamps, keeps per-message frame IDs, indexes subscripts by
+  message count, opens in existing empty directories, accepts direct appends
+  and callable sources, and never deletes written arrays when reopening.
+- Spatial pushdown handles organized point clouds; the memory backend returns
+  empty results for topics not yet received and stores non-ASCII names.
+- Buffering the example ROS1 bag's variable-size point clouds no longer fails.
+- rosbag2 bags without embedded message definitions (Humble and older), lone
+  SQLite `.bag` files, bare `.mcap` files, and `.db3` directories without
+  `metadata.yaml` open; a mistyped chunk path raises instead of reading a
+  neighbouring bag.
+- Earthdata credentials are sent only over HTTPS to the login or tile host;
+  DEM tiles download once, cache writes are atomic, and southern/eastern tile
+  names are correct.
+- XCDR2/PL_CDR payloads and malformed PointCloud2 layouts raise clear errors;
+  ROS1 rosbridge stamps and whitespace-prefixed JSON are handled.
+- Callables receive `ts`/`id` only when they require them, so
+  `map(np.linalg.norm)` and functions with optional parameters work.
+- Pipelines accept scalar, string, object, and differently shaped map outputs;
+  `DatasetQuery.collect()` keeps `frame_ids`; progress callbacks fire at every
+  interval in parallel mode.
+- Alignment, resampling, and rolling joins handle unsorted or NaN timestamps;
+  linear resampling honours `tolerance` and keeps the last grid point.
+- `save_topic_npz` returns the written `.npz` path, stores ragged and string
+  data without pickle, and round-trips frame IDs.
+- Phase-correlation shift estimation applies a Hann window and works on
+  natural, non-periodic images.
+- `navsat_to_enu` wraps longitudes across ±180°; default NavSat references skip
+  NaN and no-fix samples; zero quaternions become NaN instead of raising; nav
+  helpers accept `DataBuffer.get_buffer()` topic arrays.
+- `point_to_plane_icp` converges for clouds far from the origin;
+  `multi_scale_icp` reports gated final metrics and actual iterations;
+  nearest-neighbour search no longer needs O(Q·N) memory; a single NaN point no
+  longer breaks outlier filtering, ICP, downsampling, or normals.
+- Distorted projection no longer folds far off-axis points back into the image;
+  `CameraModel` supports `==` and hashing; `voxel_downsample` keeps fractional
+  means for integer input.
+- `convert_image_dtype` preserves zero and round-trips signed integers;
+  `normalize_image` ignores NaN; `dem_to_mesh` faces point up;
+  `traversability_map` stays in `[0, 1]`.
+- Multi-worker PyTorch iterable datasets no longer duplicate samples; time
+  splits sort by timestamp; NaN groups are kept; collation schemas and integer
+  dtypes are stable.
+- `ade info --messages` handles variable-size clouds and shows frame IDs; `ade`
+  rejects non-positive `--stride`/`--limit`/`--duration` and reports missing
+  files, unsupported message types, and missing extras as one-line errors.
+- The HTML point-cloud viewer drops NaN/Inf points and fits the view to the
+  data; `Visualizer("image").show()` no longer requires an argument or writes
+  `filename.gif` into the working directory; colormaps load through
+  `matplotlib.colormaps`.
+
+### Security
+
+- The Docker image fetches the ROS apt key over verified TLS and no longer
+  ships a fixed or empty Jupyter token.
+- Removed the unrelated PyPI `tk` package from `requirements.txt`.
 
 ## 0.3.1 - 2026-08-14
 

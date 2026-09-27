@@ -70,7 +70,7 @@ Reference categories: [Open3D point cloud tutorial](https://www.open3d.org/docs/
   - [x] Add quaternion normalization, SLERP, Euler conversion, gravity compensation, and bias correction helpers.
   - [x] Add quaternion normalization and SLERP.
   - [x] Convert WGS84 navsat samples to local ENU/NED frames and back.
-  - [x] Add approximate WGS84 to local ENU conversion and inverse conversion.
+  - [x] Add WGS84 (ECEF-based) to local ENU conversion and inverse conversion.
   - [x] Add trajectory smoothing, differentiation, integration, and dead-reckoning helpers.
   - [x] Add covariance propagation and quality/status masks for navigation streams.
 - [x] Add DEM and raster operations:

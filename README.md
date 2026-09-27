@@ -59,9 +59,9 @@ The base install keeps NumPy-only workflows lightweight. Install feature extras 
 | `arrow` | Default persistent Arrow/Parquet storage |
 | `tiledb` | Alternative TileDB persistent storage |
 | `image` | Image sequence loading and image-processing dependencies |
-| `ros` | ROS 1, rosbag2, MCAP, and message-conversion dependencies |
+| `ros` | `rosbags` reader for ROS 1 bags, MCAP, and split rosbag2 directories |
 | `dem` | DEM downloads and raster processing |
-| `visualization` | Matplotlib, Open3D, Pillow, and IPython visualization support |
+| `visualization` | Matplotlib, Open3D, OpenCV, Pillow, and IPython visualization support |
 | `ml` | PyTorch and model/dataset integrations |
 | `notebook` | JupyterLab |
 | `dev` | Test tooling |
@@ -92,18 +92,23 @@ ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by d
 `ade viewer` and `ade demo` write self-contained HTML files that render in any
 browser with no extra dependencies. Exported `.npz` files load back with
 `arraydataengine.ops.load_topic_npz` and plug straight into the ops pipelines.
-Commands that open ROS recordings require the `ros` extra; `ade ingest` also
-requires the extra for its selected storage backend (`arrow` by default or
-`tiledb`).
+Standalone SQLite recordings (`.db3`, or a single SQLite `.bag`) are read with
+the built-in decoder and need no extras; ROS 1 bags, MCAP files, and split
+rosbag2 directories require the `ros` extra. `ade ingest` also requires the
+extra for its storage backend: new stores default to `arrow`, while an existing
+output store is reopened with the backend it was written with (`--backend`
+overrides this, and non-store directories are refused). Missing files, unsupported
+message types, and missing extras are reported as one-line errors with an install
+hint; pass `--debug` (or set `ADE_DEBUG=1`) for a full traceback.
 
 ## Supported Sources
 
 | Input | Adapter | Topic(s) | Notes |
 | --- | --- | --- | --- |
-| `*.png`, `*.jpg`, `*.jpeg`, `*.tiff` | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob. |
-| `.bag` | `BagSource` | Bag topics | ROS1 bags with image, point cloud, IMU, odometry, navsat, and pose messages. |
-| `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, point cloud, IMU, odometry, and navsat messages; also decodes rosbridge/foxglove JSON payloads. |
-| `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles using Earthdata credentials. |
+| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob. |
+| `.bag` | `BagSource` | Bag topics | ROS1 bags with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. SQLite rosbag2 files named `.bag` are routed to `DB3Source`. |
+| `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. Bags without embedded message definitions (Humble and older) are supported. rosbridge/foxglove JSON payloads are decoded for PoseStamped, NavSatFix, PointCloud2, CompressedImage, and DepthAnything calibration messages. |
+| `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles over HTTPS using Earthdata credentials. |
 | `SyntheticSource` | (import directly) | configurable | Deterministic synthetic IMU/odometry/point-cloud/navsat/image streams on a circular trajectory. |
 
 Each yielded message has this shape:
@@ -116,6 +121,8 @@ Each yielded message has this shape:
     "name": "frame_000.png",
 }
 ```
+
+ROS messages also carry `frame_id` (from the message header). The `name` of a ROS message is its short type name, such as `PointCloud2`. Point clouds drop non-finite points and are zero-padded to a fixed `(max_points, 3)` array (default 30000, set it with `DataSources(path, max_points=...)`), keeping the field dtype. Their messages also carry `point_count`, the number of real points. Scans larger than `max_points`, and messages that fail to decode, are skipped with a logged warning. `get_topics()` and `get_count()` only report topics whose message type can be decoded.
 
 ## Quick Start
 
@@ -147,7 +154,7 @@ for topic in ros2_source.get_topics():
     print(topic, ros2_source.get_count(topic))
 ```
 
-For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the chunk files. Passing one `.db3` chunk still works; the reader uses the containing directory.
+For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the chunk files. Passing one `.db3` chunk that `metadata.yaml` lists still reads the whole recording; a standalone SQLite file is read on its own. A directory of `.db3` files without `metadata.yaml` is read chunk by chunk in natural filename order. Reading bare `.mcap` files requires the `ros` extra.
 
 ## Rolling Buffers
 
@@ -260,9 +267,11 @@ ground, obstacles, ground_mask = segment_ground(points, distance_threshold=0.15)
 registration = multi_scale_icp(scan_a, scan_b, voxel_sizes=(1.0, 0.5, 0.25))
 open3d_cloud = to_open3d_point_cloud(points, color_columns=(3, 4, 5))
 
-closures = verify_loop_closures(point_cloud_sequence, trajectory, radius=3.0, min_separation=60)
+closures = verify_loop_closures(point_cloud_sequence, trajectory, radius=3.0, min_separation=60, voxel_size=0.25)
 scale_calibration, metric_points = calibrate_point_cloud_metric_scale(relative_points, lidar_points, return_adjusted=True)
 ```
+
+Registration metrics are always gated: `fitness` is the fraction of finite source points with a target correspondence within the gating distance, and `inlier_rmse` is the point-to-point RMSE of those inliers for every ICP method. `verify_loop_closures` uses `max_correspondence_distance` when given; otherwise it gates at 2×`voxel_size`, or at 3× the target cloud's median point spacing, so unrelated scans are rejected. Nearest-neighbour searches use `scipy.spatial.cKDTree` when SciPy is installed and a memory-bounded chunked search otherwise. Non-finite points are ignored, and per-point outputs such as normals return NaN for them.
 
 SE(3) coordinate-frame helpers work across common robotics arrays:
 
@@ -270,9 +279,11 @@ SE(3) coordinate-frame helpers work across common robotics arrays:
 from arraydataengine.ops import apply_transform, transform_navsat, transform_odometry
 
 points_in_map = apply_transform(points_in_lidar, lidar_to_map)
-odom_in_map = transform_odometry(odom_message_array, odom_to_map)
+odom_in_map = transform_odometry(odom_message_array, odom_to_map)  # twist stays in the body (child) frame
 gps_in_map_frame = transform_navsat(gps_samples, enu_transform, ref_lat=37.0, ref_lon=-122.0, ref_alt=10.0)
 ```
+
+`nav_msgs/Odometry` twists are expressed in the child (body) frame, so `transform_odometry` re-expresses only the pose by default. Pass `twist_frame="parent"` if your twist is already in the parent frame and should be rotated along with the pose.
 
 Use `FrameGraph` when transforms need to be composed by frame name. Static transforms are used directly; time-varying transforms are interpolated by timestamp, including rotation SLERP.
 
@@ -297,17 +308,19 @@ Projection helpers connect point clouds, depth images, RGB images, DEM grids, an
 from arraydataengine.ops import backproject_pixels, camera_model, colorize_points, depth_to_point_grid, distort_pixels, points_to_depth_image, project_camera_points, project_dem_to_image, rectify_image, rgbd_to_points, scale_camera_matrix
 
 camera = camera_model(fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2], distortion=distortion_coeffs)
-small_camera_matrix = scale_camera_matrix(camera.camera_matrix, scale_x=0.5)
+small_camera_matrix = scale_camera_matrix(camera.camera_matrix, scale_x=0.5)  # half_pixel_centers=True to match cv2.resize
 rectified_rgb = rectify_image(rgb_image, camera.camera_matrix, distortion=camera.distortion)
 distorted_pixels = distort_pixels(raw_pixels, camera.camera_matrix, camera.distortion)
 camera_points = backproject_pixels(distorted_pixels, depth_values, camera.camera_matrix, distortion=camera.distortion)
 projected_pixels, visible = project_camera_points(points_in_camera, camera)
 organized_depth_points = depth_to_point_grid(depth_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 rgbd_cloud = rgbd_to_points(depth_image, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
-colored_lidar = colorize_points(points_in_camera, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5)
+colored_lidar = colorize_points(points_in_camera, rgb_image, fx=525.0, fy=525.0, cx=319.5, cy=239.5, distortion=camera.distortion)
 rendered_depth = points_to_depth_image(points_in_camera, image_shape=rgb_image.shape[:2], fx=525.0, fy=525.0, cx=319.5, cy=239.5)
 dem_pixels, dem_mask = project_dem_to_image(elevation, fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2])
 ```
+
+`colorize_points`, `sample_image_at_points`, `points_to_depth_image`, and `rgbd_to_points` accept `distortion=` for raw (unrectified) images. Undistortion iterates to a tolerance (`iterations=50`, `tolerance=1e-12` by default), and distorted projection marks points beyond the lens model's fold radius as not visible instead of wrapping them back into the image.
 
 Crop/select helpers cover row masks, axis-aligned bounds, oriented 3D bounds, and geographic bounding boxes.
 
@@ -320,7 +333,7 @@ vehicle_box = crop_oriented_bounds(points, center=pose_xyz, extent=[8.0, 4.0, 3.
 gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, max_lat=37.8, max_lon=-121.7)
 ```
 
-IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing.
+IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing. NavSat conversions use exact WGS84 geodetic/ECEF/ENU math and wrap longitudes across ±180°; the default local reference is the first finite sample with a valid fix. `odometry_to_trajectory` rotates the ROS body-frame twist into the odometry parent frame (pass `twist_frame="parent"` if yours is already world-frame), so `dead_reckon_trajectory` integrates it with its default world-frame velocity. IMU and odometry samples without an orientation (all-zero quaternion or `orientation_covariance[0] == -1`) become NaN rows instead of raising, and the nav helpers accept `DataBuffer.get_buffer()` topic arrays directly.
 
 ```python
 from arraydataengine.ops import (
@@ -363,7 +376,7 @@ gps_at_image_times = resample_navsat(window["/gps"], target_timestamps=image_tim
 smoothed_odom = smooth_trajectory(odom_50hz, window_size=5)
 derived_odom = differentiate_trajectory(smoothed_odom)
 integrated_odom = integrate_trajectory(derived_odom, initial_position=odom_traj["position"][0])
-dead_reckoned = dead_reckon_trajectory(odom_at_image_times, initial_position=odom_traj["position"][0])
+dead_reckoned = dead_reckon_trajectory(odom_at_image_times, initial_position=odom_traj["position"][0])  # twist already rotated to world frame
 covar_odom = propagate_trajectory_covariance(dead_reckoned, process_noise={"position": [0.02, 0.02, 0.05]})
 quality_odom = add_trajectory_quality_mask(covar_odom, covariance_limits={"position": [1.0, 1.0, 2.0]})
 trusted_odom = mask_trajectory(quality_odom, quality_odom["quality_mask"], drop=True)
@@ -488,12 +501,21 @@ collated = collate_samples([{"points": augmented_points}, {"points": augmented_p
 torch_dataset = to_torch_dataset(iter_ml_windows(buffer.dataset(["images"]), size=2), iterable=True)
 ```
 
-Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist through the default Arrow/Parquet backend or the TileDB backend. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row.
+Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist through the default Arrow/Parquet backend or the TileDB backend. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row. Checkpoints only advance past rows that were actually delivered. A cancelled `collect()` attaches the rows gathered so far as `PipelineCancelled.partial`, so `partial` plus a resumed `collect()` equals a full run. When resuming a persistent store, the store's per-topic counts are authoritative: after a hard crash, rows the checkpoint claimed but never flushed are replayed from the source, and rows already stored are never appended twice.
 
 ```python
 import json
 
-from arraydataengine.ops import CancellationToken, PipelineCancelled, source_pipeline, voxel_downsample
+import numpy as np
+
+from arraydataengine.ops import (
+    CancellationToken,
+    PipelineCancelled,
+    random_downsample,
+    source_pipeline,
+    valid_point_cloud_points,
+    voxel_downsample,
+)
 from arraydataengine.source import DataSources
 
 source = DataSources("/data/rosbag2/split_recording/")
@@ -501,15 +523,26 @@ checkpoint = {}
 persistent_checkpoint = {}
 cancel_token = CancellationToken()
 
+POINTS_PER_SCAN = 2048  # buffers and stores keep one fixed shape per topic
+
 def report(progress):
     print(progress.processed, progress.emitted, progress.topic)
+
+def downsample_scan(points):
+    # Drop the source's zero padding, voxelize, then cap and re-pad to a fixed shape.
+    points = voxel_downsample(valid_point_cloud_points(points), voxel_size=0.1)
+    if points.shape[0] > POINTS_PER_SCAN:
+        points = random_downsample(points, count=POINTS_PER_SCAN, seed=0)
+    padded = np.zeros((POINTS_PER_SCAN, 3), dtype=points.dtype)
+    padded[: points.shape[0]] = points
+    return padded
 
 pipeline = (
     source_pipeline(source)
     .select_topics("/points")
     .time_range(12.0, 20.0)
-    .map(lambda msg: {**msg, "data": voxel_downsample(msg["data"], voxel_size=0.1)})
-    .filter(lambda msg: msg["data"].shape[0] > 0)
+    .filter(lambda msg: valid_point_cloud_points(msg["data"]).shape[0] > 0)
+    .map(lambda msg: {**msg, "data": downsample_scan(msg["data"])})
 )
 
 try:
@@ -561,7 +594,7 @@ with DataBuffer(
     print(buffer.get_group_uri())
 ```
 
-Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed.
+Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed; `close_completed()` does the same without leaving the context. Topics that are still incomplete stay open, so a later run resumes them. Each topic has one fixed payload shape and dtype in every backend. A message that differs is rejected with `ValueError` rather than silently broadcast or cast, so pad variable-length data such as point clouds to a fixed shape. Both persistent backends stage rows in memory and write them in batches, and reads include staged rows without flushing them. Call `close()` (or use the context manager) so the last batch is written; after a crash, a resumed ingest replays only the rows that were never flushed.
 
 New stores use escaped topic directory names so topics such as `/a/b` and `/a_b` remain distinct. Existing stores retain their original directories when reopened. Query results expose each topic's location as `source_uri`.
 
@@ -632,6 +665,8 @@ Pass `cache_dir` to reuse downloaded HGT payloads. Cached tiles can be read with
 source = DataSources("DEM", bounds=[north, west], cache_dir="/tmp/ade-dem-cache")
 ```
 
+Downloads require HTTPS, and Earthdata credentials are only sent to the Earthdata login host (`urs.earthdata.nasa.gov`) or to the tile host itself; redirects to any other host never receive them. A custom `http://` base URL requires an explicit `allow_insecure_http=True`. Cache writes are atomic, and tiles are yielded as native, writable `int16` arrays.
+
 DEM helper functions operate on NumPy windows, so they can be used on individual tiles, cropped patches, or lazy pipeline chunks:
 
 ```python
@@ -651,10 +686,10 @@ from arraydataengine.ops import (
 )
 
 tile = next(source.get_message())
-elevation = tile["data"].astype("float64")
-region = mosaic_dem_tiles([tile])
+elevation = mosaic_dem_tiles([tile])  # float64, north-up, voids -> NaN, SRTM seams merged
+lat0, lon0 = north[0], -west[0]       # south-west corner; west longitudes are negative
 
-normals = terrain_normals(elevation, resolution=30.0)
+normals = terrain_normals(elevation, resolution=30.0, north_up=True)
 roughness = roughness_map(elevation, window_size=5)
 traversability = traversability_map(
     elevation,
@@ -663,24 +698,27 @@ traversability = traversability_map(
     max_roughness=1.0,
 )
 
-vehicle_patch = terrain_patch(elevation, center=(150.0, 240.0), size=(64, 64), resolution=30.0)
-vehicle_elevation = sample_elevation(elevation, x=[150.0], y=[240.0], resolution=30.0)
-terrain_points = dem_to_point_cloud(vehicle_patch, resolution=30.0)
-terrain_mesh = dem_to_mesh(vehicle_patch, resolution=30.0)
+vehicle_patch = terrain_patch(elevation, center=(150.0, 240.0), size=(64, 64), resolution=30.0, north_up=True)
+vehicle_elevation = sample_elevation(elevation, x=[150.0], y=[240.0], resolution=30.0, north_up=True)
+terrain_points = dem_to_point_cloud(vehicle_patch, resolution=30.0, north_up=True)
+terrain_mesh = dem_to_mesh(vehicle_patch, resolution=30.0, north_up=True)
 
 overview = resample_raster(elevation, shape=(512, 512))
 local_grid = reproject_raster(
     elevation,
-    src_bounds=(west[0], north[0], west[0] + 1.0, north[0] + 1.0),
-    dst_bounds=(west[0] + 0.25, north[0] + 0.25, west[0] + 0.75, north[0] + 0.75),
+    src_bounds=(lon0, lat0, lon0 + 1.0, lat0 + 1.0),
+    dst_bounds=(lon0 + 0.25, lat0 + 0.25, lon0 + 0.75, lat0 + 0.75),
     shape=(256, 256),
+    north_up=True,
 )
 
-write_dem_cache("/tmp/ade-dem-cache", tile["name"], elevation, metadata={"bounds": [west[0], north[0], west[0] + 1.0, north[0] + 1.0]})
+write_dem_cache("/tmp/ade-dem-cache", tile["name"], elevation, metadata={"bounds": [lon0, lat0, lon0 + 1.0, lat0 + 1.0]})
 cached_elevation, metadata = read_dem_cache("/tmp/ade-dem-cache", tile["name"], return_metadata=True)
 ```
 
-`mosaic_dem_tiles` also accepts `{name: raster}` mappings or `(name, raster)` pairs and fills sparse regions when adjacent SRTM tiles are missing.
+`mosaic_dem_tiles` also accepts `{name: raster}` mappings or `(name, raster)` pairs and fills sparse regions when adjacent SRTM tiles are missing. Adjacent SRTM tiles share one edge row/column, so standard 1201- and 3601-sample tiles are merged with `overlap=1` automatically. SRTM voids (`-32768`) become `fill_value` (NaN by default).
+
+DEM rasters decoded from HGT tiles are north-up (row 0 is the northern edge). Pass `north_up=True` to the helpers that map rows to `y`: `slope_aspect`, `hillshade`, `terrain_gradients`, `terrain_normals`, `terrain_patch`, `sample_elevation`, `sample_elevation_at_navsat`, `dem_to_point_cloud`, `dem_to_mesh`, and `reproject_raster`. The default, `north_up=False`, treats increasing row index as `+y`. In both conventions `origin` is the south-west cell, `aspect` is a compass bearing in `[0, 2π)` with NaN for flat cells, and `sample_elevation` returns NaN for points outside the grid. `resolution` also accepts `(dx, dy)`, because the east-west cell size of a geographic tile shrinks with latitude.
 
 ## Benchmarks
 
@@ -706,23 +744,26 @@ Results below were measured on 2026-07-28 with Python 3.14 on arm64 (Apple Silic
 | `DEMOps.synthetic` | terrain normals, roughness, traversability, and point-cloud conversion over a DEM grid | 16,384 | 0.005833s | 2,808,726 cells/s | 0.4 us/cell |
 | `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.035091s | 284,972 items/s | 3.5 us/item |
 | `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.205731s | 486 items/s | 2057.3 us/item |
+
+The TileDB rows above predate the batched, compressed TileDB writer; see [Storage backends](#storage-backends) for current backend measurements.
 | `Arrow.TopicPipeline.time_range` | same pipeline over the Arrow/Parquet backend | 100 | 0.001433s | 69,796 items/s | 14.3 us/item |
 
 `voxel_downsample` groups 1M points at 0.5 m resolution in ~70 ms (packed int64 voxel keys; ~7-9x faster than the previous row-wise grouping).
 
 ### Storage backends
 
-Identical workload — 1,500 lidar-sized point clouds of shape (30000, 3) float64, 1.08 GB of data — through each persistent backend, reads in a fresh process:
+Identical workload — 1,500 lidar-sized point clouds of shape (30000, 3) float64, 1.08 GB of data — through each persistent backend, reads in a fresh process. Measured on 2026-09-27 with Python 3.12.3 on Linux x86_64 (Intel i9-13900H, NVMe), NumPy 2.3.2, pyarrow 22.0.0, tiledb 0.36.1; best of two runs:
 
-| Operation | TileDB | Arrow (default) | Arrow advantage |
-| --- | ---: | ---: | ---: |
-| Ingest (excluding data generation) | 18.2 s | 1.3 s | 14x |
-| On-disk footprint | 1,952 MB | 1,066 MB | 1.8x |
-| Full 1.1 GB chunked scan | 2.6 s | 0.3 s | ~9x |
-| Time-range read (151 messages) | 514 ms | 17 ms | 30x |
-| Single-message fetch | 180 ms | 5 ms | 35x |
+| Operation | TileDB | Arrow (default) |
+| --- | ---: | ---: |
+| Ingest (excluding data generation) | 6.5 s | 7.1 s |
+| On-disk footprint | 1,031 MB | 923 MB |
+| Full 1.1 GB chunked scan | 0.88 s | 1.38 s |
+| Time-range read (151 messages) | 63 ms | 234 ms |
+| Single-message fetch | 6 ms | 33 ms |
+| Peak RSS, ingest / reads | 246 MB / 360 MB | 269 MB / 565 MB |
 
-Both backends stream with bounded memory on larger-than-memory datasets: the 1.1 GB Arrow ingest peaked at 314 MB RSS (staged fragment writes) and the full scan at 228 MB RSS with the default `batch_readahead`/`fragment_readahead` of 1 (raising readahead trades memory for throughput). This workload is incompressible random data; real sensor streams compress further under the Arrow backend's default zstd codec.
+Both backends stage writes (32 MB per topic by default) and stream with bounded memory on larger-than-memory datasets. Arrow scans use the default `batch_readahead`/`fragment_readahead` of 1 (raising readahead trades memory for throughput). This workload is nearly incompressible; real sensor streams compress further under both backends' Zstd codecs. Arrow remains the default because its Parquet fragments are directly queryable from Polars, DuckDB, and pandas.
 
 ## Development
 
@@ -740,5 +781,8 @@ Build and run the notebook container:
 ./build.sh
 docker compose up jupyter
 ```
+
+Jupyter uses `JUPYTER_TOKEN` from your environment when it is set; otherwise it
+generates a token and prints the login URL (`docker compose logs jupyter`).
 
 Notebook examples live in `notebooks/`.
