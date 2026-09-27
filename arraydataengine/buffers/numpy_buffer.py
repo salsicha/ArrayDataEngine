@@ -2,20 +2,10 @@ from __future__ import annotations
 import numpy as np
 
 from ..ops.core import _row_frame_id, _spatial_value_in_bounds
+from .common import check_message_schema, decode_frame_id as _decode_frame_id, encode_name, native_message_data
 
-
-def _decode_frame_id(value) -> str | None:
-    if isinstance(value, np.ndarray):
-        if value.ndim != 0:
-            return None
-        value = value.item()
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    if isinstance(value, str):
-        return value
-    return None
+# Row layout used for topics that have not received a message yet.
+_EMPTY_TOPIC_DTYPE = np.dtype([('ts', '<f8'), ('id', 'S256'), ('frame_id', object), ('data', '<f8')])
 
 
 class NumpyBuffer:
@@ -39,9 +29,10 @@ class NumpyBuffer:
 
     def _init_topic(self, msg: dict) -> None:
         topic = msg['topic']
+        data = native_message_data(msg['data'])
         self._data_buffer[topic] = np.zeros(
             self.buffer_depth,
-            dtype=[('ts', '<f8'), ('id', 'S256'), ('frame_id', object), ('data', msg['data'].dtype, msg['data'].shape)]
+            dtype=[('ts', '<f8'), ('id', 'S256'), ('frame_id', object), ('data', data.dtype, data.shape)]
         )
         self._write_indices[topic] = 0
         self._counts[topic] = 0
@@ -61,6 +52,9 @@ class NumpyBuffer:
         return np.concatenate((np.arange(write_index, depth), np.arange(0, write_index)))
 
     def _ordered_topic(self, topic: str, copy: bool = False) -> np.ndarray:
+        if topic not in self._data_buffer:
+            # A listed topic that has not received a message yet is empty.
+            return np.zeros(0, dtype=_EMPTY_TOPIC_DTYPE)
         logical_indices = self._logical_indices(topic)
         if logical_indices.size == self.buffer_depth and np.array_equal(logical_indices, np.arange(self.buffer_depth)):
             ordered = self._data_buffer[topic]
@@ -96,13 +90,21 @@ class NumpyBuffer:
 
     def append_buffer(self, msg: dict) -> None:
         topic = msg['topic']
+        data = native_message_data(msg['data'])
+        if topic in self._data_buffer:
+            # Validate before writing so a rejected message leaves no partial
+            # row; numpy assignment would otherwise broadcast or cast silently.
+            field = self._data_buffer[topic].dtype.fields['data'][0]
+            check_message_schema(topic, data, field.shape, field.base)
+        name = encode_name(msg.get('name', topic))
+        timestamp = float(msg['timestamp'])
         if topic not in self._data_buffer:
             self._init_topic(msg)
 
         write_index = self._write_indices[topic]
-        self._data_buffer[topic]['data'][write_index] = msg['data']
-        self._data_buffer[topic]['ts'][write_index] = msg['timestamp']
-        self._data_buffer[topic]['id'][write_index] = msg['name']
+        self._data_buffer[topic]['data'][write_index] = data
+        self._data_buffer[topic]['ts'][write_index] = timestamp
+        self._data_buffer[topic]['id'][write_index] = name
         self._record_frame_id(msg)
 
         self._write_indices[topic] = (write_index + 1) % self.buffer_depth
@@ -164,6 +166,7 @@ class NumpyBuffer:
                 "ts": np.array([], dtype=np.float64),
                 "data": topic['data'].copy(),
                 "topic": axis,
+                "frame_ids": topic["frame_id"].copy(),
                 **self._metadata_for_topic(axis),
             }
         end = topic['ts'][-1]

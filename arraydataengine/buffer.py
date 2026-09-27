@@ -57,6 +57,7 @@ class DataBuffer:
             raise ValueError("buffer_depth must be at least 1")
 
         self.buffer_depth = buffer_depth
+        self._source_exhausted = False
         self._axis = axis
         self.topics = [] if topics is None else list(topics)
         self._init_source = data_source
@@ -71,9 +72,10 @@ class DataBuffer:
         if self.backend == "tiledb":
             import tiledb
 
-            if not os.path.exists(self.group_uri):
+            # An existing directory (e.g. from mkdtemp()) still needs a group.
+            if tiledb.object_type(str(self.group_uri)) != "group":
                 os.makedirs(self.group_uri, exist_ok=True)
-                tiledb.group_create(self.group_uri)
+                tiledb.group_create(str(self.group_uri))
 
         self.set_methods()
         self.reset()
@@ -154,6 +156,12 @@ class DataBuffer:
         raise TypeError("data_source must expose get_message() or be a callable generator factory")
 
     def _get_preload_count(self, preload) -> int:
+        """Number of axis messages to roll during `reset()`.
+
+        `preload=True` means `buffer_depth`; integer values are capped at
+        `buffer_depth` (so the default depth of 1 preloads at most one axis
+        message). Use `load_data_db()` or `roll_buffer()` to ingest more.
+        """
         if self._init_source is None:
             return 0
         if preload is None:
@@ -211,8 +219,28 @@ class DataBuffer:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.close(closed=exc_type is None)
+        if exc_type is not None:
+            self.close(closed=False)
+        else:
+            self.close_completed()
         return False
+
+    def close_completed(self) -> None:
+        """Close the store, marking only topics known to be complete as closed.
+
+        A topic is complete once the source was exhausted, or once it holds
+        the source's `get_count(topic)` messages. Incomplete topics keep their
+        closed flag so a later run with the same source resumes them.
+        """
+        buffer_impl = getattr(self, "buffer_impl", None)
+        if buffer_impl is None:
+            return
+        if self._source_exhausted:
+            self.close(closed=True)
+        elif hasattr(buffer_impl, "close_completed"):
+            buffer_impl.close_completed()
+        else:
+            self.close()
 
     def reset_buffer(self):
         self.reset(preload=0)
@@ -233,9 +261,10 @@ class DataBuffer:
 
     def get_size(self):
         """Message count for the current axis: the number of buffered
-        messages on the numpy backend, or the topic's expected total count
-        (equal to buffered messages after a full ingest) on the TileDB
-        backend."""
+        messages on the numpy backend, the stored count on the arrow backend,
+        or the topic's expected total count (equal to buffered messages after
+        a full ingest) on the TileDB backend. TileDB topics whose source
+        reports no `get_count()` report their stored count."""
         return self.msg_len.get(self._axis, 0)
 
     def load_data_db(self, axis: str) -> None:
@@ -276,7 +305,11 @@ class DataBuffer:
 
     def roll_buffer(self, axis: str) -> None:
         self._axis = axis
-        self.buffer_impl.roll_buffer(axis)
+        try:
+            self.buffer_impl.roll_buffer(axis)
+        except StopIteration:
+            self._source_exhausted = True
+            raise
 
     def append_buffer(self, msg: dict) -> None:
         self.buffer_impl.append_buffer(msg)
