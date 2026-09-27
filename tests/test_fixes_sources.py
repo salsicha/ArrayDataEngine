@@ -21,6 +21,15 @@ from arraydataengine.sensors.image_sensor import ImageSensor
 
 REPO = Path(__file__).resolve().parents[1]
 EXAMPLE_BAG = REPO / "example" / "mapeverything_0.bag"
+
+
+def _is_real_file(path: Path) -> bool:
+    """False for missing files and for unfetched Git LFS pointer stubs."""
+    try:
+        with open(path, "rb") as handle:
+            return not handle.read(64).startswith(b"version https://git-lfs")
+    except OSError:
+        return False
 LOG_NS = 1_700_000_000_123_456_789
 
 CALIBRATION_MSG = """
@@ -171,8 +180,8 @@ def _comparable(messages):
 
 
 def test_example_bag_databuffer_on_lidar_axis():
-    if not EXAMPLE_BAG.exists():
-        pytest.skip("example bag not available")
+    if not _is_real_file(EXAMPLE_BAG):
+        pytest.skip("example bag not available (missing or Git LFS pointer)")
     from arraydataengine.buffer import DataBuffer
 
     buffer = DataBuffer(
@@ -330,8 +339,8 @@ def test_image_topic_through_bag(tmp_path):
 
 
 def test_counts_match_yielded_messages_for_example_bag():
-    if not EXAMPLE_BAG.exists():
-        pytest.skip("example bag not available")
+    if not _is_real_file(EXAMPLE_BAG):
+        pytest.skip("example bag not available (missing or Git LFS pointer)")
     pytest.importorskip("cv2")
     source = DataSources(str(EXAMPLE_BAG))
     yielded = {}

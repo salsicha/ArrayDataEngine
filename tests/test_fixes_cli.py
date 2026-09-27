@@ -19,6 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "example"
 
 
+def _is_real_file(path: Path) -> bool:
+    """False for missing files and for unfetched Git LFS pointer stubs."""
+    try:
+        with open(path, "rb") as handle:
+            return not handle.read(64).startswith(b"version https://git-lfs")
+    except OSError:
+        return False
+
+
 # --- helpers ------------------------------------------------------------------
 
 
@@ -143,8 +152,8 @@ def test_info_messages_skips_incompatible_shapes(fake, capsys):
 @pytest.mark.parametrize("name", ["mapeverything_0.db3", "mapeverything_0.bag"])
 def test_info_messages_on_example_recordings(name, capsys):
     path = EXAMPLE / name
-    if not path.exists():
-        pytest.skip(f"{path} not available")
+    if not _is_real_file(path):
+        pytest.skip(f"{path} not available (missing or Git LFS pointer)")
     assert main(["info", str(path), "--messages", "2000"]) == 0
     out = capsys.readouterr().out
     stats = out.split("stats over", 1)[1]
