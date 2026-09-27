@@ -57,22 +57,14 @@ image = [
     "scipy",
 ]
 ml = [
-    "pycocotools",
-    "tensorboard",
     "torch",
     "torchvision",
-    "ultralytics",
-    "wandb",
 ]
 notebook = [
     "jupyterlab",
 ]
 ros = [
-    "navpy",
     "rosbags",
-    "rosbags-dataframe",
-    "rosbags-image",
-    "transforms3d",
 ]
 tiledb = [
     "tiledb",
@@ -82,6 +74,7 @@ visualization = [
     "ipython",
     "matplotlib",
     "open3d",
+    "opencv-python",
     "Pillow",
 ]
 

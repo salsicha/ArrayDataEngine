@@ -1,6 +1,9 @@
-import cv2
+import os
+import tempfile
+from pathlib import Path
+
 import numpy as np
-from matplotlib import cm
+import matplotlib
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -8,20 +11,23 @@ from matplotlib.colors import LogNorm
 
 from PIL import Image as PILImage
 
-# BoxList (torch) and IPython.display are imported lazily so the visualizer
-# stays usable without the full ML/notebook stack.
+# BoxList (torch), OpenCV (box drawing), and IPython.display are imported
+# lazily so the visualizer stays usable without the full ML/notebook stack.
 
 
 class VisTool:
     """
     Generate a video for visualization
     """
-    def __init__(self, embed=True, vis_height=None):
+    def __init__(self, embed=True, vis_height=None, output_path=None):
         """
-        vis_height is the resolution of output frame
+        vis_height is the resolution of output frame.
+        output_path is where the embedded animation GIF is saved; by default
+        it goes to a temporary file that is removed after display.
         """
 
         self.show_animation = self.get_show_animation(embed)
+        self.output_path = output_path
 
         self._vis_height = vis_height
         # by default, 50 colors
@@ -59,34 +65,62 @@ class VisTool:
         self.append_img(frame)
 
 
-    def show(self, image):
-        if type(image) == np.ndarray:
+    def show(self, image=None):
+        """Show one image (array or file path), or, with no argument, play
+        the frames collected with update()/append_img() as an animation."""
+        if image is None:
+            if not self.images:
+                raise ValueError(
+                    "show() needs an image (a NumPy array or an image file path), "
+                    "or frames added first with update()/append_img()"
+                )
+            return self.show_animation()
+        if isinstance(image, np.ndarray):
             plt.imshow(image, interpolation='nearest')
             plt.show()
-        elif type(image) == str:
+        elif isinstance(image, (str, os.PathLike)):
             img = PILImage.open(image)
             plt.imshow(img, interpolation='nearest')
             plt.show()
+        else:
+            raise TypeError(
+                f"show() expects a NumPy array or an image file path, got {type(image).__name__}"
+            )
 
 
-    def _show_animation_embed(self):
+    def _show_animation_embed(self, output_path=None):
         ## Notebook embedded, called from library:
         from IPython.display import display, Image
 
+        output_path = self.output_path if output_path is None else output_path
         ani = animation.ArtistAnimation(self.fig, self.images, interval=self.interval, blit=self.blit, repeat_delay=self.repeat_delay)
-        ani.save('filename.gif', writer='ffmpeg')
-        plt.close(ani._fig)
-        with open('filename.gif','rb') as file:
-            display(Image(file.read()))
+        writer = "ffmpeg" if animation.writers.is_available("ffmpeg") else "pillow"
+        if output_path is None:
+            # No explicit destination: never write into the working directory.
+            with tempfile.TemporaryDirectory(prefix="ade_animation_") as tmp:
+                path = Path(tmp) / "animation.gif"
+                ani.save(path, writer=writer)
+                gif = path.read_bytes()
+        else:
+            path = Path(output_path)
+            ani.save(path, writer=writer)
+            gif = path.read_bytes()
+        plt.close(self.fig)
+        display(Image(gif))
+        return None if output_path is None else path
 
 
-    def _show_animation_native(self):
+    def _show_animation_native(self, output_path=None):
         ## Pop out:
         # Keep a reference so the animation is not garbage-collected, and
         # show the figure — the animation only starts on its first draw.
         self._animation = animation.ArtistAnimation(
             self.fig, self.images, interval=self.interval, blit=self.blit, repeat_delay=self.repeat_delay
         )
+        output_path = self.output_path if output_path is None else output_path
+        if output_path is not None:
+            writer = "ffmpeg" if animation.writers.is_available("ffmpeg") else "pillow"
+            self._animation.save(Path(output_path), writer=writer)
         plt.show()
 
 
@@ -99,7 +133,7 @@ class VisTool:
         # https://matplotlib.org/examples/color/colormaps_reference.html
         # and https://matplotlib.org/users/colormaps.html
 
-        colors = cm.get_cmap(colormap)(np.linspace(0, 1, n))
+        colors = matplotlib.colormaps[colormap](np.linspace(0, 1, n))
         # Randomly shuffle the colors
         np.random.shuffle(colors)
         # Opencv expects bgr while cm returns rgb, so we swap to match the colormap (though it also works fine without)
@@ -110,6 +144,8 @@ class VisTool:
 
     def normalize_output(self, frame, results: "BoxList"):
         if self._vis_height is not None:
+            import cv2
+
             boxlist_height = results.size[1]
             frame_height, frame_width = frame.shape[:2]
             assert (boxlist_height == frame_height)
@@ -127,6 +163,8 @@ class VisTool:
     def frame_vis_generator(self, frame, results: "BoxList" = None):
         if results is None:
             return frame
+        import cv2
+
         frame, results = self.normalize_output(frame, results)
         ids = results.get_field('ids')
         results = results[ids >= 0]

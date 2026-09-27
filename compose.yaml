@@ -12,9 +12,12 @@ services:
       - XAUTHORITY
       - NVIDIA_DRIVER_CAPABILITIES=all
       - EGL_PLATFORM=surfaceless
+      # Optional fixed login token taken from the host environment; when it
+      # is unset Jupyter generates a random one and prints the URL in the logs.
+      - JUPYTER_TOKEN
     user: "1000:1000"
     command: >
-      bash -c "jupyter-lab --no-browser --LabApp.token=''"
+      bash -c "jupyter-lab --no-browser"
     deploy:
       resources:
         reservations:

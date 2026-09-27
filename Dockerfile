@@ -14,9 +14,9 @@ SHELL ["/bin/bash","-c"]
 
 # ROS2
 RUN apt update && apt install -q -y --no-install-recommends \
-    curl gnupg2 lsb-release python3-pip python3-venv && \
+    ca-certificates curl gnupg2 lsb-release python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/*
-RUN curl --insecure -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key  -o /usr/share/keyrings/ros-archive-keyring.gpg
+RUN curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
 RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
 # Install ROS2 packages
@@ -41,7 +41,7 @@ RUN python -m ensurepip --upgrade
 RUN python -m pip install --upgrade setuptools
 
 # EM is preventing msgs from building...
-RUN pip3 uninstall em
+RUN pip3 uninstall -y em
 
 RUN mkdir /dataengine
 
@@ -71,9 +71,21 @@ FROM scratch
 
 COPY --from=build / /
 
+# ENV does not carry over from the build stage; re-declare the runtime ones.
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US.UTF-8 \
+    TERM=xterm \
+    PYTHONIOENCODING=UTF-8 \
+    ROS2_DISTRO=jazzy \
+    ROS_DISTRO=jazzy \
+    PATH="/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 WORKDIR /notebooks/
 
 ENTRYPOINT ["/entrypoint.sh"]
+# No hardcoded token: Jupyter uses $JUPYTER_TOKEN when it is set (e.g.
+# `docker run -e JUPYTER_TOKEN=...`) and otherwise generates a random token
+# and prints the login URL in the container logs.
 CMD ["jupyter-lab", "--ip", "0.0.0.0", "--no-browser", \
-    "--allow-root", "--ServerApp.token=docker_jupyter", \
+    "--allow-root", \
     "--NotebookApp.allow_password_change=False"]

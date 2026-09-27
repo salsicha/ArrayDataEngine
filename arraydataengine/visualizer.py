@@ -33,7 +33,9 @@ class Visualizer:
 
             self.vis_tool = ImgVisTool(embed, **kwargs)
         else:
-            raise ValueError(f"Visualization type not supported: ['image', 'pointcloud']")
+            raise ValueError(
+                f"Visualization type not supported: {vis_type!r}; expected 'image' or 'pointcloud'"
+            )
 
         # self.init()
 
@@ -51,7 +53,10 @@ class Visualizer:
 
 
     def show(self, *args, **kwargs):
-        self.vis_tool.show(*args, **kwargs) # this calls destroy
+        # Point clouds: renders what was added (this calls destroy).
+        # Images: show(image) displays one image; show() with no argument
+        # plays the frames collected with update() as an animation.
+        return self.vis_tool.show(*args, **kwargs)
 
 
     # def show_ego(self, *args, **kwargs):

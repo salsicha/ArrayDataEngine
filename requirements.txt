@@ -1,7 +1,13 @@
+# NOTE: --extra-index-url lets pip take any package from either index, so a
+# same-named package on rospypi (e.g. catkin-pkg or rospkg, pulled in by
+# rosdep) can shadow the PyPI release (dependency-confusion risk). None of the
+# packages listed below are rospypi-only; drop this line once the Docker build
+# is verified without it.
 --extra-index-url https://rospypi.github.io/simple/
 
 # Full Docker/notebook environment. Installable package metadata and optional
-# dependency groups live in pyproject.toml.
+# dependency groups live in pyproject.toml. tkinter comes from apt
+# (python3-tk in the Dockerfile); the PyPI "tk" package is unrelated.
 transforms3d
 tensorboard
 jupyterlab
@@ -13,7 +19,6 @@ navpy
 typeguard
 pytest
 cvxopt
-tk
 rosbags
 rosbags-dataframe
 rosbags-image

@@ -11,6 +11,9 @@ import numpy as np
 o3d = None
 draw = None
 
+# Points embedded in the standalone HTML viewer (uniformly subsampled).
+HTML_MAX_POINTS = 100000
+
 
 def _ensure_open3d():
     global o3d, draw
@@ -104,19 +107,43 @@ class VisTool:
     def _init_html(self):
         self.point_sets = []
         self.pose_segments = []
+        # Streaming uniform decimation keeps memory bounded for long inputs:
+        # only incoming points whose running index is a multiple of the
+        # stride are kept, and the stride doubles whenever the kept set
+        # exceeds twice the display budget.
+        self._html_stride = 1
+        self._html_seen = 0
+        self._html_kept = 0
 
 
     def _add_point_cloud_html(self, points, colors=None):
         arr = np.asarray(points, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] < 3 or arr.shape[0] == 0:
             return
-        self.point_sets.append(arr[:, :3].copy())
+        xyz = arr[:, :3]
+        # NaN/Inf would serialize as invalid JSON and blank the viewer.
+        xyz = xyz[np.isfinite(xyz).all(axis=1)]
+        if xyz.shape[0] == 0:
+            return
+        start = (-self._html_seen) % self._html_stride
+        kept = xyz[start::self._html_stride].copy()
+        self._html_seen += xyz.shape[0]
+        if kept.shape[0]:
+            self.point_sets.append(kept)
+            self._html_kept += kept.shape[0]
+        while self._html_kept > 2 * HTML_MAX_POINTS:
+            merged = np.vstack(self.point_sets)[::2]
+            self.point_sets = [merged]
+            self._html_kept = merged.shape[0]
+            self._html_stride *= 2
 
 
     def _add_pose_arrow_html(self, curr_se3):
         transform = np.asarray(curr_se3, dtype=np.float64)
         origin = transform[:3, 3]
         end = transform[:3, :3] @ np.array([1.0, 0.0, 0.0]) + origin
+        if not (np.isfinite(origin).all() and np.isfinite(end).all()):
+            return
         self.pose_segments.append((origin.copy(), end.copy()))
 
 
@@ -141,8 +168,8 @@ class VisTool:
 
     def _destroy_html(self):
         points = np.vstack(self.point_sets) if self.point_sets else np.empty((0, 3), dtype=np.float64)
-        if points.shape[0] > 100000:
-            indices = np.linspace(0, points.shape[0] - 1, 100000).astype(np.int64)
+        if points.shape[0] > HTML_MAX_POINTS:
+            indices = np.linspace(0, points.shape[0] - 1, HTML_MAX_POINTS).astype(np.int64)
             points = points[indices]
         payload = {
             "points": points.round(5).tolist(),
@@ -151,7 +178,7 @@ class VisTool:
                 for origin, end in self.pose_segments
             ],
         }
-        self.output_path.write_text(_html_viewer(json.dumps(payload)), encoding="utf-8")
+        self.output_path.write_text(_html_viewer(json.dumps(payload, allow_nan=False)), encoding="utf-8")
         print(f"Wrote point-cloud viewer to {self.output_path}")
 
 
@@ -337,21 +364,34 @@ const data = {payload};
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
 const hud = document.getElementById('hud');
-let yaw = -0.7, pitch = 0.45, scale = 120, drag = false, lastX = 0, lastY = 0;
+let yaw = -0.7, pitch = 0.45, drag = false, lastX = 0, lastY = 0, pending = false;
 const pts = data.points || [];
 const poses = data.poses || [];
+const all = pts.concat(poses.flat());
 let center = [0,0,0];
-if (pts.length) {{
-  for (const p of pts) {{ center[0]+=p[0]; center[1]+=p[1]; center[2]+=p[2]; }}
-  center = center.map(v => v / pts.length);
+if (all.length) {{
+  for (const p of all) {{ center[0]+=p[0]; center[1]+=p[1]; center[2]+=p[2]; }}
+  center = center.map(v => v / all.length);
 }}
-function resize() {{ canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; draw(); }}
+function quantile(values, q) {{
+  if (!values.length) return 0;
+  const sorted = Float64Array.from(values).sort();
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+}}
+// Fit the initial zoom, perspective, and height colors to the data extent
+// (robust percentiles, so a few stray points do not shrink the view).
+const radius = quantile(all.map(p => Math.hypot(p[0]-center[0], p[1]-center[1], p[2]-center[2])), 0.98) || 1;
+const heights = pts.map(p => p[2]);
+const zLo = quantile(heights, 0.02), zHi = quantile(heights, 0.98);
+const zSpan = zHi > zLo ? zHi - zLo : 1;
+let scale = 0.45 * Math.min(innerWidth, innerHeight) / radius;
+function resize() {{ canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; requestDraw(); }}
 function project(p) {{
   const x = p[0]-center[0], y = p[1]-center[1], z = p[2]-center[2];
   const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
   const x1 = cy*x - sy*y, y1 = sy*x + cy*y, z1 = z;
   const y2 = cp*y1 - sp*z1, z2 = sp*y1 + cp*z1;
-  const f = scale / (1 + Math.max(-0.8, z2) * 0.015);
+  const f = scale / (1 + Math.max(-0.8, z2 / radius * 0.2));
   return [canvas.width/2 + x1*f*devicePixelRatio, canvas.height/2 - y2*f*devicePixelRatio, z2];
 }}
 function draw() {{
@@ -359,17 +399,19 @@ function draw() {{
   hud.textContent = `${{pts.length}} points, ${{poses.length}} poses | drag rotate, wheel zoom`;
   const projected = pts.map(p => [p, project(p)]).sort((a,b) => a[1][2]-b[1][2]);
   for (const [p, q] of projected) {{
-    const c = Math.max(60, Math.min(255, 120 + (p[2]-center[2])*40));
+    const c = Math.round(60 + 195 * Math.max(0, Math.min(1, (p[2]-zLo) / zSpan)));
     ctx.fillStyle = `rgb(${{c}},${{180}},${{255-c/3}})`;
     ctx.fillRect(q[0], q[1], 1.6*devicePixelRatio, 1.6*devicePixelRatio);
   }}
   ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 2 * devicePixelRatio;
   for (const seg of poses) {{ const a=project(seg[0]), b=project(seg[1]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); }}
 }}
+// Coalesce bursts of input events into at most one redraw per frame.
+function requestDraw() {{ if (pending) return; pending = true; requestAnimationFrame(() => {{ pending = false; draw(); }}); }}
 canvas.addEventListener('mousedown', e => {{ drag = true; lastX = e.clientX; lastY = e.clientY; }});
 addEventListener('mouseup', () => drag = false);
-addEventListener('mousemove', e => {{ if (!drag) return; yaw += (e.clientX-lastX)*0.006; pitch += (e.clientY-lastY)*0.006; lastX=e.clientX; lastY=e.clientY; draw(); }});
-canvas.addEventListener('wheel', e => {{ e.preventDefault(); scale *= e.deltaY > 0 ? 0.9 : 1.1; draw(); }}, {{passive:false}});
+addEventListener('mousemove', e => {{ if (!drag) return; yaw += (e.clientX-lastX)*0.006; pitch += (e.clientY-lastY)*0.006; lastX=e.clientX; lastY=e.clientY; requestDraw(); }});
+canvas.addEventListener('wheel', e => {{ e.preventDefault(); scale *= e.deltaY > 0 ? 0.9 : 1.1; requestDraw(); }}, {{passive:false}});
 addEventListener('resize', resize); resize();
 </script>
 </body></html>"""
