@@ -31,13 +31,65 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Install system libraries for opencv-python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0t64
       - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
-          # opencv-python-headless instead of the [image] extra: CI has no libGL
-          python -m pip install -e ".[dev,tiledb,arrow]" \
-            opencv-python-headless scipy matplotlib pillow scikit-image rosbags
+          # Install through the declared extras so a broken extra fails CI;
+          # matplotlib and pillow are only needed by the tests.
+          python -m pip install -e ".[dev,arrow,tiledb,image,ros]" matplotlib pillow
       - name: Validate release metadata
         run: python scripts/check_release.py
       - name: Run tests
         run: python -m pytest -q --strict-config --strict-markers tests/
+
+  base-install:
+    name: NumPy-only install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install the package without optional extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Import and CLI smoke test
+        run: |
+          python -c "import arraydataengine, ArrayDataEngine; assert ArrayDataEngine.__version__ == arraydataengine.__version__"
+          ade --help >/dev/null
+          ade demo -o "$RUNNER_TEMP/ade_demo" --duration 1
+      - name: Run the tests that need no extras
+        run: python -m pytest -q --strict-config --strict-markers tests/test_fixes_cli.py
+
+  dist:
+    name: Build and check distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+      - name: Build wheel and sdist from source
+        run: python -m build
+      - name: Validate distribution metadata and contents
+        run: |
+          python -m twine check --strict dist/*
+          python scripts/check_dist.py dist
