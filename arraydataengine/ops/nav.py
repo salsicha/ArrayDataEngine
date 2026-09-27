@@ -5,7 +5,13 @@ from typing import Any
 
 import numpy as np
 
+from .core import TopicView, topic_parts
+
 EARTH_RADIUS_M = 6378137.0
+# WGS84 ellipsoid: semi-major axis, flattening, first eccentricity squared.
+WGS84_A = EARTH_RADIUS_M
+WGS84_F = 1.0 / 298.257223563
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
 
 
 def normalize_quaternion(quaternion: np.ndarray) -> np.ndarray:
@@ -190,12 +196,19 @@ def compensate_imu_gravity(
     gravity=(0.0, 0.0, -9.80665),
     orientation_maps_body_to_world: bool = True,
 ):
-    """Remove gravity from ADE IMU arrays shaped `(N, 6, 4)`."""
+    """Remove gravity from ADE IMU arrays shaped `(N, 6, 4)`.
+
+    Accepts raw arrays, topic dicts, and buffered structured topic arrays
+    (as returned by `DataBuffer.get_buffer()`) and returns the same form.
+    Samples without an orientation estimate (an all-zero quaternion, or ROS's
+    `orientation_covariance[0] == -1` convention) cannot be compensated and
+    get NaN accelerations instead of raising.
+    """
 
     imu, original_shape, result = _mutable_imu_data(imu_data)
     imu[:, 4, :3] = compensate_gravity(
         imu[:, 4, :3],
-        imu[:, 0, :4],
+        _normalize_orientations(imu[:, 0, :4], imu[:, 1, :3]),
         gravity=gravity,
         orientation_maps_body_to_world=orientation_maps_body_to_world,
     )
@@ -236,6 +249,12 @@ def correct_imu_bias(
 
 
 def interpolate_timeseries(timestamps: np.ndarray, values: np.ndarray, target_timestamps: np.ndarray) -> np.ndarray:
+    """Linearly interpolate samples at target timestamps.
+
+    `timestamps` must be strictly increasing (the same rule as the other
+    trajectory helpers); targets outside the range hold the edge values.
+    """
+
     ts = np.asarray(timestamps, dtype=np.float64)
     vals = np.asarray(values, dtype=np.float64)
     targets = np.asarray(target_timestamps, dtype=np.float64)
@@ -245,6 +264,7 @@ def interpolate_timeseries(timestamps: np.ndarray, values: np.ndarray, target_ti
         raise ValueError("timestamps cannot be empty")
     if vals.shape[0] != ts.size:
         raise ValueError("values must have the same first dimension as timestamps")
+    ts = _strict_timestamps(ts)
 
     flat = vals.reshape((vals.shape[0], -1))
     interpolated = np.column_stack([np.interp(targets, ts, flat[:, dim]) for dim in range(flat.shape[1])])
@@ -256,28 +276,33 @@ def interpolate_quaternions(
     orientations: np.ndarray,
     target_timestamps: np.ndarray,
 ) -> np.ndarray:
-    """Interpolate XYZW quaternions at target timestamps using SLERP."""
+    """Interpolate XYZW quaternions at target timestamps using SLERP.
+
+    Invalid samples (all-zero or non-finite quaternions) and NaN targets
+    produce NaN rows instead of raising.
+    """
 
     ts, targets = _interpolation_timestamps(timestamps, target_timestamps)
     quaternions = np.asarray(orientations, dtype=np.float64)
     if quaternions.shape != (ts.size, 4):
         raise ValueError("orientations must have shape (N, 4)")
-    quaternions = normalize_quaternion(quaternions)
+    quaternions = _normalize_orientations(quaternions)
     if ts.size == 1:
         return np.repeat(quaternions, targets.size, axis=0)
 
-    result = np.empty((targets.size, 4), dtype=np.float64)
-    for index, target in enumerate(targets):
-        if target <= ts[0]:
-            result[index] = quaternions[0]
-        elif target >= ts[-1]:
-            result[index] = quaternions[-1]
-        else:
-            upper = int(np.searchsorted(ts, target, side="right"))
-            lower = upper - 1
-            fraction = float((target - ts[lower]) / (ts[upper] - ts[lower]))
-            result[index] = slerp(quaternions[lower], quaternions[upper], fraction)
-    return normalize_quaternion(result)
+    result = np.full((targets.size, 4), np.nan, dtype=np.float64)
+    before = targets <= ts[0]
+    after = ~before & (targets >= ts[-1])
+    result[before] = quaternions[0]
+    result[after] = quaternions[-1]
+    inside = ~before & ~after & ~np.isnan(targets)
+    if np.any(inside):
+        inner_targets = targets[inside]
+        upper = np.searchsorted(ts, inner_targets, side="right")
+        lower = upper - 1
+        fraction = (inner_targets - ts[lower]) / (ts[upper] - ts[lower])
+        result[inside] = _slerp_rows(quaternions[lower], quaternions[upper], fraction)
+    return _normalize_orientations(result)
 
 
 def interpolate_trajectory(trajectory: Mapping[str, Any], target_timestamps: np.ndarray) -> dict:
@@ -383,10 +408,14 @@ def resample_odometry(
     timestamps: np.ndarray | None = None,
     start: float | None = None,
     end: float | None = None,
+    twist_frame: str = "child",
 ) -> dict:
-    """Convert and resample an odometry stream as a common trajectory dict."""
+    """Convert and resample an odometry stream as a common trajectory dict.
 
-    trajectory = odometry_to_trajectory(odometry_data, timestamps=timestamps)
+    See `odometry_to_trajectory` for `twist_frame`.
+    """
+
+    trajectory = odometry_to_trajectory(odometry_data, timestamps=timestamps, twist_frame=twist_frame)
     return resample_trajectory(trajectory, period=period, target_timestamps=target_timestamps, start=start, end=end)
 
 
@@ -524,23 +553,19 @@ def angular_velocity_from_quaternions(
     """Estimate angular velocity vectors from XYZW orientation samples."""
 
     ts = _strict_timestamps(timestamps)
-    q = normalize_quaternion(orientations)
+    q = _normalize_orientations(orientations)
     if q.shape != (ts.size, 4):
         raise ValueError("orientations must have shape (N, 4)")
     if ts.size < 2:
         return np.zeros((ts.size, 3), dtype=np.float64)
 
     frame = _angular_velocity_frame(angular_velocity_frame)
-    interval_omega = np.empty((ts.size - 1, 3), dtype=np.float64)
-    for index in range(ts.size - 1):
-        dt = ts[index + 1] - ts[index]
-        if frame == "body":
-            delta = _quaternion_multiply(_quaternion_conjugate(q[index]), q[index + 1])
-        else:
-            delta = _quaternion_multiply(q[index + 1], _quaternion_conjugate(q[index]))
-        if delta[3] < 0.0:
-            delta = -delta
-        interval_omega[index] = _rotation_vector_from_quaternion(delta) / dt
+    if frame == "body":
+        delta = _quaternion_multiply(_quaternion_conjugate(q[:-1]), q[1:])
+    else:
+        delta = _quaternion_multiply(q[1:], _quaternion_conjugate(q[:-1]))
+    delta = np.where(delta[:, 3:4] < 0.0, -delta, delta)
+    interval_omega = _rotation_vectors_from_quaternions(delta) / np.diff(ts)[:, None]
 
     omega = np.empty((ts.size, 3), dtype=np.float64)
     omega[0] = interval_omega[0]
@@ -591,9 +616,11 @@ def integrate_timeseries(timestamps: np.ndarray, rates: np.ndarray, initial=0.0)
     initial_array = np.broadcast_to(np.asarray(initial, dtype=np.float64), rate.shape[1:])
     result = np.empty_like(rate, dtype=np.float64)
     result[0] = initial_array
-    for index in range(1, ts.size):
-        dt = ts[index] - ts[index - 1]
-        result[index] = result[index - 1] + 0.5 * (rate[index - 1] + rate[index]) * dt
+    if ts.size > 1:
+        dt = np.diff(ts).reshape((-1,) + (1,) * (rate.ndim - 1))
+        increments = 0.5 * (rate[:-1] + rate[1:]) * dt
+        increments[0] = increments[0] + initial_array
+        result[1:] = np.cumsum(increments, axis=0)
     return result
 
 
@@ -612,16 +639,30 @@ def integrate_orientations(
     frame = _angular_velocity_frame(angular_velocity_frame)
     orientations = np.empty((ts.size, 4), dtype=np.float64)
     orientations[0] = normalize_quaternion(np.asarray(initial_orientation, dtype=np.float64))
-    for index in range(1, ts.size):
-        dt = ts[index] - ts[index - 1]
-        average_omega = 0.5 * (omega[index - 1] + omega[index])
-        delta = _quaternion_from_rotation_vector(average_omega * dt)
-        if frame == "body":
-            orientations[index] = _quaternion_multiply(orientations[index - 1], delta)
+    if ts.size < 2:
+        return orientations
+    # The per-step rotations are independent, so build them in one batch; only
+    # the quaternion chain itself is sequential.
+    average_omega = 0.5 * (omega[:-1] + omega[1:])
+    deltas = _quaternions_from_rotation_vectors(average_omega * np.diff(ts)[:, None]).tolist()
+    body = frame == "body"
+    x, y, z, w = orientations[0].tolist()
+    rows = orientations.tolist()
+    for index, (dx, dy, dz, dw) in enumerate(deltas, start=1):
+        if body:
+            ax, ay, az, aw, bx, by, bz, bw = x, y, z, w, dx, dy, dz, dw
         else:
-            orientations[index] = _quaternion_multiply(delta, orientations[index - 1])
-        orientations[index] = normalize_quaternion(orientations[index])
-    return orientations
+            ax, ay, az, aw, bx, by, bz, bw = dx, dy, dz, dw, x, y, z, w
+        x = aw * bx + ax * bw + ay * bz - az * by
+        y = aw * by - ax * bz + ay * bw + az * bx
+        z = aw * bz + ax * by - ay * bx + az * bw
+        w = aw * bw - ax * bx - ay * by - az * bz
+        norm = (x * x + y * y + z * z + w * w) ** 0.5
+        if norm == 0.0:
+            raise ValueError("zero-length quaternion cannot be normalized")
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        rows[index] = [x, y, z, w]
+    return np.asarray(rows, dtype=np.float64)
 
 
 def integrate_trajectory(
@@ -696,8 +737,25 @@ def propagate_trajectory_covariance(
     trajectory: Mapping[str, Any],
     process_noise: Mapping[str, Any] | float | None = None,
     fill_missing: bool = True,
+    from_initial: bool = False,
 ) -> dict:
-    """Accumulate diagonal process noise into trajectory covariance fields."""
+    """Accumulate diagonal process noise into trajectory covariance fields.
+
+    This is a per-axis random-walk model: row `i` becomes
+    `base_i + (ts[i] - ts[0]) * process_noise`, where `process_noise` is a
+    variance rate (units^2 per second) given as a scalar or per-axis vector,
+    either globally or per field (`{"position": ..., "orientation_covariance":
+    ...}`). There is no state-transition coupling (no `F P F^T`) and no
+    cross-covariance; only the stored diagonals are updated.
+
+    By default `base_i` is each row's own covariance, which suits
+    per-sample measurement covariances. If the stored covariance already
+    grows over time (e.g. odometry that integrates its own drift), adding
+    elapsed noise on top double counts it; pass `from_initial=True` to use
+    the first row's covariance as the base for every row instead. With
+    `fill_missing`, non-finite base values are treated as zero whenever
+    noise is added to that field.
+    """
 
     ts = _strict_timestamps(trajectory["ts"])
     elapsed = np.concatenate(([0.0], np.cumsum(np.diff(ts))))
@@ -706,6 +764,8 @@ def propagate_trajectory_covariance(
         covariance = _trajectory_field(trajectory, covariance_key, ts.size, 3)
         noise = _process_noise_vector(process_noise, state_key, covariance_key)
         propagated = covariance.copy()
+        if from_initial and ts.size:
+            propagated = np.broadcast_to(covariance[:1], covariance.shape).copy()
         if fill_missing and np.any(noise != 0.0):
             propagated = np.where(np.isfinite(propagated), propagated, 0.0)
         result[covariance_key] = propagated + elapsed[:, None] * noise[None, :]
@@ -802,7 +862,11 @@ def mask_trajectory(
 
 
 def imu_to_trajectory(imu_data, timestamps: np.ndarray | None = None, position=None, linear_velocity=None) -> dict:
-    """Convert ADE IMU arrays shaped `(N, 6, 4)` into a common trajectory dict."""
+    """Convert ADE IMU arrays shaped `(N, 6, 4)` into a common trajectory dict.
+
+    Samples without an orientation estimate (an all-zero quaternion, or ROS's
+    `orientation_covariance[0] == -1` convention) get NaN orientations.
+    """
 
     values, ts, metadata = _topic_data_and_timestamps(imu_data, timestamps)
     imu = _as_sensor_stream(values, (6, 4), "imu")
@@ -825,20 +889,55 @@ def imu_to_trajectory(imu_data, timestamps: np.ndarray | None = None, position=N
     )
 
 
-def odometry_to_trajectory(odometry_data, timestamps: np.ndarray | None = None) -> dict:
-    """Convert ADE odometry arrays shaped `(N, 8, 4)` into a common trajectory dict."""
+def odometry_to_trajectory(
+    odometry_data,
+    timestamps: np.ndarray | None = None,
+    twist_frame: str = "child",
+) -> dict:
+    """Convert ADE odometry arrays shaped `(N, 8, 4)` into a common trajectory dict.
 
+    ROS `nav_msgs/Odometry` reports the pose in the parent (`header.frame_id`)
+    frame but the twist in the child (body) frame. With the default
+    `twist_frame="child"` the linear twist (and its diagonal covariance) is
+    rotated into the parent frame by the pose orientation, so the trajectory's
+    `linear_velocity` is world-frame like every other trajectory source and can
+    be passed straight to `dead_reckon_trajectory`/`integrate_trajectory` with
+    their default `body_frame_velocity=False`. Pass `twist_frame="parent"` when
+    the twist is already expressed in the parent frame. `angular_velocity` is
+    kept in the body frame, matching `imu_to_trajectory`,
+    `differentiate_trajectory`, and the default `angular_velocity_frame="body"`
+    of the integrators.
+    """
+
+    frame = str(twist_frame).lower()
+    if frame not in {"child", "parent"}:
+        raise ValueError("twist_frame must be 'child' or 'parent'")
     values, ts, metadata = _topic_data_and_timestamps(odometry_data, timestamps)
     odom = _as_sensor_stream(values, (8, 4), "odometry")
+    orientation = _normalize_orientations(odom[:, 2, :4], odom[:, 3, :3])
+    linear_velocity = odom[:, 4, :3]
+    linear_velocity_covariance = odom[:, 5, :3]
+    if frame == "child" and ts.size:
+        rotation = quaternion_to_rotation_matrix(orientation)
+        linear_velocity = np.einsum("nij,nj->ni", rotation, linear_velocity)
+        # Diagonal of R diag(sigma) R^T for the diagonal covariance we store;
+        # zero-weight terms must not let an unknown (NaN) axis leak in.
+        weights = rotation * rotation
+        linear_velocity_covariance = np.where(
+            weights > 0.0,
+            weights * linear_velocity_covariance[:, None, :],
+            0.0,
+        ).sum(axis=-1)
+        linear_velocity_covariance[~np.isfinite(weights).all(axis=(1, 2))] = np.nan
     return _trajectory_dict(
         ts=ts,
         position=odom[:, 0, :3],
-        orientation=odom[:, 2, :4],
-        linear_velocity=odom[:, 4, :3],
+        orientation=orientation,
+        linear_velocity=linear_velocity,
         angular_velocity=odom[:, 6, :3],
         position_covariance=odom[:, 1, :3],
         orientation_covariance=odom[:, 3, :3],
-        linear_velocity_covariance=odom[:, 5, :3],
+        linear_velocity_covariance=linear_velocity_covariance,
         angular_velocity_covariance=odom[:, 7, :3],
         linear_acceleration=_filled_vectors(ts.size, np.nan),
         linear_acceleration_covariance=_filled_vectors(ts.size, np.nan),
@@ -855,18 +954,18 @@ def navsat_to_trajectory(
     ref_alt: float | None = None,
     compute_velocity: bool = True,
 ) -> dict:
-    """Convert NavSat `[lat, lon, alt]` samples into local ENU trajectory arrays."""
+    """Convert NavSat `[lat, lon, alt]` samples into local ENU trajectory arrays.
+
+    Missing reference coordinates default to the first sample whose latitude,
+    longitude, and altitude are finite and, when a numeric `status` is
+    available, whose fix status is valid (`>= 0`; ROS `STATUS_NO_FIX` is -1).
+    """
 
     status = _mapping_value(navsat_data, "status")
     position_covariance = _mapping_value(navsat_data, "position_covariance", "covariance")
     values, ts, metadata = _topic_data_and_timestamps(navsat_data, timestamps, message_ndim=1)
     navsat = _as_navsat_stream(values)
-    if ref_lat is None:
-        ref_lat = float(navsat[0, 0])
-    if ref_lon is None:
-        ref_lon = float(navsat[0, 1])
-    if ref_alt is None:
-        ref_alt = float(navsat[0, 2])
+    ref_lat, ref_lon, ref_alt = _navsat_reference(navsat, status, ref_lat, ref_lon, ref_alt)
 
     position = navsat_to_enu(navsat[:, 0], navsat[:, 1], navsat[:, 2], ref_lat, ref_lon, ref_alt)
     linear_velocity = _velocity_from_positions(ts, position) if compute_velocity else _filled_vectors(ts.size, np.nan)
@@ -904,21 +1003,37 @@ def sensor_to_trajectory(sensor_data, kind: str, timestamps: np.ndarray | None =
     if normalized in {"imu", "imudata"}:
         return imu_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
     if normalized in {"odom", "odometry"}:
-        return odometry_to_trajectory(sensor_data, timestamps=timestamps)
+        return odometry_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
     if normalized in {"navsat", "navsatfix", "gps"}:
         return navsat_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
     raise ValueError("kind must be 'imu', 'odometry', or 'navsat'")
 
 
 def navsat_to_enu(lat, lon, alt, ref_lat: float, ref_lon: float, ref_alt: float = 0.0) -> np.ndarray:
+    """Convert WGS84 latitude/longitude/altitude samples to local ENU coordinates.
+
+    This is the exact ellipsoidal conversion (geodetic -> ECEF -> the
+    east-north-up tangent frame at the reference point), so `up` includes the
+    Earth's curvature drop for distant points. Longitude differences wrap
+    across the +/-180 degree meridian. `enu_to_navsat` is the exact inverse.
+    """
+
     lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
     alt = np.asarray(alt, dtype=np.float64)
-    ref_lat_rad = np.deg2rad(ref_lat)
-    east = np.deg2rad(lon - ref_lon) * EARTH_RADIUS_M * np.cos(ref_lat_rad)
-    north = np.deg2rad(lat - ref_lat) * EARTH_RADIUS_M
-    up = alt - ref_alt
-    return np.stack((east, north, up), axis=-1)
+    ref_lat_rad = np.deg2rad(float(ref_lat))
+    # Work in an ECEF frame rotated so the reference longitude is zero; this
+    # keeps small offsets precise and makes the longitude wrap trivial.
+    x, y, z = _geodetic_to_ecef(np.deg2rad(lat), np.deg2rad(_wrap_longitude_delta(lon - float(ref_lon))), alt)
+    ref_x, _, ref_z = _geodetic_to_ecef(ref_lat_rad, 0.0, float(ref_alt))
+    dx = x - ref_x
+    dz = z - ref_z
+    sin_ref = np.sin(ref_lat_rad)
+    cos_ref = np.cos(ref_lat_rad)
+    east = y
+    north = -sin_ref * dx + cos_ref * dz
+    up = cos_ref * dx + sin_ref * dz
+    return np.stack(np.broadcast_arrays(east, north, up), axis=-1)
 
 
 def enu_to_ned(enu: np.ndarray) -> np.ndarray:
@@ -942,12 +1057,25 @@ def navsat_to_ned(lat, lon, alt, ref_lat: float, ref_lon: float, ref_alt: float 
 
 
 def enu_to_navsat(enu: np.ndarray, ref_lat: float, ref_lon: float, ref_alt: float = 0.0) -> np.ndarray:
+    """Convert local ENU coordinates back to WGS84 latitude/longitude/altitude.
+
+    Exact inverse of `navsat_to_enu`; output longitudes are wrapped into
+    `[-180, 180)`.
+    """
+
     arr = np.asarray(enu, dtype=np.float64)
-    ref_lat_rad = np.deg2rad(ref_lat)
-    lat = ref_lat + np.rad2deg(arr[..., 1] / EARTH_RADIUS_M)
-    lon = ref_lon + np.rad2deg(arr[..., 0] / (EARTH_RADIUS_M * np.cos(ref_lat_rad)))
-    alt = ref_alt + arr[..., 2]
-    return np.stack((lat, lon, alt), axis=-1)
+    east = arr[..., 0]
+    north = arr[..., 1]
+    up = arr[..., 2]
+    ref_lat_rad = np.deg2rad(float(ref_lat))
+    sin_ref = np.sin(ref_lat_rad)
+    cos_ref = np.cos(ref_lat_rad)
+    ref_x, _, ref_z = _geodetic_to_ecef(ref_lat_rad, 0.0, float(ref_alt))
+    x = ref_x + (-sin_ref * north + cos_ref * up)
+    z = ref_z + (cos_ref * north + sin_ref * up)
+    lat, delta_lon, alt = _ecef_to_geodetic(x, east, z)
+    lon = _wrap_longitude(float(ref_lon) + np.rad2deg(delta_lon))
+    return np.stack((np.rad2deg(lat), lon, alt), axis=-1)
 
 
 def ned_to_navsat(ned: np.ndarray, ref_lat: float, ref_lon: float, ref_alt: float = 0.0) -> np.ndarray:
@@ -964,16 +1092,16 @@ def navsat_to_local(
     frame: str = "enu",
     return_reference: bool = False,
 ):
-    """Convert WGS84 NavSat samples to local ENU or NED coordinates."""
+    """Convert WGS84 NavSat samples to local ENU or NED coordinates.
 
-    values, _, _ = _topic_data_and_timestamps(navsat_data, timestamps=None)
+    The default reference is chosen like `navsat_to_trajectory`: the first
+    finite sample with a valid fix status (when a status is available).
+    """
+
+    status = _mapping_value(navsat_data, "status")
+    values, _, _ = _topic_data_and_timestamps(navsat_data, timestamps=None, message_ndim=1)
     navsat = _as_navsat_stream(values)
-    if ref_lat is None:
-        ref_lat = float(navsat[0, 0])
-    if ref_lon is None:
-        ref_lon = float(navsat[0, 1])
-    if ref_alt is None:
-        ref_alt = float(navsat[0, 2])
+    ref_lat, ref_lon, ref_alt = _navsat_reference(navsat, status, ref_lat, ref_lon, ref_alt)
 
     normalized_frame = _local_frame(frame)
     enu = navsat_to_enu(navsat[:, 0], navsat[:, 1], navsat[:, 2], ref_lat, ref_lon, ref_alt)
@@ -999,15 +1127,87 @@ def local_to_navsat(
 
 
 def trajectory_speed(timestamps: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    """Speed magnitude from positions using second-order central differences.
+
+    Timestamps must be strictly increasing; non-uniform spacing is handled
+    exactly (`np.gradient` with coordinates).
+    """
+
     ts = np.asarray(timestamps, dtype=np.float64)
     pos = np.asarray(positions, dtype=np.float64)
     if ts.size < 2:
         return np.zeros(ts.shape, dtype=np.float64)
-    dt = np.gradient(ts)
-    if np.any(dt == 0):
-        raise ValueError("timestamps must not contain duplicate values")
-    velocity = np.gradient(pos, axis=0) / dt.reshape((-1,) + (1,) * (pos.ndim - 1))
+    ts = _strict_timestamps(ts)
+    if pos.shape[0] != ts.size:
+        raise ValueError("positions must have the same first dimension as timestamps")
+    velocity = np.gradient(pos, ts, axis=0)
     return np.linalg.norm(velocity, axis=-1)
+
+
+def _geodetic_to_ecef(lat_rad, lon_rad, alt):
+    sin_lat = np.sin(lat_rad)
+    cos_lat = np.cos(lat_rad)
+    prime_vertical = WGS84_A / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+    horizontal = (prime_vertical + alt) * cos_lat
+    return (
+        horizontal * np.cos(lon_rad),
+        horizontal * np.sin(lon_rad),
+        (prime_vertical * (1.0 - WGS84_E2) + alt) * sin_lat,
+    )
+
+
+def _ecef_to_geodetic(x, y, z):
+    """Return `(lat_rad, lon_rad, alt)` for ECEF coordinates (Bowring + refinement)."""
+
+    x, y, z = np.broadcast_arrays(np.asarray(x, dtype=np.float64), y, z)
+    semi_minor = WGS84_A * (1.0 - WGS84_F)
+    second_eccentricity = WGS84_E2 / (1.0 - WGS84_E2)
+    horizontal = np.hypot(x, y)
+    lon = np.arctan2(y, x)
+    beta = np.arctan2(WGS84_A * z, semi_minor * horizontal)
+    lat = np.arctan2(
+        z + second_eccentricity * semi_minor * np.sin(beta) ** 3,
+        horizontal - WGS84_E2 * WGS84_A * np.cos(beta) ** 3,
+    )
+    # Fixed-point refinement contracts by ~e^2 per step; three steps reach
+    # float64 precision for any terrestrial altitude.
+    for _ in range(3):
+        sin_lat = np.sin(lat)
+        prime_vertical = WGS84_A / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+        lat = np.arctan2(z + WGS84_E2 * prime_vertical * sin_lat, horizontal)
+    sin_lat = np.sin(lat)
+    prime_vertical = WGS84_A / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+    alt = horizontal * np.cos(lat) + z * sin_lat - WGS84_A * WGS84_A / prime_vertical
+    return lat, lon, alt
+
+
+def _wrap_longitude(lon):
+    return np.mod(np.asarray(lon, dtype=np.float64) + 180.0, 360.0) - 180.0
+
+
+def _wrap_longitude_delta(delta):
+    delta = np.asarray(delta, dtype=np.float64)
+    outside = (delta < -180.0) | (delta >= 180.0)
+    if np.any(outside):
+        delta = np.where(outside, _wrap_longitude(delta), delta)
+    return delta
+
+
+def _navsat_reference(navsat: np.ndarray, status, ref_lat, ref_lon, ref_alt) -> tuple[float, float, float]:
+    if ref_lat is not None and ref_lon is not None and ref_alt is not None:
+        return float(ref_lat), float(ref_lon), float(ref_alt)
+    usable = np.isfinite(navsat).all(axis=1)
+    if status is not None:
+        status_values = _status_array(status, navsat.shape[0])
+        if np.issubdtype(status_values.dtype, np.number):
+            usable &= status_values >= 0
+    candidates = np.flatnonzero(usable)
+    row = navsat[candidates[0]] if candidates.size else np.full(3, np.nan)
+    return (
+        float(row[0] if ref_lat is None else ref_lat),
+        float(row[1] if ref_lon is None else ref_lon),
+        float(row[2] if ref_alt is None else ref_alt),
+    )
 
 
 def _interpolation_timestamps(
@@ -1158,6 +1358,11 @@ def _invalidate_rows(values: np.ndarray, keep: np.ndarray, invalid_value):
 
 
 def _mapping_value(value, *keys: str):
+    if isinstance(value, np.ndarray) and value.dtype.names is not None:
+        for key in keys:
+            if key in value.dtype.names:
+                return value[key]
+        return None
     if not isinstance(value, Mapping):
         return None
     for key in keys:
@@ -1268,6 +1473,74 @@ def _quaternion_from_rotation_vector(rotation_vector: np.ndarray) -> np.ndarray:
     ], dtype=np.float64))
 
 
+def _normalize_orientations(orientations: np.ndarray, orientation_covariance: np.ndarray | None = None) -> np.ndarray:
+    """Normalize XYZW rows, mapping unusable orientations to NaN instead of raising.
+
+    A row is unusable when its norm is zero or non-finite, or when the matching
+    diagonal orientation covariance starts with -1 (the ROS "no estimate" flag).
+    """
+
+    q = np.asarray(orientations, dtype=np.float64)
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    invalid = ~np.isfinite(norm) | (norm == 0.0)
+    if orientation_covariance is not None:
+        covariance = np.asarray(orientation_covariance, dtype=np.float64)
+        if covariance.ndim >= 1 and covariance.shape[:-1] == q.shape[:-1] and covariance.shape[-1] >= 1:
+            invalid |= (covariance[..., :1] == -1.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        normalized = q / np.where(invalid, 1.0, norm)
+    return np.where(invalid, np.nan, normalized)
+
+
+def _slerp_rows(q0: np.ndarray, q1: np.ndarray, fraction: np.ndarray) -> np.ndarray:
+    """Row-wise `slerp` for `(M, 4)` quaternion pairs and `(M,)` fractions."""
+
+    q0 = _normalize_orientations(q0)
+    q1 = _normalize_orientations(q1)
+    fraction = np.asarray(fraction, dtype=np.float64)[:, None]
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    flip = dot < 0.0
+    q1 = np.where(flip, -q1, q1)
+    dot = np.clip(np.where(flip, -dot, dot), -1.0, 1.0)
+    linear = dot > 0.9995
+    with np.errstate(invalid="ignore", divide="ignore"):
+        lerp = q0 + fraction * (q1 - q0)
+        lerp = lerp / np.linalg.norm(lerp, axis=-1, keepdims=True)
+        theta_0 = np.arccos(dot)
+        theta = theta_0 * fraction
+        spherical = np.cos(theta) * q0 + np.sin(theta) * (q1 - q0 * dot) / np.sin(theta_0)
+    return np.where(linear, lerp, spherical)
+
+
+def _rotation_vectors_from_quaternions(quaternions: np.ndarray) -> np.ndarray:
+    """Row-wise `_rotation_vector_from_quaternion` for `(M, 4)` arrays."""
+
+    q = _normalize_orientations(quaternions)
+    q = np.where(q[:, 3:4] < 0.0, -q, q)
+    vector = q[:, :3]
+    norm = np.linalg.norm(vector, axis=-1, keepdims=True)
+    small = norm < 1.0e-12
+    with np.errstate(invalid="ignore", divide="ignore"):
+        angle = 2.0 * np.arctan2(norm, np.clip(q[:, 3:4], -1.0, 1.0))
+        rotation = vector * (angle / norm)
+    return np.where(small, 0.0, rotation)
+
+
+def _quaternions_from_rotation_vectors(rotation_vectors: np.ndarray) -> np.ndarray:
+    """Row-wise `_quaternion_from_rotation_vector` for `(M, 3)` arrays."""
+
+    vector = np.asarray(rotation_vectors, dtype=np.float64)
+    angle = np.linalg.norm(vector, axis=-1, keepdims=True)
+    small = angle < 1.0e-12
+    with np.errstate(invalid="ignore", divide="ignore"):
+        axis = vector / angle
+        half_angle = 0.5 * angle
+        quaternion = np.concatenate((axis * np.sin(half_angle), np.cos(half_angle)), axis=-1)
+        quaternion = quaternion / np.linalg.norm(quaternion, axis=-1, keepdims=True)
+    identity = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return np.where(small, identity, quaternion)
+
+
 def _angular_velocity_frame(frame: str) -> str:
     normalized = str(frame).lower()
     if normalized not in {"body", "world"}:
@@ -1312,7 +1585,21 @@ def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None
     (6, 4)/(8, 4) IMU and odometry layouts, 1 for (3,) navsat samples)."""
 
     metadata: dict[str, Any] = {}
-    if isinstance(sensor_data, Mapping):
+    if _is_topic_array(sensor_data):
+        # Buffered structured topic arrays / TopicViews (e.g. the values of
+        # `DataBuffer.get_buffer()`).
+        _, topic_ts, values = topic_parts(sensor_data)
+        if timestamps is None:
+            timestamps = topic_ts
+        frame_id = _single_frame_id(sensor_data)
+        if frame_id is not None:
+            metadata["frame_id"] = frame_id
+        if isinstance(sensor_data, TopicView) and sensor_data.metadata is not None:
+            for key in ("topic", "source_uri"):
+                value = getattr(sensor_data.metadata, key, None)
+                if value is not None:
+                    metadata[key] = value
+    elif isinstance(sensor_data, Mapping):
         values = sensor_data["data"]
         if timestamps is None:
             timestamps = sensor_data.get("ts", sensor_data.get("timestamp"))
@@ -1331,8 +1618,44 @@ def _topic_data_and_timestamps(sensor_data, timestamps: np.ndarray | None = None
     return arr, ts, metadata
 
 
+def _is_topic_array(value) -> bool:
+    return isinstance(value, TopicView) or (
+        isinstance(value, np.ndarray) and value.dtype.names is not None and "data" in value.dtype.names
+    )
+
+
+def _single_frame_id(topic_data) -> str | None:
+    if isinstance(topic_data, TopicView):
+        frames = topic_data.frame_ids
+        if frames is None and topic_data.metadata is not None:
+            return topic_data.metadata.frame_id
+    elif "frame_id" in topic_data.dtype.names:
+        frames = topic_data["frame_id"]
+    else:
+        return None
+    if frames is None:
+        return None
+    decoded = {
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in np.asarray(frames, dtype=object).ravel()
+        if value is not None and value != b"" and value != ""
+    }
+    return decoded.pop() if len(decoded) == 1 else None
+
+
 def _mutable_imu_data(imu_data):
-    if isinstance(imu_data, Mapping):
+    if _is_topic_array(imu_data):
+        ids, ts, topic_values = topic_parts(imu_data)
+        values = np.asarray(topic_values, dtype=np.float64)
+        # Structured arrays come back in their own layout with `data` replaced;
+        # TopicViews come back as plain topic dicts.
+        if isinstance(imu_data, np.ndarray):
+            result = imu_data.copy()
+        else:
+            result = {"ts": ts.copy(), "data": None}
+            if ids is not None:
+                result["id"] = ids
+    elif isinstance(imu_data, Mapping):
         values = np.asarray(imu_data["data"], dtype=np.float64)
         result = dict(imu_data)
     else:
@@ -1343,7 +1666,7 @@ def _mutable_imu_data(imu_data):
     return imu, original_shape, result
 
 
-def _restore_imu_data(result: dict[str, Any] | None, imu: np.ndarray, original_shape: tuple[int, ...]):
+def _restore_imu_data(result: dict[str, Any] | np.ndarray | None, imu: np.ndarray, original_shape: tuple[int, ...]):
     data = imu[0] if original_shape == (6, 4) else imu
     if result is None:
         return data
@@ -1387,7 +1710,9 @@ def _trajectory_dict(
     metadata: Mapping[str, Any],
 ) -> dict:
     count = _validated_stream_count(ts, position, orientation)
-    normalized_orientation = normalize_quaternion(orientation)
+    # ROS publishes all-zero quaternions (and orientation_covariance[0] == -1)
+    # when there is no orientation estimate; carry those rows as NaN.
+    normalized_orientation = _normalize_orientations(orientation, orientation_covariance)
     pose = np.concatenate((position, normalized_orientation), axis=1)
     trajectory = np.concatenate((pose, linear_velocity, angular_velocity), axis=1)
     result = {
@@ -1443,7 +1768,7 @@ def _filled_vectors(count: int, value: float) -> np.ndarray:
 def _velocity_from_positions(timestamps: np.ndarray, positions: np.ndarray) -> np.ndarray:
     if timestamps.size < 2:
         return np.zeros((timestamps.size, 3), dtype=np.float64)
-    if np.any(np.diff(timestamps) == 0):
+    if not np.all(np.diff(timestamps) > 0):
+        # Duplicate, unsorted, or NaN stamps have no meaningful derivative.
         return _filled_vectors(timestamps.size, np.nan)
-    dt = np.gradient(timestamps)
-    return np.gradient(positions, axis=0) / dt.reshape((-1, 1))
+    return np.gradient(positions, timestamps, axis=0)

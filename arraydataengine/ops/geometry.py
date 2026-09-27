@@ -245,9 +245,19 @@ def transform_poses(poses: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return result
 
 
-def transform_odometry(odometry: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    """Apply an SE(3) transform to ADE odometry arrays shaped (..., 8, 4)."""
+def transform_odometry(odometry: np.ndarray, transform: np.ndarray, twist_frame: str = "child") -> np.ndarray:
+    """Apply an SE(3) transform to ADE odometry arrays shaped (..., 8, 4).
 
+    The pose (rows 0-3) is re-expressed in the new parent frame. In
+    `nav_msgs/Odometry` the twist (rows 4-7) is expressed in the body
+    `child_frame_id`, which a change of parent frame does not affect, so the
+    default `twist_frame="child"` leaves it untouched. Use
+    `twist_frame="parent"` for odometry whose twist is expressed in the parent
+    frame; its linear/angular vectors and covariances are then rotated too.
+    """
+
+    if twist_frame not in ("child", "parent"):
+        raise ValueError("twist_frame must be 'child' or 'parent'")
     arr = np.asarray(odometry, dtype=np.float64)
     if arr.shape[-2:] != (8, 4):
         raise ValueError("odometry must have shape (..., 8, 4)")
@@ -257,10 +267,13 @@ def transform_odometry(odometry: np.ndarray, transform: np.ndarray) -> np.ndarra
     result = arr.copy()
     result[..., 0, :3] = _transform_xyz(arr[..., 0, :3], matrix)
     result[..., 2, :4] = _transform_quaternions(arr[..., 2, :4], matrix)
-    result[..., 4, :3] = transform_vectors(arr[..., 4, :3], matrix)
-    result[..., 6, :3] = transform_vectors(arr[..., 6, :3], matrix)
+    covariance_rows = (1, 3)
+    if twist_frame == "parent":
+        result[..., 4, :3] = transform_vectors(arr[..., 4, :3], matrix)
+        result[..., 6, :3] = transform_vectors(arr[..., 6, :3], matrix)
+        covariance_rows = (1, 3, 5, 7)
 
-    for row in (1, 3, 5, 7):
+    for row in covariance_rows:
         result[..., row, :3] = _rotate_diagonal_covariances(arr[..., row, :3], rotation)
     return result
 
@@ -340,9 +353,13 @@ def transform_dem_grid(
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CameraModel:
-    """Pinhole camera model with optional distortion and rectification metadata."""
+    """Pinhole camera model with optional distortion and rectification metadata.
+
+    Models compare equal when all calibration arrays have equal values, and
+    hash consistently with that equality, so they can be used as dict keys.
+    """
 
     camera_matrix: np.ndarray
     image_shape: tuple[int, int] | None = None
@@ -373,6 +390,36 @@ class CameraModel:
             if projection.shape not in ((3, 3), (3, 4)):
                 raise ValueError("projection_matrix must have shape (3, 3) or (3, 4)")
             object.__setattr__(self, "projection_matrix", projection.copy())
+
+    def _array_fields(self) -> tuple[np.ndarray | None, ...]:
+        return (self.camera_matrix, self.distortion, self.rectification, self.projection_matrix)
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, CameraModel):
+            return NotImplemented
+        return self.image_shape == other.image_shape and all(
+            _optional_arrays_equal(left, right)
+            for left, right in zip(self._array_fields(), other._array_fields())
+        )
+
+    def __hash__(self):
+        return hash((self.image_shape, *(_array_hash_key(value) for value in self._array_fields())))
+
+
+def _optional_arrays_equal(left: np.ndarray | None, right: np.ndarray | None) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return bool(np.array_equal(left, right))
+
+
+def _array_hash_key(value: np.ndarray | None):
+    if value is None:
+        return None
+    # Adding 0.0 folds -0.0 into 0.0 so hashing agrees with np.array_equal.
+    arr = np.ascontiguousarray(value, dtype=np.float64) + 0.0
+    return arr.shape, arr.tobytes()
 
 
 def camera_matrix(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
@@ -409,16 +456,34 @@ def camera_model(
     )
 
 
-def scale_camera_matrix(matrix: np.ndarray, scale_x: float, scale_y: float | None = None) -> np.ndarray:
-    """Scale focal length and principal point for resized images."""
+def scale_camera_matrix(
+    matrix: np.ndarray,
+    scale_x: float,
+    scale_y: float | None = None,
+    half_pixel_centers: bool = False,
+) -> np.ndarray:
+    """Scale focal length and principal point for resized images.
+
+    Pixel centers sit at integer `(col, row)` coordinates. The default keeps
+    pixel 0's center fixed (`cx' = cx * s`), the convention of this library's
+    corner-aligned `resize_nearest` / `resize_images` (whose exact factor is
+    `(new_size - 1) / (old_size - 1)`). Set `half_pixel_centers=True` for
+    resizers that align pixel *edges* (`cv2.resize`, PIL,
+    `align_corners=False` in ML frameworks), which gives
+    `cx' = (cx + 0.5) * s - 0.5` (likewise for `cy`).
+    """
 
     sx = float(scale_x)
     sy = sx if scale_y is None else float(scale_y)
     scaled = _camera_matrix_from_optional(None, None, None, None, matrix)
     scaled[0, 0] *= sx
-    scaled[0, 2] *= sx
     scaled[1, 1] *= sy
-    scaled[1, 2] *= sy
+    if half_pixel_centers:
+        scaled[0, 2] = (scaled[0, 2] + 0.5) * sx - 0.5
+        scaled[1, 2] = (scaled[1, 2] + 0.5) * sy - 0.5
+    else:
+        scaled[0, 2] *= sx
+        scaled[1, 2] *= sy
     return scaled
 
 
@@ -479,19 +544,59 @@ def distort_normalized_points(points: np.ndarray, distortion: np.ndarray | None 
 def undistort_normalized_points(
     points: np.ndarray,
     distortion: np.ndarray | None = None,
-    iterations: int = 5,
+    iterations: int = 50,
+    tolerance: float | None = 1.0e-12,
 ) -> np.ndarray:
-    """Invert Brown-Conrady distortion with fixed-point iteration."""
+    """Invert Brown-Conrady / rational distortion of normalized coordinates.
+
+    Uses OpenCV's fixed-point scheme `x = (x_d - tangential(x)) / radial(x)`,
+    iterating each point until its update is at most `tolerance` (normalized
+    units; `None` always runs `iterations`) or `iterations` is reached.
+    Points whose radial factor becomes non-positive or non-finite during the
+    iteration lie outside the distortion model's valid domain and are
+    returned as NaN.
+    """
 
     distorted, original_shape = _pixel_array(points)
     coefficients = _distortion_coefficients(distortion)
     if not np.any(coefficients):
         return distorted.copy().reshape(original_shape)
 
-    estimate = distorted.copy()
-    for _ in range(int(iterations)):
-        redistorted = distort_normalized_points(estimate, coefficients).reshape(-1, 2)
-        estimate += distorted - redistorted
+    k1, k2, p1, p2, k3, k4, k5, k6 = coefficients
+    x_distorted = distorted[:, 0]
+    y_distorted = distorted[:, 1]
+    x = x_distorted.copy()
+    y = y_distorted.copy()
+    active = np.isfinite(x) & np.isfinite(y)
+    invalid = np.zeros(x.shape[0], dtype=bool)
+    for _ in range(max(int(iterations), 0)):
+        rows = np.flatnonzero(active)
+        if rows.size == 0:
+            break
+        x_current = x[rows]
+        y_current = y[rows]
+        r2 = x_current * x_current + y_current * y_current
+        r4 = r2 * r2
+        r6 = r4 * r2
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inverse_radial = (1.0 + k4 * r2 + k5 * r4 + k6 * r6) / (1.0 + k1 * r2 + k2 * r4 + k3 * r6)
+        delta_x = 2.0 * p1 * x_current * y_current + p2 * (r2 + 2.0 * x_current * x_current)
+        delta_y = p1 * (r2 + 2.0 * y_current * y_current) + 2.0 * p2 * x_current * y_current
+        x_next = (x_distorted[rows] - delta_x) * inverse_radial
+        y_next = (y_distorted[rows] - delta_y) * inverse_radial
+        bad = ~np.isfinite(inverse_radial) | (inverse_radial <= 0.0)
+        x[rows] = x_next
+        y[rows] = y_next
+        invalid[rows[bad]] = True
+        done = bad
+        if tolerance is not None:
+            with np.errstate(invalid="ignore"):
+                step = np.maximum(np.abs(x_next - x_current), np.abs(y_next - y_current))
+            done = done | (step <= float(tolerance))
+        active[rows[done]] = False
+
+    estimate = np.column_stack((x, y))
+    estimate[invalid] = np.nan
     return estimate.reshape(original_shape)
 
 
@@ -511,12 +616,17 @@ def undistort_pixels(
     pixels: np.ndarray,
     camera_matrix: np.ndarray,
     distortion: np.ndarray | None = None,
-    iterations: int = 5,
+    iterations: int = 50,
+    tolerance: float | None = 1.0e-12,
 ) -> np.ndarray:
-    """Remove lens distortion from `(col, row)` pixels."""
+    """Remove lens distortion from `(col, row)` pixels.
+
+    See `undistort_normalized_points` for the iteration and tolerance
+    semantics; pixels outside the distortion model's valid domain are NaN.
+    """
 
     normalized = pixels_to_normalized_points(pixels, camera_matrix)
-    undistorted = undistort_normalized_points(normalized, distortion, iterations=iterations)
+    undistorted = undistort_normalized_points(normalized, distortion, iterations=iterations, tolerance=tolerance)
     return normalized_points_to_pixels(undistorted, camera_matrix)
 
 
@@ -525,13 +635,24 @@ def backproject_pixels(
     depth: np.ndarray | float,
     camera_matrix: np.ndarray,
     distortion: np.ndarray | None = None,
+    iterations: int = 50,
+    tolerance: float | None = 1.0e-12,
 ) -> np.ndarray:
-    """Backproject `(col, row)` pixels and depth values to XYZ camera points."""
+    """Backproject `(col, row)` pixels and depth values to XYZ camera points.
+
+    With `distortion`, pixels are undistorted first (`iterations` and
+    `tolerance` are passed to `undistort_normalized_points`).
+    """
 
     _, original_shape = _pixel_array(pixels)
     normalized = pixels_to_normalized_points(pixels, camera_matrix).reshape(-1, 2)
     if distortion is not None:
-        normalized = undistort_normalized_points(normalized, distortion).reshape(-1, 2)
+        normalized = undistort_normalized_points(
+            normalized,
+            distortion,
+            iterations=iterations,
+            tolerance=tolerance,
+        ).reshape(-1, 2)
 
     depth_values = np.asarray(depth, dtype=np.float64)
     if depth_values.ndim == 0:
@@ -748,8 +869,13 @@ def sample_image_at_points(
     bilinear: bool = True,
     fill_value=np.nan,
     return_mask: bool = False,
+    distortion: np.ndarray | None = None,
 ):
-    """Project points into an image and sample pixel values at their projected locations."""
+    """Project points into an image and sample pixel values at their projected locations.
+
+    `distortion` applies lens distortion during projection (see
+    `project_points_to_image`).
+    """
 
     pixels, projected = project_points_to_image(
         points,
@@ -760,6 +886,7 @@ def sample_image_at_points(
         image_shape=np.asarray(image).shape[:2],
         transform=transform,
         camera_matrix=camera_matrix,
+        distortion=distortion,
     )
     samples, sampled = sample_image_at_pixels(
         image,
@@ -784,6 +911,7 @@ def colorize_points(
     bilinear: bool = True,
     fill_value=np.nan,
     return_mask: bool = False,
+    distortion: np.ndarray | None = None,
 ):
     """Append sampled image channels to a point cloud projected into the camera frame."""
 
@@ -800,6 +928,7 @@ def colorize_points(
         bilinear=bilinear,
         fill_value=fill_value,
         return_mask=True,
+        distortion=distortion,
     )
     if colors.ndim == 1:
         colors = colors[:, None]
@@ -821,8 +950,13 @@ def points_to_depth_image(
     camera_matrix: np.ndarray | None = None,
     fill_value: float = 0.0,
     return_indices: bool = False,
+    distortion: np.ndarray | None = None,
 ):
-    """Rasterize a point cloud into a depth image using nearest-depth z-buffering."""
+    """Rasterize a point cloud into a depth image using nearest-depth z-buffering.
+
+    `distortion` applies lens distortion during projection (see
+    `project_points_to_image`).
+    """
 
     height, width = _image_height_width(image_shape)
     pixels, depth_values, valid = project_points_to_image(
@@ -834,6 +968,7 @@ def points_to_depth_image(
         image_shape=None,
         transform=transform,
         camera_matrix=camera_matrix,
+        distortion=distortion,
         return_depth=True,
     )
 
@@ -873,8 +1008,14 @@ def rgbd_to_points(
     scale: float = 1.0,
     mask: np.ndarray | None = None,
     camera_matrix: np.ndarray | None = None,
+    distortion: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Backproject a depth image to XYZ and append aligned image channels."""
+    """Backproject a depth image to XYZ and append aligned image channels.
+
+    With `distortion`, pixels are undistorted before backprojection (depth is
+    the optical-axis Z); pixels outside the distortion model's valid domain
+    are dropped.
+    """
 
     if scale == 0:
         raise ValueError("scale must be non-zero")
@@ -893,8 +1034,21 @@ def rgbd_to_points(
 
     rows, cols = np.nonzero(valid)
     z_valid = z[rows, cols]
-    x = (cols - intrinsics[2]) * z_valid / intrinsics[0]
-    y = (rows - intrinsics[3]) * z_valid / intrinsics[1]
+    if distortion is None:
+        x = (cols - intrinsics[2]) * z_valid / intrinsics[0]
+        y = (rows - intrinsics[3]) * z_valid / intrinsics[1]
+    else:
+        pixel_coords = np.column_stack((cols, rows)).astype(np.float64)
+        normalized = undistort_normalized_points(
+            pixels_to_normalized_points(pixel_coords, _camera_matrix_from_optional(fx, fy, cx, cy, camera_matrix)),
+            distortion,
+        )
+        undistorted = np.isfinite(normalized).all(axis=1)
+        if not undistorted.all():
+            rows, cols = rows[undistorted], cols[undistorted]
+            z_valid, normalized = z_valid[undistorted], normalized[undistorted]
+        x = normalized[:, 0] * z_valid
+        y = normalized[:, 1] * z_valid
     colors = image_arr[rows, cols]
     if colors.ndim == 1:
         colors = colors[:, None]
@@ -1115,6 +1269,17 @@ def _project_points_with_camera(
         normalized = np.empty((np.count_nonzero(valid), 2), dtype=np.float64)
         normalized[:, 0] = xyz[valid, 0] / depth[valid]
         normalized[:, 1] = xyz[valid, 1] / depth[valid]
+        if distortion is not None:
+            # Past the radius where the radial model stops increasing, far
+            # off-axis points fold back into the image; they are not
+            # projectable, so mark them invalid (NaN pixels).
+            radius_limit = _radial_distortion_limit(_distortion_coefficients(distortion))
+            if radius_limit is not None:
+                in_domain = normalized[:, 0] ** 2 + normalized[:, 1] ** 2 <= radius_limit
+                if not in_domain.all():
+                    valid_rows = np.flatnonzero(valid)
+                    valid[valid_rows[~in_domain]] = False
+                    normalized = normalized[in_domain]
         normalized = distort_normalized_points(normalized, distortion).reshape(-1, 2)
         pixels[valid, 0] = intrinsics[0] * normalized[:, 0] + intrinsics[2]
         pixels[valid, 1] = intrinsics[1] * normalized[:, 1] + intrinsics[3]
@@ -1131,6 +1296,41 @@ def _project_points_with_camera(
     if return_depth:
         return pixels, depth.copy(), valid
     return pixels, valid
+
+
+def _radial_distortion_limit(coefficients: np.ndarray) -> float | None:
+    """Return the squared normalized radius where radial distortion folds over.
+
+    The distorted radius is `f(r) = r * N(r^2) / D(r^2)` with
+    `N = 1 + k1 s + k2 s^2 + k3 s^3` and `D = 1 + k4 s + k5 s^2 + k6 s^3`
+    (`s = r^2`). Projection is only one-to-one while `f'(r) > 0`, i.e. up to
+    the first positive root of `N D + 2 s (N' D - N D')` (or a pole of `D`).
+    Tangential terms are ignored. Returns `None` when `f` never turns over.
+    """
+
+    k1, k2, _, _, k3, k4, k5, k6 = np.asarray(coefficients, dtype=np.float64)
+    poly = np.polynomial.polynomial
+    numerator = np.array([1.0, k1, k2, k3])
+    denominator = np.array([1.0, k4, k5, k6])
+    numerator_ds = np.array([k1, 2.0 * k2, 3.0 * k3])
+    denominator_ds = np.array([k4, 2.0 * k5, 3.0 * k6])
+    slope = poly.polyadd(
+        poly.polymul(numerator, denominator),
+        2.0 * poly.polymulx(poly.polysub(
+            poly.polymul(numerator_ds, denominator),
+            poly.polymul(numerator, denominator_ds),
+        )),
+    )
+    limits = []
+    for polynomial in (slope, denominator):
+        trimmed = poly.polytrim(polynomial)
+        if trimmed.size < 2:
+            continue
+        roots = poly.polyroots(trimmed)
+        real = roots.real[(np.abs(roots.imag) <= 1.0e-9 * np.maximum(1.0, np.abs(roots))) & (roots.real > 0.0)]
+        if real.size:
+            limits.append(float(real.min()))
+    return min(limits) if limits else None
 
 
 def _camera_model_components(

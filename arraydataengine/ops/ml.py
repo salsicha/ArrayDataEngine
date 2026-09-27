@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from itertools import islice
 from typing import Any
 
 import numpy as np
@@ -59,7 +60,12 @@ def to_numpy_dataset(samples, transform: Callable | None = None, copy: bool = Tr
 
 
 def to_torch_dataset(samples, transform: Callable | None = None, iterable: bool = True):
-    """Wrap samples as a PyTorch Dataset when `torch` is installed."""
+    """Wrap samples as a PyTorch Dataset when `torch` is installed.
+
+    The iterable dataset shards samples across `DataLoader` workers
+    (worker `i` of `n` yields samples `i, i + n, ...`), so multi-worker
+    loading yields every sample exactly once.
+    """
 
     try:
         import torch
@@ -71,7 +77,11 @@ def to_torch_dataset(samples, transform: Callable | None = None, iterable: bool 
 
         class _TorchIterableDataset(torch.utils.data.IterableDataset):
             def __iter__(self):
-                for sample in source:
+                samples_iter = iter(source)
+                worker = torch.utils.data.get_worker_info()
+                if worker is not None and worker.num_workers > 1:
+                    samples_iter = islice(samples_iter, worker.id, None, worker.num_workers)
+                for sample in samples_iter:
                     yield _to_torch_sample(sample, torch)
 
         return _TorchIterableDataset()
@@ -127,7 +137,14 @@ def deterministic_split_indices(
     shuffle: bool = False,
     groups: Iterable[Any] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Create deterministic row-index splits, optionally keeping groups together."""
+    """Create deterministic row-index splits, optionally keeping groups together.
+
+    Units (rows, or groups in order of first appearance) are assigned to the
+    splits in order. With `shuffle=True` the units are permuted with
+    `np.random.default_rng(seed)`; `seed=None` uses seed 0 so the split stays
+    deterministic (pass a different seed for a different permutation).
+    `seed` is ignored when `shuffle` is false. NaN group values form one group.
+    """
 
     count = int(count)
     if count < 0:
@@ -141,15 +158,17 @@ def deterministic_split_indices(
         group_values = [_hashable_group(value) for value in groups]
         if len(group_values) != count:
             raise ValueError("groups must have one entry per row")
-        units = _unique_stable(group_values)
-        unit_to_indices = {
-            unit: np.asarray([index for index, value in enumerate(group_values) if value == unit], dtype=np.int64)
-            for unit in units
-        }
+        # Dict insertion order keeps first-appearance order (independent of
+        # PYTHONHASHSEED) and groups rows in one pass.
+        grouped: dict[Any, list[int]] = {}
+        for index, value in enumerate(group_values):
+            grouped.setdefault(value, []).append(index)
+        units = list(grouped)
+        unit_to_indices = {unit: np.asarray(indices, dtype=np.int64) for unit, indices in grouped.items()}
 
     order = list(units)
     if shuffle:
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(0 if seed is None else seed)
         rng.shuffle(order)
 
     counts = _split_counts(len(order), fractions_array)
@@ -176,7 +195,13 @@ def split_topic(
     geography_columns: tuple[int, int] = (0, 1),
     geography_cell_size: float = 0.01,
 ) -> dict[str, dict]:
-    """Split a topic dict into deterministic train/validation/test-style partitions."""
+    """Split a topic dict into deterministic train/validation/test-style partitions.
+
+    `by="time"` orders rows by timestamp (stable for ties) before splitting,
+    so earlier samples land in the first split even when the topic is not
+    time-sorted; `by="index"` uses row order. Each split keeps the original
+    row order. See `deterministic_split_indices` for `seed`/`shuffle`.
+    """
 
     view = topic_view(topic_data, copy=False)
     groups = _split_groups(topic_data, view, by, geography_columns, geography_cell_size)
@@ -189,6 +214,9 @@ def split_topic(
         shuffle=use_shuffle,
         groups=groups,
     )
+    if by.lower().replace("-", "_") == "time":
+        time_order = np.argsort(np.asarray(view.timestamps, dtype=np.float64), kind="stable")
+        split_indices = {name: np.sort(time_order[indices]) for name, indices in split_indices.items()}
     return {name: _select_view_indices(view, indices).as_dict(copy=False) for name, indices in split_indices.items()}
 
 
@@ -202,12 +230,19 @@ def augment_image(
     noise_std: float = 0.0,
     seed: int | None = None,
     clip: tuple[float, float] | None = None,
+    channel_axis="auto",
 ) -> np.ndarray:
-    """Apply deterministic image-style augmentations to image arrays or sequences."""
+    """Apply deterministic image-style augmentations to image arrays or sequences.
+
+    `channel_axis="auto"` treats a trailing axis of size 1, 3, or 4 on 3-D+
+    input as color channels. A gray `(N, H, W)` sequence whose width is 1, 3,
+    or 4 is ambiguous; pass `channel_axis=None` (no color axis: the last two
+    axes are spatial) or an integer color axis to be explicit.
+    """
 
     arr = np.asarray(image)
     result = arr.copy()
-    vertical_axis, horizontal_axis = _spatial_axes(result)
+    vertical_axis, horizontal_axis = _spatial_axes(result, channel_axis)
     if flip_vertical:
         result = np.flip(result, axis=vertical_axis)
     if flip_horizontal:
@@ -235,14 +270,21 @@ def augment_dem_patch(
     z_offset: float = 0.0,
     noise_std: float = 0.0,
     seed: int | None = None,
+    channel_axis=None,
 ) -> np.ndarray:
-    """Apply spatial and elevation augmentations to a DEM patch."""
+    """Apply spatial and elevation augmentations to a DEM patch.
+
+    DEM patches have no color axis, so the last two axes are spatial by
+    default (a `(N, 3, 3)` patch stack flips each 3x3 patch); see
+    `augment_image` for `channel_axis`.
+    """
 
     augmented = augment_image(
         patch,
         flip_horizontal=flip_horizontal,
         flip_vertical=flip_vertical,
         rotate_k=rotate_k,
+        channel_axis=channel_axis,
     ).astype(np.float64, copy=False)
     if z_scale != 1.0 or z_offset != 0.0 or noise_std:
         augmented = augmented * float(z_scale) + float(z_offset)
@@ -327,7 +369,16 @@ def augment_trajectory(
 
 
 def collate_samples(samples: Iterable[Mapping[str, Any]], pad: bool = True, pad_value=0.0) -> dict[str, Any]:
-    """Collate mixed-rate sensor samples, padding variable-size arrays when needed."""
+    """Collate mixed-rate sensor samples, padding variable-size arrays when needed.
+
+    With `pad=True`, every array field with at least one dimension also gets
+    `<key>_lengths` (leading-axis lengths) and `<key>_mask` entries, whether
+    or not the batch happens to be ragged, so the batch schema is stable.
+    Arrays with different numbers of dimensions cannot be padded together and
+    raise `ValueError`. `pad_value` is cast to the arrays' dtype when it is
+    exactly representable (so int64 nanosecond timestamps stay int64);
+    otherwise the dtype is promoted.
+    """
 
     sample_list = [dict(sample) for sample in samples]
     if not sample_list:
@@ -343,6 +394,9 @@ def collate_samples(samples: Iterable[Mapping[str, Any]], pad: bool = True, pad_
 def _as_dataset_query(dataset) -> DatasetQuery:
     if isinstance(dataset, DatasetQuery):
         return dataset
+    if isinstance(dataset, np.ndarray) and dataset.dtype.names is not None and "data" in dataset.dtype.names:
+        # A buffered structured topic array (a `DataBuffer.get_buffer()` value).
+        return dataset_query({"topic": dataset})
     if isinstance(dataset, Mapping) and "ts" in dataset and "data" in dataset:
         topic = str(dataset.get("topic", "topic"))
         return dataset_query({topic: dataset})
@@ -393,25 +447,27 @@ def _split_counts(count: int, fractions: np.ndarray) -> np.ndarray:
     return counts
 
 
-def _unique_stable(values: np.ndarray) -> list[Any]:
-    seen = set()
-    result = []
-    for value in values:
-        key = _hashable_group(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(key)
-    return result
+class _NaNGroup:
+    """Hashable stand-in so every NaN group value lands in one group."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "nan"
+
+
+_NAN_GROUP = _NaNGroup()
 
 
 def _hashable_group(value) -> Any:
     if isinstance(value, np.ndarray):
-        return tuple(value.tolist())
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, list):
-        return tuple(value)
+        value = value.tolist()
+    elif isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_group(item) for item in value)
+    if isinstance(value, (float, complex)) and value != value:
+        return _NAN_GROUP
     return value
 
 
@@ -449,12 +505,25 @@ def _select_view_indices(view: TopicView, indices: np.ndarray) -> TopicView:
     return TopicView(ids, view.timestamps[indices], view.data[indices], metadata=view.metadata, copy=True)
 
 
-def _spatial_axes(arr: np.ndarray) -> tuple[int, int]:
+def _spatial_axes(arr: np.ndarray, channel_axis="auto") -> tuple[int, int]:
     if arr.ndim < 2:
         raise ValueError("array must have at least two spatial dimensions")
-    if arr.ndim >= 3 and arr.shape[-1] in {1, 3, 4}:
-        return -3, -2
-    return -2, -1
+    if isinstance(channel_axis, str):
+        if channel_axis != "auto":
+            raise ValueError("channel_axis must be 'auto', None, or an integer axis")
+        if arr.ndim >= 3 and arr.shape[-1] in {1, 3, 4}:
+            return -3, -2
+        return -2, -1
+    remaining = list(range(arr.ndim))
+    if channel_axis is not None:
+        axis = int(channel_axis)
+        axis = axis + arr.ndim if axis < 0 else axis
+        if axis < 0 or axis >= arr.ndim:
+            raise ValueError("channel_axis is out of bounds")
+        remaining.remove(axis)
+    if len(remaining) < 2:
+        raise ValueError("array must have two spatial dimensions besides the channel axis")
+    return remaining[-2], remaining[-1]
 
 
 def _restore_numeric_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -502,26 +571,46 @@ def _as_collatable_array(value) -> np.ndarray | None:
 
 def _collate_arrays(key: str, arrays: list[np.ndarray], pad: bool, pad_value) -> dict[str, Any]:
     shapes = [array.shape for array in arrays]
-    if len(set(shapes)) == 1:
-        return {key: np.stack(arrays, axis=0)}
+    ndims = {array.ndim for array in arrays}
     if not pad:
+        if len(set(shapes)) == 1:
+            return {key: np.stack(arrays, axis=0)}
         return {key: np.asarray(arrays, dtype=object)}
+    if ndims == {0}:
+        # Scalars can never be ragged; no lengths/mask needed.
+        return {key: np.stack(arrays, axis=0)}
+    if len(ndims) != 1:
+        raise ValueError(
+            f"cannot pad {key!r}: samples have different numbers of dimensions "
+            f"({sorted(ndims)}); reshape them consistently or use pad=False"
+        )
 
-    max_ndim = max(array.ndim for array in arrays)
-    normalized = [array.reshape(array.shape + (1,) * (max_ndim - array.ndim)) for array in arrays]
-    max_shape = tuple(max(array.shape[dim] for array in normalized) for dim in range(max_ndim))
-    dtype = np.result_type(*[array.dtype for array in normalized], np.asarray(pad_value).dtype)
-    padded = np.full((len(normalized), *max_shape), pad_value, dtype=dtype)
-    mask = np.zeros((len(normalized), max_shape[0] if max_shape else 1), dtype=bool)
-    lengths = np.zeros((len(normalized),), dtype=np.int64)
-    for index, array in enumerate(normalized):
+    max_shape = tuple(max(shape[dim] for shape in shapes) for dim in range(len(shapes[0])))
+    dtype = _padded_dtype([array.dtype for array in arrays], pad_value)
+    padded = np.full((len(arrays), *max_shape), pad_value, dtype=dtype)
+    mask = np.zeros((len(arrays), max_shape[0]), dtype=bool)
+    lengths = np.zeros((len(arrays),), dtype=np.int64)
+    for index, array in enumerate(arrays):
         slices = (index, *[slice(0, size) for size in array.shape])
         padded[slices] = array
-        length = array.shape[0] if array.ndim else 1
-        lengths[index] = length
-        mask[index, :length] = True
+        lengths[index] = array.shape[0]
+        mask[index, :array.shape[0]] = True
     return {
         key: padded,
         f"{key}_lengths": lengths,
         f"{key}_mask": mask,
     }
+
+
+def _padded_dtype(dtypes: list[np.dtype], pad_value) -> np.dtype:
+    dtype = np.result_type(*dtypes)
+    pad = np.asarray(pad_value)
+    if dtype.kind in "biufc" and pad.dtype.kind in "biufc":
+        try:
+            with np.errstate(invalid="ignore", over="ignore"):
+                cast = pad.astype(dtype)
+            if bool(np.all(cast == pad)):
+                return dtype
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return np.result_type(dtype, pad.dtype)

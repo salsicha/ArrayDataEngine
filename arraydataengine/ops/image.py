@@ -4,14 +4,29 @@ import numpy as np
 
 
 def normalize_image(image: np.ndarray, min_value=None, max_value=None, dtype=np.float32) -> np.ndarray:
+    """Scale an image to `[0, 1]` using its finite range (or explicit bounds).
+
+    Non-finite pixels (e.g. NaN depth holes) are ignored when computing the
+    range and stay NaN in the output.
+    """
+
     # Subtract in float64: integer dtypes wrap around (or overflow on NumPy 2)
     # when min_value exceeds a pixel value.
     arr = np.asarray(image).astype(np.float64, copy=False)
-    min_value = arr.min() if min_value is None else float(min_value)
-    max_value = arr.max() if max_value is None else float(max_value)
+    if min_value is None or max_value is None:
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            if arr.size == 0:
+                return np.zeros(arr.shape, dtype=dtype)
+            return np.full(arr.shape, np.nan, dtype=dtype)
+        min_value = finite.min() if min_value is None else float(min_value)
+        max_value = finite.max() if max_value is None else float(max_value)
+    else:
+        min_value = float(min_value)
+        max_value = float(max_value)
     span = max_value - min_value
     if span == 0:
-        return np.zeros(arr.shape, dtype=dtype)
+        return np.where(np.isnan(arr), np.nan, 0.0).astype(dtype)
     return ((arr - min_value) / span).astype(dtype)
 
 
@@ -30,15 +45,25 @@ def normalize_images(
 
     values = arr.astype(np.float64, copy=False)
     axes = tuple(range(1, values.ndim))
-    mins = values.min(axis=axes, keepdims=True) if min_value is None else np.asarray(min_value, dtype=np.float64)
-    maxs = values.max(axis=axes, keepdims=True) if max_value is None else np.asarray(max_value, dtype=np.float64)
+    finite = np.isfinite(values)
+    if min_value is None:
+        mins = np.where(finite, values, np.inf).min(axis=axes, keepdims=True)
+    else:
+        mins = np.asarray(min_value, dtype=np.float64)
+    if max_value is None:
+        maxs = np.where(finite, values, -np.inf).max(axis=axes, keepdims=True)
+    else:
+        maxs = np.asarray(max_value, dtype=np.float64)
     span = maxs - mins
+    usable = np.isfinite(span) & (span != 0)
     normalized = np.divide(
         values - mins,
         span,
         out=np.zeros_like(values, dtype=np.float64),
-        where=span != 0,
+        where=usable,
     )
+    # Keep NaN pixels (and frames without any finite pixel) as NaN.
+    normalized[np.isnan(values)] = np.nan
     return normalized.astype(dtype)
 
 
@@ -66,6 +91,14 @@ def pad_images(images: np.ndarray, pad_width, value=0) -> np.ndarray:
 
 
 def resize_nearest(image: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Nearest-neighbour resize with align-corners sampling.
+
+    Output pixel `i` samples input index `round(i * (in - 1) / (out - 1))`, so
+    the first and last rows/columns map exactly onto each other. This differs
+    from OpenCV's `INTER_NEAREST` (pixel-area floor sampling), e.g. 10 -> 4
+    columns picks `[0, 3, 6, 9]` rather than `[0, 2, 5, 7]`.
+    """
+
     arr = np.asarray(image)
     out_h, out_w = shape
     if out_h <= 0 or out_w <= 0:
@@ -76,7 +109,10 @@ def resize_nearest(image: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 
 def resize_images_nearest(images: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """Resize an image/depth sequence with nearest-neighbor sampling."""
+    """Resize an image/depth sequence with nearest-neighbor sampling.
+
+    Uses the same align-corners index mapping as `resize_nearest`.
+    """
 
     arr = _as_image_sequence(images)
     out_h, out_w = _validate_shape(shape)
@@ -152,7 +188,20 @@ def convert_color(images: np.ndarray, mode: str, alpha=None) -> np.ndarray:
 
 
 def convert_image_dtype(image: np.ndarray, dtype, scale: bool = True, clip: bool = True) -> np.ndarray:
-    """Convert image/depth arrays between common numeric dtypes."""
+    """Convert image/depth arrays between common numeric dtypes.
+
+    With `scale=True` values follow scikit-image's conventions: unsigned
+    integers map to floats in `[0, 1]` (`x / max`) and signed integers to
+    `[-1, 1]` (`x / max`, clamped at -1). Floats map back by the inverse
+    scale with rounding, so integer -> float -> same integer round-trips
+    (except the most negative signed value, which shares -1.0 with `-max`).
+    Integer -> integer conversions preserve zero: same-signedness conversions
+    rescale full-range (unsigned, bit replication/rounding) or by bit shift
+    (signed), and signed <-> unsigned conversions map the non-negative range
+    onto the other type's non-negative range, clipping negatives to 0.
+    `clip=True` clips float inputs to the representable range before scaling.
+    `scale=False` is a plain `astype`.
+    """
 
     arr = np.asarray(image)
     target = np.dtype(dtype)
@@ -165,32 +214,49 @@ def convert_image_dtype(image: np.ndarray, dtype, scale: bool = True, clip: bool
         converted = arr.astype(np.float64)
         if np.issubdtype(arr.dtype, np.integer):
             info = np.iinfo(arr.dtype)
+            converted = converted * (1.0 / info.max)
             if info.min < 0:
-                converted = (converted - info.min) / (info.max - info.min)
-            elif info.max > 0:
-                converted = converted / info.max
+                converted = np.maximum(converted, -1.0)
         return converted.astype(target)
 
     if not np.issubdtype(target, np.integer):
         return arr.astype(target)
 
     target_info = np.iinfo(target)
+    target_signed = target_info.min < 0
+    if np.issubdtype(arr.dtype, np.integer):
+        return _convert_integer_image(arr, target)
+
     converted = arr.astype(np.float64)
     if np.issubdtype(arr.dtype, np.floating):
         if clip:
-            converted = np.clip(converted, 0.0, 1.0)
+            converted = np.clip(converted, -1.0 if target_signed else 0.0, 1.0)
         converted = converted * target_info.max
-    elif np.issubdtype(arr.dtype, np.integer):
-        source_info = np.iinfo(arr.dtype)
-        if source_info.min < 0:
-            converted = (converted - source_info.min) / (source_info.max - source_info.min)
-            converted = converted * (target_info.max - target_info.min) + target_info.min
-        elif source_info.max != target_info.max:
-            converted = converted / source_info.max * target_info.max
 
     if clip:
         converted = np.clip(converted, target_info.min, target_info.max)
     return np.rint(converted).astype(target)
+
+
+def _convert_integer_image(arr: np.ndarray, target: np.dtype) -> np.ndarray:
+    source_info = np.iinfo(arr.dtype)
+    target_info = np.iinfo(target)
+    source_signed = source_info.min < 0
+    target_signed = target_info.min < 0
+
+    if source_signed and target_signed:
+        # Arithmetic bit shifts keep zero at zero and round-trip exactly.
+        shift = target_info.bits - source_info.bits
+        if shift >= 0:
+            return np.left_shift(arr.astype(target), shift)
+        return np.right_shift(arr, -shift).astype(target)
+
+    values = arr.astype(np.float64)
+    if source_signed:
+        # signed -> unsigned: negative values have no representation.
+        values = np.maximum(values, 0.0)
+    converted = np.rint(values / source_info.max * target_info.max)
+    return np.clip(converted, target_info.min, target_info.max).astype(target)
 
 
 def image_mask(
@@ -274,11 +340,23 @@ def close_mask(mask: np.ndarray, size=3, iterations: int = 1, spatial_axes=None)
     return erode_mask(dilated, size=size, iterations=iterations, spatial_axes=spatial_axes)
 
 
-def image_gradients(image: np.ndarray, method: str = "sobel", spatial_axes=None) -> dict[str, np.ndarray]:
-    """Compute spatial image gradients and magnitude."""
+def image_gradients(
+    image: np.ndarray,
+    method: str = "sobel",
+    spatial_axes=None,
+    channel_axis="auto",
+) -> dict[str, np.ndarray]:
+    """Compute spatial image gradients and magnitude.
 
-    arr = _gradient_input(image)
-    axes = _infer_spatial_axes(arr, spatial_axes)
+    Color inputs are converted to gray first. `channel_axis="auto"` keeps the
+    shape heuristic (a trailing axis of 3 or 4 is RGB(A) unless `spatial_axes`
+    names it as spatial). A gray `(N, H, W)` sequence whose width is 1, 3, or 4
+    is ambiguous with `(H, W, C)`; pass `channel_axis=None` (no channels) or
+    `spatial_axes=(1, 2)` to resolve it, or an integer `channel_axis` for an
+    explicit color axis.
+    """
+
+    arr, axes = _gradient_input(image, spatial_axes, channel_axis)
     method = method.lower()
     if method == "central":
         dy, dx = np.gradient(arr.astype(np.float64, copy=False), axis=axes)
@@ -333,7 +411,15 @@ def local_statistics(
     statistics=("mean", "std"),
     spatial_axes=None,
 ) -> dict[str, np.ndarray]:
-    """Compute local window statistics over spatial dimensions."""
+    """Compute local window statistics over spatial dimensions.
+
+    Windows are edge-padded; any NaN inside a window makes its mean/std NaN.
+    Reductions run over strided views (the std uses a two-pass sum over
+    shifted views), so memory stays proportional to the image, not to
+    `image.size * window_area`. See `_infer_spatial_axes` for how ambiguous
+    `(N, H, W)` vs `(H, W, C)` inputs are resolved; pass `spatial_axes` to be
+    explicit.
+    """
 
     arr = np.asarray(image)
     axes = _infer_spatial_axes(arr, spatial_axes)
@@ -344,7 +430,7 @@ def local_statistics(
         if name == "mean":
             result["mean"] = windows.mean(axis=(-2, -1))
         elif name == "std":
-            result["std"] = windows.astype(np.float64, copy=False).std(axis=(-2, -1))
+            result["std"] = _local_std(arr, windows, size, axes)
         elif name == "min":
             result["min"] = windows.min(axis=(-2, -1))
         elif name == "max":
@@ -352,6 +438,26 @@ def local_statistics(
         else:
             raise ValueError("statistics entries must be mean, std, min, or max")
     return result
+
+
+def _local_std(arr: np.ndarray, windows: np.ndarray, size, axes: tuple[int, int]) -> np.ndarray:
+    height, width = _kernel_shape(size)
+    mean = windows.mean(axis=(-2, -1), dtype=np.float64)
+    pad = [(0, 0)] * arr.ndim
+    pad[axes[0]] = (height // 2, height - 1 - height // 2)
+    pad[axes[1]] = (width // 2, width - 1 - width // 2)
+    padded = np.pad(arr, pad, mode="edge")
+    squared = np.zeros(arr.shape, dtype=np.float64)
+    deviation = np.empty(arr.shape, dtype=np.float64)
+    slicer = [slice(None)] * arr.ndim
+    for row in range(height):
+        slicer[axes[0]] = slice(row, row + arr.shape[axes[0]])
+        for col in range(width):
+            slicer[axes[1]] = slice(col, col + arr.shape[axes[1]])
+            np.subtract(padded[tuple(slicer)], mean, out=deviation, casting="unsafe")
+            np.multiply(deviation, deviation, out=deviation)
+            squared += deviation
+    return np.sqrt(squared / (height * width))
 
 
 def local_mean(image: np.ndarray, size=3, spatial_axes=None) -> np.ndarray:
@@ -439,11 +545,16 @@ def frame_to_frame_optical_flow(
 
 
 def translate_image(image: np.ndarray, shift, fill_value=0) -> np.ndarray:
-    """Translate an image by integer ``(row_shift, col_shift)`` pixels."""
+    """Translate an image by integer ``(row_shift, col_shift)`` pixels.
+
+    The output keeps the input dtype, so `fill_value` must be representable
+    in it (a NaN fill on an integer image raises `ValueError`).
+    """
 
     arr = np.asarray(image)
     if arr.ndim not in (2, 3):
         raise ValueError("image must have shape (H, W) or (H, W, C)")
+    _check_fill_value(fill_value, arr.dtype)
     row_shift, col_shift = _integer_shift(shift)
     result = np.full(arr.shape, fill_value, dtype=arr.dtype)
     height, width = arr.shape[:2]
@@ -839,7 +950,28 @@ def _default_alpha(dtype) -> float | int:
     return 1
 
 
-def _infer_spatial_axes(arr: np.ndarray, spatial_axes) -> tuple[int, int]:
+def _check_fill_value(fill_value, dtype: np.dtype) -> None:
+    if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+        value = np.asarray(fill_value)
+        if value.dtype.kind in "fc" and not np.all(np.isfinite(value)):
+            raise ValueError(
+                f"fill_value={fill_value!r} cannot be represented in an image of dtype {np.dtype(dtype)}; "
+                "convert the image to float first or use a finite fill value"
+            )
+
+
+def _infer_spatial_axes(arr: np.ndarray, spatial_axes, channel_axis="auto") -> tuple[int, int]:
+    """Resolve the two spatial axes of an image or image sequence.
+
+    Explicit `spatial_axes` win. Otherwise `channel_axis` decides: `None`
+    means no color axis (the last two axes are spatial), an integer names
+    the color axis (the last two remaining axes are spatial), and `"auto"`
+    uses the shape heuristic: 3-D arrays whose last axis is 1, 3, or 4 are
+    `(H, W, C)`, other 3-D arrays are `(N, H, W)`, and 4-D arrays are
+    `(N, H, W, C)`. A gray `(N, H, W)` sequence with a width of 1, 3, or 4 is
+    ambiguous under `"auto"`; pass `spatial_axes` or `channel_axis=None`.
+    """
+
     if spatial_axes is not None:
         axes = tuple(int(axis) for axis in spatial_axes)
         if len(axes) != 2:
@@ -848,6 +980,19 @@ def _infer_spatial_axes(arr: np.ndarray, spatial_axes) -> tuple[int, int]:
         if any(axis < 0 or axis >= arr.ndim for axis in axes) or axes[0] == axes[1]:
             raise ValueError("spatial_axes must refer to two distinct axes")
         return axes
+
+    if channel_axis is None or not isinstance(channel_axis, str):
+        if arr.ndim < 2:
+            raise ValueError("image data must have at least two dimensions")
+        remaining = list(range(arr.ndim))
+        if channel_axis is not None:
+            channel = _normalize_axis(channel_axis, arr.ndim, "channel_axis")
+            remaining.remove(channel)
+        if len(remaining) < 2:
+            raise ValueError("image data must have two spatial axes besides the channel axis")
+        return remaining[-2], remaining[-1]
+    if channel_axis != "auto":
+        raise ValueError("channel_axis must be 'auto', None, or an integer axis")
 
     if arr.ndim == 2:
         return (0, 1)
@@ -903,11 +1048,39 @@ def _morphology(mask: np.ndarray, size, iterations: int, operation: str, spatial
     return result
 
 
-def _gradient_input(image: np.ndarray) -> np.ndarray:
+def _normalize_axis(axis, ndim: int, name: str) -> int:
+    axis = int(axis)
+    if axis < 0:
+        axis += ndim
+    if axis < 0 or axis >= ndim:
+        raise ValueError(f"{name} is out of bounds")
+    return axis
+
+
+def _gradient_input(image: np.ndarray, spatial_axes=None, channel_axis="auto") -> tuple[np.ndarray, tuple[int, int]]:
+    """Return a gray float image and its spatial axes."""
+
     arr = np.asarray(image)
-    if arr.ndim >= 3 and arr.shape[-1] >= 3 and arr.shape[-1] <= 4:
-        return rgb_to_gray(arr)
-    return arr.astype(np.float64, copy=False)
+    if isinstance(channel_axis, str):
+        if channel_axis != "auto":
+            raise ValueError("channel_axis must be 'auto', None, or an integer axis")
+        last = arr.ndim - 1
+        explicit_spatial = spatial_axes is not None and last in {
+            _normalize_axis(axis, arr.ndim, "spatial_axes") for axis in spatial_axes
+        }
+        if arr.ndim >= 3 and 3 <= arr.shape[-1] <= 4 and not explicit_spatial:
+            gray = rgb_to_gray(arr)
+            # The color axis is gone; the spatial axes are the last two left.
+            axes = _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
+            return gray, axes
+        gray = arr.astype(np.float64, copy=False)
+        return gray, _infer_spatial_axes(gray, spatial_axes)
+    if channel_axis is None:
+        gray = arr.astype(np.float64, copy=False)
+        return gray, _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
+    channel = _normalize_axis(channel_axis, arr.ndim, "channel_axis")
+    gray = rgb_to_gray(np.moveaxis(arr, channel, -1))
+    return gray, _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
 
 
 def _convolve_spatial(image: np.ndarray, kernel: np.ndarray, spatial_axes) -> np.ndarray:
@@ -917,6 +1090,7 @@ def _convolve_spatial(image: np.ndarray, kernel: np.ndarray, spatial_axes) -> np
 
 
 def _resize_spatial_nearest(image: np.ndarray, shape: tuple[int, int], spatial_axes: tuple[int, int]) -> np.ndarray:
+    # Align-corners nearest sampling, like `resize_nearest`.
     arr = np.asarray(image)
     out_h, out_w = _validate_shape(shape)
     row_idx = np.linspace(0, arr.shape[spatial_axes[0]] - 1, out_h).round().astype(int)
@@ -979,6 +1153,15 @@ def _phase_correlation_shift(
     mov = moving.astype(np.float64, copy=False) - float(np.mean(moving))
     if not np.any(ref) or not np.any(mov):
         return np.zeros(2, dtype=np.float64)
+
+    # Taper both frames with a Hann window so the wrap-around discontinuity
+    # at the borders (FFT periodicity) does not dominate the correlation peak
+    # on natural, non-periodic content. The inner samples of an (n + 2)-point
+    # window keep tiny blocks from being zeroed out.
+    height, width = ref.shape
+    window = np.outer(np.hanning(height + 2)[1:-1], np.hanning(width + 2)[1:-1])
+    ref = ref * window
+    mov = mov * window
 
     cross_power = np.fft.fft2(mov) * np.conj(np.fft.fft2(ref))
     magnitude = np.abs(cross_power)

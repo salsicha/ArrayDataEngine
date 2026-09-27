@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping, Sequence
-from itertools import product
+from functools import lru_cache
+from itertools import chain, product
 
 import numpy as np
 
@@ -15,14 +16,40 @@ from .nav import quaternion_to_rotation_matrix
 # unique.
 _VOXEL_PACK_LIMIT = 1 << 20
 
+# Without SciPy, k-NN falls back to brute force over blocks of queries; the
+# block size keeps each (block, N) distance matrix around 2M float64 values.
+_KNN_MAX_QUERY_CHUNK = 1024
+_KNN_CHUNK_ELEMENTS = 1 << 21
+# Queries per cKDTree.query_ball_point call (bounds the Python-list output).
+_BALL_QUERY_CHUNK = 4096
+# Tree searches use a slightly inflated radius; candidates are then filtered
+# with the exact squared-distance test so results match the brute-force path.
+_RADIUS_SEARCH_SLACK = 1.0e-9
+# Points per block when gathering (block, k, 3) neighborhoods.
+_NEIGHBORHOOD_CHUNK = 1 << 15
+# verify_loop_closures without a gating distance or voxel size gates at this
+# multiple of the target cloud's median nearest-neighbor spacing.
+_LOOP_CLOSURE_SPACING_FACTOR = 3.0
+_SPACING_SAMPLE_COUNT = 2048
+
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Average points that fall into the same voxel.
+
+    Rows with non-finite XYZ are dropped. Integer inputs are promoted to
+    float64 so voxel means are not truncated; floating inputs keep their dtype.
+    """
+
     if voxel_size <= 0:
         raise ValueError("voxel_size must be positive")
 
     arr = _as_points(points)
+    output_dtype = arr.dtype if np.issubdtype(arr.dtype, np.floating) else np.dtype(np.float64)
+    finite = np.isfinite(arr[:, :3]).all(axis=1)
+    if not finite.all():
+        arr = arr[finite]
     if arr.size == 0:
-        return arr.copy()
+        return arr.astype(output_dtype, copy=True)
 
     voxels = np.floor(arr[:, :3] / voxel_size).astype(np.int64)
     if ((voxels > -_VOXEL_PACK_LIMIT) & (voxels < _VOXEL_PACK_LIMIT)).all():
@@ -40,7 +67,7 @@ def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     counts = np.bincount(inverse)
     for dim in range(arr.shape[1]):
         downsampled[:, dim] = np.bincount(inverse, weights=arr[:, dim]) / counts
-    return downsampled.astype(arr.dtype, copy=False)
+    return downsampled.astype(output_dtype, copy=False)
 
 
 def uniform_downsample(
@@ -91,42 +118,51 @@ def farthest_point_downsample(
     seed: int | None = None,
     return_indices: bool = False,
 ):
-    """Sample points with greedy farthest-point sampling over XYZ coordinates."""
+    """Sample points with greedy farthest-point sampling over XYZ coordinates.
+
+    Rows with non-finite XYZ are never selected. If `start_index` refers to
+    such a row, sampling starts from the first finite point instead.
+    """
 
     arr = _as_points(points)
     n_points = arr.shape[0]
     count = int(count)
     if count < 0:
         raise ValueError("count must be non-negative")
-    if count == 0 or n_points == 0:
+    xyz = arr[:, :3].astype(np.float64, copy=False)
+    finite = np.isfinite(xyz).all(axis=1)
+    finite_indices = np.flatnonzero(finite)
+    n_finite = finite_indices.size
+    if count == 0 or n_finite == 0:
         indices = np.empty((0,), dtype=np.int64)
         sampled = arr[:0].copy()
         return (sampled, indices) if return_indices else sampled
-    if count >= n_points:
-        indices = np.arange(n_points, dtype=np.int64)
-        sampled = arr.copy()
+    if count >= n_finite:
+        indices = finite_indices.astype(np.int64, copy=False)
+        sampled = arr[indices].copy()
         return (sampled, indices) if return_indices else sampled
 
     if start_index is None:
         rng = np.random.default_rng(seed)
-        current = int(rng.integers(0, n_points))
+        current = int(finite_indices[int(rng.integers(0, n_finite))])
     else:
         current = int(start_index)
         if current < 0 or current >= n_points:
             raise ValueError("start_index must refer to an existing point")
+        if not finite[current]:
+            current = int(finite_indices[0])
 
-    xyz = arr[:, :3].astype(np.float64, copy=False)
     indices = np.empty(count, dtype=np.int64)
     min_distances = np.full(n_points, np.inf, dtype=np.float64)
-    selected = np.zeros(n_points, dtype=bool)
+    blocked = ~finite
 
     for sample_index in range(count):
         indices[sample_index] = current
-        selected[current] = True
+        blocked[current] = True
         diff = xyz - xyz[current]
         distances = np.einsum("ij,ij->i", diff, diff)
         min_distances = np.minimum(min_distances, distances)
-        min_distances[selected] = -np.inf
+        min_distances[blocked] = -np.inf
         if sample_index + 1 < count:
             current = int(np.argmax(min_distances))
 
@@ -135,24 +171,22 @@ def farthest_point_downsample(
 
 
 def knn_search(points: np.ndarray, queries: np.ndarray, k: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Return distances and indices of the `k` nearest points for each query.
+
+    Results have shape `(Q, min(k, N))`, sorted by increasing distance. Uses
+    `scipy.spatial.cKDTree` when SciPy is installed and memory-bounded
+    brute force otherwise. Rows with non-finite XYZ are never returned as
+    neighbors; slots that cannot be filled (non-finite queries, or `k` larger
+    than the number of finite points) hold distance `inf` and index `-1`.
+    """
+
     arr = _as_points(points)
-    query = np.asarray(queries, dtype=np.float64)
-    if query.ndim == 1:
-        query = query.reshape(1, -1)
-    if query.ndim != 2 or query.shape[1] < 3:
-        raise ValueError("queries must have shape (Q, 3+) or (3,)")
+    query = _query_array(queries)
     if k < 1:
         raise ValueError("k must be at least 1")
     if arr.shape[0] == 0:
         return np.empty((query.shape[0], 0)), np.empty((query.shape[0], 0), dtype=np.int64)
-
-    k = min(k, arr.shape[0])
-    distances = np.linalg.norm(arr[None, :, :3] - query[:, None, :3], axis=2)
-    indices = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
-    row = np.arange(query.shape[0])[:, None]
-    order = np.argsort(distances[row, indices], axis=1)
-    indices = indices[row, order]
-    return distances[row, indices], indices
+    return _PointIndex(arr).knn(query, int(k))
 
 
 def _sampling_count(n_points: int, count: int | None, ratio: float | None, replace: bool) -> int:
@@ -176,48 +210,12 @@ def _sampling_count(n_points: int, count: int | None, ratio: float | None, repla
 
 
 def _radius_neighbors(points: np.ndarray, queries: np.ndarray, radius: float) -> list[np.ndarray]:
-    arr = _as_points(points).astype(np.float64, copy=False)
-    query = np.asarray(queries, dtype=np.float64)
-    if query.ndim == 1:
-        query = query.reshape(1, -1)
-    if query.ndim != 2 or query.shape[1] < 3:
-        raise ValueError("queries must have shape (Q, 3+) or (3,)")
-    if arr.shape[0] == 0:
-        return [np.empty((0,), dtype=np.int64) for _ in range(query.shape[0])]
-
-    if radius == 0:
-        return [
-            np.flatnonzero(np.all(arr[:, :3] == item[:3], axis=1)).astype(np.int64, copy=False)
-            for item in query
-        ]
-
-    cell_size = float(radius)
-    radius_squared = cell_size * cell_size
-    point_cells = np.floor(arr[:, :3] / cell_size).astype(np.int64)
-    buckets: dict[tuple[int, int, int], list[int]] = {}
-    for point_index, cell in enumerate(point_cells):
-        buckets.setdefault(tuple(int(v) for v in cell), []).append(point_index)
-
-    offsets = tuple(product((-1, 0, 1), repeat=3))
-    neighborhoods = []
-    for item in query:
-        cell = np.floor(item[:3] / cell_size).astype(np.int64)
-        candidate_indices = []
-        for offset in offsets:
-            key = tuple(int(cell[dim] + offset[dim]) for dim in range(3))
-            candidate_indices.extend(buckets.get(key, ()))
-        if not candidate_indices:
-            neighborhoods.append(np.empty((0,), dtype=np.int64))
-            continue
-
-        candidates = np.asarray(sorted(set(candidate_indices)), dtype=np.int64)
-        diff = arr[candidates, :3] - item[:3]
-        distances = np.einsum("ij,ij->i", diff, diff)
-        neighborhoods.append(candidates[distances <= radius_squared])
-    return neighborhoods
+    return _PointIndex(points).radius_neighbors(_query_array(queries), float(radius))
 
 
 def radius_search(points: np.ndarray, queries: np.ndarray, radius: float) -> list[np.ndarray]:
+    """Return sorted indices of the points within `radius` of each query."""
+
     if radius < 0:
         raise ValueError("radius must be non-negative")
     return _radius_neighbors(points, queries, radius)
@@ -237,30 +235,301 @@ def hybrid_search(
     if max_neighbors < 1:
         raise ValueError("max_neighbors must be at least 1")
 
-    arr = _as_points(points).astype(np.float64, copy=False)
+    arr = _as_points(points)
+    query = _query_array(queries)
+    return _PointIndex(arr).hybrid(query, float(radius), max_neighbors)
+
+
+@lru_cache(maxsize=None)
+def _scipy_ckdtree():
+    """Return `scipy.spatial.cKDTree`, or None when SciPy is not installed."""
+
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None
+    return cKDTree
+
+
+def _query_array(queries: np.ndarray) -> np.ndarray:
     query = np.asarray(queries, dtype=np.float64)
     if query.ndim == 1:
         query = query.reshape(1, -1)
     if query.ndim != 2 or query.shape[1] < 3:
         raise ValueError("queries must have shape (Q, 3+) or (3,)")
+    return np.ascontiguousarray(query[:, :3])
 
-    neighborhoods = _radius_neighbors(arr, query, radius)
-    distances = np.full((query.shape[0], max_neighbors), np.inf, dtype=np.float64)
-    indices = np.full((query.shape[0], max_neighbors), -1, dtype=np.int64)
-    counts = np.zeros((query.shape[0],), dtype=np.int64)
 
-    for row, candidates in enumerate(neighborhoods):
-        if candidates.size == 0:
-            continue
-        candidate_distances = np.linalg.norm(arr[candidates, :3] - query[row, :3], axis=1)
-        order = np.argsort(candidate_distances, kind="stable")[:max_neighbors]
-        selected = candidates[order]
-        count = selected.size
-        counts[row] = count
-        indices[row, :count] = selected
-        distances[row, :count] = candidate_distances[order]
+class _PointIndex:
+    """Nearest-neighbor index over the finite XYZ rows of a point array.
 
-    return distances, indices, counts
+    Backed by `scipy.spatial.cKDTree` when SciPy is importable; otherwise
+    k-NN queries use chunked brute force and radius queries a voxel hash grid.
+    Rows with non-finite XYZ are excluded, and every returned index refers to
+    the original array. Building the index once and querying it repeatedly
+    (e.g. across ICP iterations) avoids rebuilding the tree.
+    """
+
+    def __init__(self, points: np.ndarray):
+        xyz = np.asarray(_as_points(points)[:, :3], dtype=np.float64)
+        finite = np.isfinite(xyz).all(axis=1)
+        self.size = int(xyz.shape[0])
+        self.points_xyz = xyz
+        if finite.all():
+            self._finite_indices = None
+            self.xyz = xyz
+        else:
+            self._finite_indices = np.flatnonzero(finite).astype(np.int64, copy=False)
+            self.xyz = xyz[self._finite_indices]
+        self._tree = None
+        self._tree_built = False
+        self._buckets: dict[float, dict[tuple[int, int, int], np.ndarray]] = {}
+
+    @property
+    def finite_count(self) -> int:
+        return int(self.xyz.shape[0])
+
+    def _original(self, indices: np.ndarray) -> np.ndarray:
+        return indices if self._finite_indices is None else self._finite_indices[indices]
+
+    def tree(self):
+        if not self._tree_built:
+            self._tree_built = True
+            ckdtree = _scipy_ckdtree()
+            if ckdtree is not None and self.finite_count:
+                self._tree = ckdtree(np.ascontiguousarray(self.xyz))
+        return self._tree
+
+    def knn(self, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        width = min(k, self.size)
+        valid_k = min(width, self.finite_count)
+        distances = np.full((query.shape[0], width), np.inf, dtype=np.float64)
+        indices = np.full((query.shape[0], width), -1, dtype=np.int64)
+        query_rows = np.isfinite(query).all(axis=1)
+        all_rows = bool(query_rows.all())
+        queries = query if all_rows else query[query_rows]
+        if valid_k == 0 or queries.shape[0] == 0:
+            return distances, indices
+
+        tree = self.tree()
+        if tree is not None:
+            found_distances, found_indices = tree.query(queries, k=valid_k)
+            found_distances = np.asarray(found_distances, dtype=np.float64).reshape(-1, valid_k)
+            found_indices = np.asarray(found_indices, dtype=np.int64).reshape(-1, valid_k)
+        else:
+            found_distances, found_indices = _knn_bruteforce(self.xyz, queries, valid_k)
+        found_indices = self._original(found_indices)
+        if all_rows and valid_k == width:
+            return found_distances, found_indices
+        distances[query_rows, :valid_k] = found_distances
+        indices[query_rows, :valid_k] = found_indices
+        return distances, indices
+
+    def radius_neighbors(self, query: np.ndarray, radius: float) -> list[np.ndarray]:
+        if radius == 0.0 or self.tree() is None:
+            return self._grid_radius_neighbors(query, radius)
+        rows, cols = self._tree_radius_pairs(query, radius, np.flatnonzero(np.isfinite(query).all(axis=1)))
+        counts = np.bincount(rows, minlength=query.shape[0])
+        return np.split(cols, np.cumsum(counts)[:-1])
+
+    def radius_pairs(self, query: np.ndarray, radius: float) -> tuple[np.ndarray, np.ndarray]:
+        """Return `(query_rows, point_indices)` within `radius`, sorted by row then index."""
+
+        if radius == 0.0 or self.tree() is None:
+            neighborhoods = self._grid_radius_neighbors(query, radius)
+            counts = np.fromiter(map(len, neighborhoods), dtype=np.int64, count=len(neighborhoods))
+            rows = np.repeat(np.arange(len(neighborhoods), dtype=np.int64), counts)
+            cols = np.concatenate(neighborhoods) if neighborhoods else np.empty((0,), dtype=np.int64)
+            return rows, cols.astype(np.int64, copy=False)
+        return self._tree_radius_pairs(query, radius, np.flatnonzero(np.isfinite(query).all(axis=1)))
+
+    def hybrid(self, query: np.ndarray, radius: float, max_neighbors: int):
+        n_query = query.shape[0]
+        distances = np.full((n_query, max_neighbors), np.inf, dtype=np.float64)
+        indices = np.full((n_query, max_neighbors), -1, dtype=np.int64)
+        counts = np.zeros((n_query,), dtype=np.int64)
+        if n_query == 0 or self.finite_count == 0:
+            return distances, indices, counts
+
+        tree = self.tree()
+        if radius == 0.0 or tree is None:
+            rows, cols = self.radius_pairs(query, radius)
+            self._fill_nearest(query, rows, cols, max_neighbors, distances, indices, counts)
+            return distances, indices, counts
+
+        # Ask the tree for one neighbor more than needed: if the extra one is
+        # clearly farther than the last kept one, the kept set is exact.
+        # Rows with a (near) tie at that boundary are resolved with a complete
+        # ball query so tie-breaking matches the brute-force path (lowest index).
+        query_rows = np.flatnonzero(np.isfinite(query).all(axis=1))
+        if query_rows.size == 0:
+            return distances, indices, counts
+        request = min(max_neighbors + 1, self.finite_count)
+        search_radius = radius * (1.0 + _RADIUS_SEARCH_SLACK)
+        _, found = tree.query(query[query_rows], k=request, distance_upper_bound=search_radius)
+        found = np.asarray(found, dtype=np.int64).reshape(-1, request)
+        present = found < self.finite_count
+
+        row_slot, slot = np.nonzero(present)
+        rows = query_rows[row_slot]
+        cols = found[row_slot, slot]
+        diff = self.xyz[cols] - query[rows]
+        inside = np.einsum("ij,ij->i", diff, diff) <= radius * radius
+        rows, cols = rows[inside], self._original(cols[inside])
+
+        if request > max_neighbors:
+            full_rows = query_rows[present.all(axis=1)]
+            if full_rows.size:
+                full = found[present.all(axis=1)]
+                exact = np.linalg.norm(self.xyz[full] - query[full_rows][:, None, :], axis=2)
+                exact.sort(axis=1)
+                tied = exact[:, max_neighbors] <= exact[:, max_neighbors - 1] * (1.0 + 1.0e-12)
+                if tied.any():
+                    # Every point that can rank in the top `max_neighbors`
+                    # lies within the extra neighbor's distance.
+                    tie_rows = full_rows[tied]
+                    keep = ~np.isin(rows, tie_rows)
+                    tie_pairs = self._tree_radius_pairs(
+                        query,
+                        radius,
+                        tie_rows,
+                        ball_radius=np.minimum(exact[tied, max_neighbors], radius) * (1.0 + _RADIUS_SEARCH_SLACK),
+                    )
+                    rows = np.concatenate((rows[keep], tie_pairs[0]))
+                    cols = np.concatenate((cols[keep], tie_pairs[1]))
+
+        self._fill_nearest(query, rows, cols, max_neighbors, distances, indices, counts)
+        return distances, indices, counts
+
+    def _fill_nearest(self, query, rows, cols, max_neighbors, distances, indices, counts) -> None:
+        if rows.size == 0:
+            return
+        candidate_distances = np.linalg.norm(self.points_xyz[cols] - query[rows], axis=1)
+        order = np.lexsort((cols, candidate_distances, rows))
+        rows = rows[order]
+        cols = cols[order]
+        candidate_distances = candidate_distances[order]
+        rank = np.arange(rows.size) - np.searchsorted(rows, rows, side="left")
+        keep = rank < max_neighbors
+        rows, rank = rows[keep], rank[keep]
+        distances[rows, rank] = candidate_distances[keep]
+        indices[rows, rank] = cols[keep]
+        counts += np.bincount(rows, minlength=counts.size)
+
+    def _tree_radius_pairs(self, query: np.ndarray, radius: float, query_rows: np.ndarray, ball_radius=None):
+        tree = self.tree()
+        radius_squared = radius * radius
+        if ball_radius is None:
+            ball_radius = np.full(query_rows.size, radius * (1.0 + _RADIUS_SEARCH_SLACK))
+        row_parts = []
+        col_parts = []
+        for start in range(0, query_rows.size, _BALL_QUERY_CHUNK):
+            chunk_rows = query_rows[start:start + _BALL_QUERY_CHUNK]
+            neighborhoods = tree.query_ball_point(
+                query[chunk_rows],
+                ball_radius[start:start + _BALL_QUERY_CHUNK],
+                return_sorted=False,
+            )
+            lengths = np.fromiter(map(len, neighborhoods), dtype=np.int64, count=len(neighborhoods))
+            cols = np.fromiter(chain.from_iterable(neighborhoods), dtype=np.int64, count=int(lengths.sum()))
+            rows = np.repeat(chunk_rows, lengths)
+            diff = self.xyz[cols] - query[rows]
+            inside = np.einsum("ij,ij->i", diff, diff) <= radius_squared
+            row_parts.append(rows[inside])
+            col_parts.append(cols[inside])
+        if not row_parts:
+            return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+        rows = np.concatenate(row_parts)
+        cols = np.concatenate(col_parts)
+        order = np.lexsort((cols, rows))
+        return rows[order], self._original(cols[order])
+
+    def _grid_radius_neighbors(self, query: np.ndarray, radius: float) -> list[np.ndarray]:
+        empty = np.empty((0,), dtype=np.int64)
+        if self.finite_count == 0:
+            return [empty for _ in range(query.shape[0])]
+        query_finite = np.isfinite(query).all(axis=1)
+
+        if radius == 0.0:
+            return [
+                self._original(np.flatnonzero(np.all(self.xyz == item, axis=1)).astype(np.int64, copy=False))
+                if finite else empty
+                for item, finite in zip(query, query_finite)
+            ]
+
+        cell_size = float(radius)
+        radius_squared = cell_size * cell_size
+        buckets = self._grid_buckets(cell_size)
+        offsets = tuple(product((-1, 0, 1), repeat=3))
+        neighborhoods = []
+        for item, finite in zip(query, query_finite):
+            if not finite:
+                neighborhoods.append(empty)
+                continue
+            cell = np.floor(item / cell_size).astype(np.int64)
+            candidate_parts = []
+            for offset in offsets:
+                key = (int(cell[0] + offset[0]), int(cell[1] + offset[1]), int(cell[2] + offset[2]))
+                bucket = buckets.get(key)
+                if bucket is not None:
+                    candidate_parts.append(bucket)
+            if not candidate_parts:
+                neighborhoods.append(empty)
+                continue
+
+            # Each point lives in exactly one cell, so the parts are disjoint.
+            candidates = np.sort(np.concatenate(candidate_parts))
+            diff = self.xyz[candidates] - item
+            distances = np.einsum("ij,ij->i", diff, diff)
+            neighborhoods.append(self._original(candidates[distances <= radius_squared]))
+        return neighborhoods
+
+    def _grid_buckets(self, cell_size: float) -> dict[tuple[int, int, int], np.ndarray]:
+        buckets = self._buckets.get(cell_size)
+        if buckets is None:
+            cells = np.floor(self.xyz / cell_size).astype(np.int64)
+            unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+            inverse = inverse.reshape(-1)
+            order = np.argsort(inverse, kind="stable")
+            splits = np.split(order.astype(np.int64, copy=False), np.cumsum(np.bincount(inverse))[:-1])
+            buckets = {tuple(int(value) for value in cell): members for cell, members in zip(unique_cells, splits)}
+            self._buckets[cell_size] = buckets
+        return buckets
+
+
+def _knn_bruteforce(points_xyz: np.ndarray, query_xyz: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Exact k-NN by brute force over query blocks (bounded memory)."""
+
+    n_points = points_xyz.shape[0]
+    n_query = query_xyz.shape[0]
+    distances = np.empty((n_query, k), dtype=np.float64)
+    indices = np.empty((n_query, k), dtype=np.int64)
+    chunk = int(max(1, min(_KNN_MAX_QUERY_CHUNK, _KNN_CHUNK_ELEMENTS // max(n_points, 1))))
+    px = points_xyz[:, 0][None, :]
+    py = points_xyz[:, 1][None, :]
+    pz = points_xyz[:, 2][None, :]
+    for start in range(0, n_query, chunk):
+        block = query_xyz[start:start + chunk]
+        squared = px - block[:, 0:1]
+        np.multiply(squared, squared, out=squared)
+        axis_diff = py - block[:, 1:2]
+        np.multiply(axis_diff, axis_diff, out=axis_diff)
+        squared += axis_diff
+        np.subtract(pz, block[:, 2:3], out=axis_diff)
+        np.multiply(axis_diff, axis_diff, out=axis_diff)
+        squared += axis_diff
+        if k == 1:
+            nearest = np.argmin(squared, axis=1)[:, None]
+        elif k < n_points:
+            nearest = np.argpartition(squared, kth=k - 1, axis=1)[:, :k]
+        else:
+            nearest = np.broadcast_to(np.arange(n_points), squared.shape).copy()
+        selected = np.take_along_axis(squared, nearest, axis=1)
+        order = np.argsort(selected, axis=1)
+        stop = start + block.shape[0]
+        indices[start:stop] = np.take_along_axis(nearest, order, axis=1)
+        distances[start:stop] = np.sqrt(np.take_along_axis(selected, order, axis=1))
+    return distances, indices
 
 
 def calibrate_point_cloud_metric_scale(
@@ -576,6 +845,16 @@ def verify_loop_closures(
     and `orientation`, or an array shaped `(N, 7+)` containing XYZ + XYZW poses.
     The returned transform maps each source/current point cloud into the target
     loop-closure point cloud frame.
+
+    Registration always uses a gating distance so that `fitness` (the fraction
+    of source points within it of the target after alignment) can reject
+    unrelated scans. When `max_correspondence_distance` is None it defaults to
+    `2 * voxel_size` if `voxel_size` is given, otherwise to 3x the median
+    nearest-neighbor spacing of the target cloud. For `method="multi_scale"`
+    levels with a positive voxel size gate at twice that size (see
+    `multi_scale_icp`) and voxel-size-0 levels use the same default. Pass an
+    explicit distance that covers the expected odometry drift for reliable
+    results.
     """
 
     clouds = _point_cloud_sequence(point_clouds)
@@ -597,6 +876,7 @@ def verify_loop_closures(
         candidate_iter = _iter_candidate_records(candidates)
 
     records = []
+    default_gates: dict[int, float] = {}
     for candidate in candidate_iter:
         source_index = int(candidate["source_index"])
         target_index = int(candidate["target_index"])
@@ -606,11 +886,24 @@ def verify_loop_closures(
         source = _loop_closure_cloud(clouds[source_index], voxel_size)
         target = _loop_closure_cloud(clouds[target_index], voxel_size)
         seed = np.linalg.inv(pose_matrices[target_index]) @ pose_matrices[source_index]
+
+        def default_gate() -> float:
+            if target_index not in default_gates:
+                default_gates[target_index] = _default_loop_closure_gate(target, voxel_size)
+            return default_gates[target_index]
+
         registration_kwargs = dict(icp_kwargs)
         if method == "multi_scale":
-            registration_kwargs.setdefault("max_correspondence_distances", max_correspondence_distance)
+            distances = max_correspondence_distance
+            if distances is None and "max_correspondence_distances" not in registration_kwargs:
+                sizes = tuple(float(size) for size in registration_kwargs.get("voxel_sizes", (1.0, 0.5, 0.25)))
+                sizes = sizes or (0.0,)
+                if any(size == 0.0 for size in sizes):
+                    distances = tuple(2.0 * size if size > 0.0 else default_gate() for size in sizes)
+            registration_kwargs.setdefault("max_correspondence_distances", distances)
         else:
-            registration_kwargs.setdefault("max_correspondence_distance", max_correspondence_distance)
+            gate = max_correspondence_distance
+            registration_kwargs["max_correspondence_distance"] = default_gate() if gate is None else gate
         result = odometry_seeded_icp(
             source,
             target,
@@ -659,7 +952,8 @@ def connected_components(
 
     neighborhoods = _radius_neighbors(arr, arr[:, :3], radius)
     raw_components: list[list[int]] = []
-    visited = np.zeros(arr.shape[0], dtype=bool)
+    # Rows with non-finite XYZ belong to no component (label -1).
+    visited = ~np.isfinite(np.asarray(arr[:, :3], dtype=np.float64)).all(axis=1)
     for point_index in range(arr.shape[0]):
         if visited[point_index]:
             continue
@@ -691,7 +985,12 @@ def connected_components(
 
 
 def local_covariances(points: np.ndarray, k: int = 8, return_indices: bool = False):
-    """Estimate per-point local XYZ covariance matrices from KNN neighborhoods."""
+    """Estimate per-point local XYZ covariance matrices from KNN neighborhoods.
+
+    Neighborhoods are drawn from finite points only. Rows with non-finite XYZ
+    get NaN covariances (and `-1` neighbor indices), keeping outputs aligned
+    with the input rows.
+    """
 
     arr = _as_points(points).astype(np.float64, copy=False)
     k = int(k)
@@ -702,20 +1001,59 @@ def local_covariances(points: np.ndarray, k: int = 8, return_indices: bool = Fal
         indices = np.empty((0, 0), dtype=np.int64)
         return (covariances, indices) if return_indices else covariances
 
-    neighbor_count = min(k, arr.shape[0])
-    _, indices = knn_search(arr, arr[:, :3], k=neighbor_count)
-    covariances = np.empty((arr.shape[0], 3, 3), dtype=np.float64)
-    for point_index, neighbors in enumerate(indices):
-        local = arr[neighbors, :3]
-        centered = local - local.mean(axis=0)
-        covariances[point_index] = centered.T @ centered / max(local.shape[0] - 1, 1)
+    xyz = arr[:, :3]
+    finite_rows = np.flatnonzero(np.isfinite(xyz).all(axis=1))
+    neighbor_count = min(k, finite_rows.size)
+    covariances = np.full((arr.shape[0], 3, 3), np.nan, dtype=np.float64)
+    indices = np.full((arr.shape[0], neighbor_count), -1, dtype=np.int64)
+    if finite_rows.size:
+        _, neighbors = _PointIndex(xyz).knn(np.ascontiguousarray(xyz[finite_rows]), neighbor_count)
+        indices[finite_rows] = neighbors
+        covariances[finite_rows] = _neighborhood_covariances(xyz, neighbors)
     return (covariances, indices) if return_indices else covariances
 
 
+def _neighborhood_covariances(xyz: np.ndarray, neighbors: np.ndarray) -> np.ndarray:
+    covariances = np.empty((neighbors.shape[0], 3, 3), dtype=np.float64)
+    denominator = max(neighbors.shape[1] - 1, 1)
+    for start in range(0, neighbors.shape[0], _NEIGHBORHOOD_CHUNK):
+        local = xyz[neighbors[start:start + _NEIGHBORHOOD_CHUNK]]
+        centered = local - local.mean(axis=1, keepdims=True)
+        covariances[start:start + _NEIGHBORHOOD_CHUNK] = (
+            np.matmul(centered.transpose(0, 2, 1), centered) / denominator
+        )
+    return covariances
+
+
 def curvature_descriptors(points: np.ndarray, k: int = 8) -> dict[str, np.ndarray]:
-    """Compute eigenvalue-based local shape descriptors for each point."""
+    """Compute eigenvalue-based local shape descriptors for each point.
+
+    Rows with non-finite XYZ get NaN descriptors.
+    """
 
     covariances = local_covariances(points, k=k)
+    names = (
+        "linearity",
+        "planarity",
+        "scattering",
+        "anisotropy",
+        "omnivariance",
+        "eigenentropy",
+        "curvature",
+        "surface_variation",
+    )
+    valid = np.isfinite(covariances).all(axis=(1, 2))
+    if not valid.all():
+        result = {"eigenvalues": np.full((covariances.shape[0], 3), np.nan, dtype=np.float64)}
+        result.update({name: np.full((covariances.shape[0],), np.nan, dtype=np.float64) for name in names})
+        if valid.any():
+            for name, values in _curvature_from_covariances(covariances[valid]).items():
+                result[name][valid] = values
+        return result
+    return _curvature_from_covariances(covariances)
+
+
+def _curvature_from_covariances(covariances: np.ndarray) -> dict[str, np.ndarray]:
     eigenvalues = np.linalg.eigvalsh(covariances)
     eigenvalues = np.clip(eigenvalues[:, ::-1], 0.0, None)
     if eigenvalues.size == 0:
@@ -756,7 +1094,10 @@ def curvature_descriptors(points: np.ndarray, k: int = 8) -> dict[str, np.ndarra
 
 
 def nearest_neighbor_distances(points: np.ndarray, k: int = 1) -> np.ndarray:
-    """Return distances to each point's nearest neighbors, excluding the point itself."""
+    """Return distances to each point's nearest neighbors, excluding the point itself.
+
+    Only finite points are considered; rows with non-finite XYZ are NaN.
+    """
 
     arr = _as_points(points)
     k = int(k)
@@ -765,16 +1106,28 @@ def nearest_neighbor_distances(points: np.ndarray, k: int = 1) -> np.ndarray:
     if arr.shape[0] <= 1:
         return np.empty((arr.shape[0], 0), dtype=np.float64)
 
-    neighbor_count = min(k + 1, arr.shape[0])
-    distances, _ = knn_search(arr, arr[:, :3], k=neighbor_count)
-    return distances[:, 1:]
+    xyz = np.asarray(arr[:, :3], dtype=np.float64)
+    finite_rows = np.flatnonzero(np.isfinite(xyz).all(axis=1))
+    neighbor_count = min(k + 1, finite_rows.size)
+    if finite_rows.size == arr.shape[0]:
+        distances, _ = knn_search(xyz, xyz, k=neighbor_count)
+        return distances[:, 1:]
+    distances = np.full((arr.shape[0], max(neighbor_count - 1, 0)), np.nan, dtype=np.float64)
+    if neighbor_count > 1:
+        found, _ = _PointIndex(xyz).knn(np.ascontiguousarray(xyz[finite_rows]), neighbor_count)
+        distances[finite_rows] = found[:, 1:]
+    return distances
 
 
 def nearest_neighbor_distance_stats(points: np.ndarray, k: int = 1) -> dict[str, np.ndarray | float]:
-    """Compute per-point and global nearest-neighbor distance statistics."""
+    """Compute per-point and global nearest-neighbor distance statistics.
+
+    Global statistics ignore rows with non-finite XYZ.
+    """
 
     distances = nearest_neighbor_distances(points, k=k)
-    if distances.shape[1] == 0:
+    finite_distances = distances[np.isfinite(distances).all(axis=1)]
+    if distances.shape[1] == 0 or finite_distances.shape[0] == 0:
         per_point = np.full((distances.shape[0],), np.nan, dtype=np.float64)
         return {
             "distances": distances,
@@ -794,44 +1147,66 @@ def nearest_neighbor_distance_stats(points: np.ndarray, k: int = 1) -> dict[str,
         "per_point_std": distances.std(axis=1),
         "per_point_min": distances.min(axis=1),
         "per_point_max": distances.max(axis=1),
-        "global_mean": float(distances.mean()),
-        "global_std": float(distances.std()),
-        "global_min": float(distances.min()),
-        "global_max": float(distances.max()),
+        "global_mean": float(finite_distances.mean()),
+        "global_std": float(finite_distances.std()),
+        "global_min": float(finite_distances.min()),
+        "global_max": float(finite_distances.max()),
     }
 
 
 def estimate_normals(points: np.ndarray, k: int = 8, orient_toward: np.ndarray | None = None) -> np.ndarray:
+    """Estimate unit normals from the smallest-eigenvalue direction of local covariances.
+
+    With `orient_toward`, normals are flipped to face that point. Rows with
+    non-finite XYZ get NaN normals and are not used as neighbors.
+    """
+
     arr = _as_points(points).astype(np.float64, copy=False)
     if arr.shape[0] < 3:
         raise ValueError("at least three points are required to estimate normals")
-    k = max(3, min(k, arr.shape[0]))
+    finite = np.isfinite(arr[:, :3]).all(axis=1)
+    finite_count = int(finite.sum())
+    if finite_count < 3:
+        raise ValueError("at least three finite points are required to estimate normals")
+    k = max(3, min(k, finite_count))
     covariances = local_covariances(arr, k=k)
 
-    normals = np.zeros((arr.shape[0], 3), dtype=np.float64)
-    for i, covariance in enumerate(covariances):
-        _, vectors = np.linalg.eigh(covariance)
-        normal = vectors[:, 0]
-        if orient_toward is not None and np.dot(normal, np.asarray(orient_toward) - arr[i, :3]) < 0:
-            normal = -normal
-        normals[i] = normal / max(np.linalg.norm(normal), np.finfo(float).eps)
+    normals = np.full((arr.shape[0], 3), np.nan, dtype=np.float64)
+    rows = np.flatnonzero(finite)
+    _, vectors = np.linalg.eigh(covariances[rows])
+    normal = vectors[:, :, 0]
+    if orient_toward is not None:
+        toward = np.asarray(orient_toward) - arr[rows, :3]
+        flip = np.einsum("ij,ij->i", normal, toward) < 0
+        normal[flip] = -normal[flip]
+    norms = np.linalg.norm(normal, axis=1)
+    normals[rows] = normal / np.maximum(norms, np.finfo(float).eps)[:, None]
     return normals
 
 
 def statistical_outlier_filter(points: np.ndarray, k: int = 8, std_ratio: float = 2.0, return_mask: bool = False):
+    """Remove points whose mean neighbor distance is unusually large.
+
+    Rows with non-finite XYZ are always removed (mask `False`) and do not
+    take part in the neighbor statistics.
+    """
+
     arr = _as_points(points)
     if arr.shape[0] == 0:
         mask = np.array([], dtype=bool)
         return (arr.copy(), mask) if return_mask else arr.copy()
-    if arr.shape[0] == 1:
+    xyz = np.asarray(arr[:, :3], dtype=np.float64)
+    finite_rows = np.flatnonzero(np.isfinite(xyz).all(axis=1))
+    mask = np.zeros(arr.shape[0], dtype=bool)
+    if finite_rows.size == 1:
         # A single point has no neighbors to judge it by; keep it.
-        mask = np.ones(1, dtype=bool)
-        return (arr.copy(), mask) if return_mask else arr.copy()
-    neighbor_count = max(2, min(k + 1, arr.shape[0]))
-    distances, _ = knn_search(arr, arr[:, :3], k=neighbor_count)
-    mean_distances = distances[:, 1:].mean(axis=1)
-    threshold = mean_distances.mean() + std_ratio * mean_distances.std()
-    mask = mean_distances <= threshold
+        mask[finite_rows] = True
+    elif finite_rows.size > 1:
+        neighbor_count = max(2, min(k + 1, finite_rows.size))
+        distances, _ = _PointIndex(xyz).knn(np.ascontiguousarray(xyz[finite_rows]), neighbor_count)
+        mean_distances = distances[:, 1:].mean(axis=1)
+        threshold = mean_distances.mean() + std_ratio * mean_distances.std()
+        mask[finite_rows] = mean_distances <= threshold
     filtered = arr[mask].copy()
     return (filtered, mask) if return_mask else filtered
 
@@ -880,14 +1255,37 @@ def cluster_dbscan(points: np.ndarray, eps: float, min_points: int) -> np.ndarra
     return labels
 
 
+# Samples whose edge vectors are this close to parallel (|a x b| relative to
+# |a| |b|, i.e. sin of the angle between them) are treated as collinear.
+_PLANE_DEGENERACY_TOLERANCE = 1.0e-12
+
+
 def _plane_from_points(points: np.ndarray) -> np.ndarray | None:
     p0, p1, p2 = points
-    normal = np.cross(p1 - p0, p2 - p0)
+    first = p1 - p0
+    second = p2 - p0
+    normal = np.cross(first, second)
     norm = np.linalg.norm(normal)
-    if norm <= np.finfo(float).eps:
+    scale = np.linalg.norm(first) * np.linalg.norm(second)
+    if not np.isfinite(norm) or norm <= _PLANE_DEGENERACY_TOLERANCE * scale:
         return None
     normal = normal / norm
     return np.r_[normal, -np.dot(normal, p0)]
+
+
+def _refine_plane(xyz: np.ndarray, inliers: np.ndarray, plane: np.ndarray) -> np.ndarray | None:
+    """Least-squares plane through `inliers`, oriented like `plane`."""
+
+    inlier_xyz = xyz[inliers]
+    if inlier_xyz.shape[0] < 3:
+        return None
+    centroid = inlier_xyz.mean(axis=0)
+    centered = inlier_xyz - centroid
+    _, vectors = np.linalg.eigh(centered.T @ centered)
+    normal = vectors[:, 0]
+    if np.dot(normal, plane[:3]) < 0:
+        normal = -normal
+    return np.r_[normal, -np.dot(normal, centroid)]
 
 
 def _segment_plane_ransac(
@@ -897,12 +1295,18 @@ def _segment_plane_ransac(
     seed: int,
     normal: np.ndarray | None = None,
     max_angle_degrees: float | None = None,
+    refine: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     if distance_threshold < 0:
         raise ValueError("distance_threshold must be non-negative")
     arr = _as_points(points).astype(np.float64, copy=False)
     if arr.shape[0] < 3:
         raise ValueError("at least three points are required to segment a plane")
+    xyz = arr[:, :3]
+    finite_rows = np.flatnonzero(np.isfinite(xyz).all(axis=1))
+    if finite_rows.size < 3:
+        raise ValueError("at least three finite points are required to segment a plane")
+    sample_xyz = xyz if finite_rows.size == arr.shape[0] else xyz[finite_rows]
 
     normal_filter = None
     if normal is not None:
@@ -920,18 +1324,20 @@ def _segment_plane_ransac(
     else:
         min_alignment = None
 
+    def aligned(candidate: np.ndarray) -> bool:
+        if normal_filter is None or min_alignment is None:
+            return True
+        return abs(float(np.dot(candidate[:3], normal_filter))) >= min_alignment
+
     rng = np.random.default_rng(seed)
     best_plane = None
     best_mask = np.zeros(arr.shape[0], dtype=bool)
     for _ in range(max(iterations, 1)):
-        sample = arr[rng.choice(arr.shape[0], size=3, replace=False), :3]
+        sample = sample_xyz[rng.choice(sample_xyz.shape[0], size=3, replace=False)]
         plane = _plane_from_points(sample)
-        if plane is None:
+        if plane is None or not aligned(plane):
             continue
-        if normal_filter is not None and min_alignment is not None:
-            if abs(float(np.dot(plane[:3], normal_filter))) < min_alignment:
-                continue
-        distances = np.abs(arr[:, :3] @ plane[:3] + plane[3])
+        distances = np.abs(xyz @ plane[:3] + plane[3])
         mask = distances <= distance_threshold
         if mask.sum() > best_mask.sum():
             best_plane = plane
@@ -939,11 +1345,36 @@ def _segment_plane_ransac(
 
     if best_plane is None:
         raise ValueError("could not find a non-degenerate plane")
+    if refine:
+        # Replace the 3-point hypothesis with a least-squares fit to its
+        # inliers; keep it only if it still satisfies the normal constraint
+        # and does not lose inliers. The mask is always the set of points
+        # within `distance_threshold` of the returned plane.
+        refined = _refine_plane(xyz, best_mask, best_plane)
+        if refined is not None and aligned(refined):
+            refined_mask = np.abs(xyz @ refined[:3] + refined[3]) <= distance_threshold
+            if refined_mask.sum() >= best_mask.sum():
+                best_plane = refined
+                best_mask = refined_mask
     return best_plane, best_mask
 
 
-def segment_plane(points: np.ndarray, distance_threshold: float, iterations: int = 100, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    return _segment_plane_ransac(points, distance_threshold, iterations, seed)
+def segment_plane(
+    points: np.ndarray,
+    distance_threshold: float,
+    iterations: int = 100,
+    seed: int = 0,
+    refine: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a plane `[a, b, c, d]` (unit normal) with RANSAC.
+
+    Returns the plane and the mask of points within `distance_threshold` of
+    it. Rows with non-finite XYZ are never sampled or counted as inliers.
+    With `refine=True` the best hypothesis is re-fitted by least squares to
+    its inliers (kept only if it does not lose inliers).
+    """
+
+    return _segment_plane_ransac(points, distance_threshold, iterations, seed, refine=refine)
 
 
 def segment_ground(
@@ -954,8 +1385,12 @@ def segment_ground(
     iterations: int = 100,
     seed: int = 0,
     return_plane: bool = False,
+    refine: bool = True,
 ):
-    """Split points into ground and non-ground sets using an up-aligned RANSAC plane."""
+    """Split points into ground and non-ground sets using an up-aligned RANSAC plane.
+
+    See `segment_plane` for `refine`.
+    """
 
     arr = _as_points(points)
     plane, ground_mask = _segment_plane_ransac(
@@ -965,6 +1400,7 @@ def segment_ground(
         seed=seed,
         normal=np.asarray(up_axis, dtype=np.float64),
         max_angle_degrees=max_slope_degrees,
+        refine=refine,
     )
     up = np.asarray(up_axis, dtype=np.float64)
     up = up / np.linalg.norm(up)
@@ -989,22 +1425,30 @@ def point_to_point_icp(
     min_correspondences: int = 3,
     return_correspondences: bool = False,
 ) -> dict:
-    """Register `source` to `target` with point-to-point ICP."""
+    """Register `source` to `target` with point-to-point ICP.
+
+    `fitness` is the fraction of finite source points with a correspondence
+    and `inlier_rmse` the RMS point-to-point distance of those
+    correspondences. Without `max_correspondence_distance` every finite
+    source point is matched to its nearest target point, so `fitness` is 1.0
+    by construction; pass a gating distance whenever fitness must separate
+    good from bad alignments. Rows with non-finite XYZ are ignored.
+    """
 
     source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
+    target_index = _PointIndex(target_arr)
+    source_count = _finite_row_count(source_arr)
     previous_rmse = np.inf
     previous_fitness = 0.0
     converged = False
     correspondences = _empty_correspondences()
     iteration = 0
+    max_iterations = max(int(max_iterations), 0)
+    transformed = _transform_points_xyz(source_arr[:, :3], transform)
+    if max_iterations:
+        correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
 
-    for iteration in range(1, max(int(max_iterations), 0) + 1):
-        transformed = _transform_points_xyz(source_arr[:, :3], transform)
-        correspondences = _nearest_correspondences(
-            transformed,
-            target_arr,
-            max_correspondence_distance=max_correspondence_distance,
-        )
+    for iteration in range(1, max_iterations + 1):
         if correspondences["source_indices"].size < min_correspondences:
             break
 
@@ -1013,24 +1457,21 @@ def point_to_point_icp(
         delta = _best_fit_transform(source_matches, target_matches)
         transform = delta @ transform
 
-        metrics = _registration_metrics(
-            source_arr,
-            target_arr,
-            transform,
-            max_correspondence_distance=max_correspondence_distance,
-        )
+        # These correspondences also seed the next iteration, so each
+        # iteration performs a single nearest-neighbor search.
+        transformed = _transform_points_xyz(source_arr[:, :3], transform)
+        correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
+        metrics = _metrics_from_correspondences(transformed, target_arr, correspondences, source_count)
         rmse = metrics["inlier_rmse"]
         fitness = metrics["fitness"]
         if (
             abs(previous_rmse - rmse) <= relative_rmse_tolerance
             and abs(previous_fitness - fitness) <= relative_fitness_tolerance
         ):
-            correspondences = metrics["correspondences"]
             converged = True
             break
         previous_rmse = rmse
         previous_fitness = fitness
-        correspondences = metrics["correspondences"]
 
     return _registration_result(
         transform,
@@ -1056,22 +1497,29 @@ def point_to_plane_icp(
     normal_k: int = 8,
     return_correspondences: bool = False,
 ) -> dict:
-    """Register `source` to `target` with linearized point-to-plane ICP."""
+    """Register `source` to `target` with linearized point-to-plane ICP.
+
+    Convergence is judged on the point-to-plane residual, but the reported
+    `inlier_rmse` is the point-to-point distance of the correspondences, as
+    for the other registration methods (see `point_to_point_icp` for
+    `fitness` and gating). Each step linearizes the rotation about the
+    matched source centroid, so clouds far from the origin (e.g. UTM
+    coordinates) converge like clouds near it.
+    """
 
     source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
     normals = _registration_normals(target_arr, target_normals, normal_k)
+    target_index = _PointIndex(target_arr)
     previous_rmse = np.inf
     converged = False
     correspondences = _empty_correspondences()
     iteration = 0
+    max_iterations = max(int(max_iterations), 0)
+    transformed = _transform_points_xyz(source_arr[:, :3], transform)
+    if max_iterations:
+        correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
 
-    for iteration in range(1, max(int(max_iterations), 0) + 1):
-        transformed = _transform_points_xyz(source_arr[:, :3], transform)
-        correspondences = _nearest_correspondences(
-            transformed,
-            target_arr,
-            max_correspondence_distance=max_correspondence_distance,
-        )
+    for iteration in range(1, max_iterations + 1):
         if correspondences["source_indices"].size < min_correspondences:
             break
 
@@ -1081,20 +1529,13 @@ def point_to_plane_icp(
         delta = _point_to_plane_delta(source_matches, target_matches, normal_matches)
         transform = delta @ transform
 
-        metrics = _registration_metrics(
-            source_arr,
-            target_arr,
-            transform,
-            target_normals=normals,
-            max_correspondence_distance=max_correspondence_distance,
-        )
-        rmse = metrics["inlier_rmse"]
+        transformed = _transform_points_xyz(source_arr[:, :3], transform)
+        correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
+        rmse = _point_to_plane_rmse(transformed, target_arr, normals, correspondences)
         if abs(previous_rmse - rmse) <= relative_rmse_tolerance:
-            correspondences = metrics["correspondences"]
             converged = True
             break
         previous_rmse = rmse
-        correspondences = metrics["correspondences"]
 
     return _registration_result(
         transform,
@@ -1104,7 +1545,6 @@ def point_to_plane_icp(
         iteration,
         converged,
         "point_to_plane",
-        target_normals=normals,
         return_correspondences=return_correspondences,
     )
 
@@ -1119,7 +1559,14 @@ def multi_scale_icp(
     max_correspondence_distances: float | tuple[float, ...] | list[float] | None = None,
     **kwargs,
 ) -> dict:
-    """Run ICP from coarse to fine voxel scales."""
+    """Run ICP from coarse to fine voxel scales.
+
+    Each level without an explicit correspondence distance gates at twice its
+    voxel size (a level with voxel size 0 and no distance is ungated). The
+    final `fitness` / `inlier_rmse` are evaluated on the full-resolution
+    clouds with the finest level's gating distance, and `iterations` is the
+    total number of iterations actually run across levels.
+    """
 
     source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
     scales = tuple(float(size) for size in voxel_sizes)
@@ -1131,6 +1578,8 @@ def multi_scale_icp(
     iterations = _scale_parameter(max_iterations, len(scales), "max_iterations")
     distances = _scale_parameter(max_correspondence_distances, len(scales), "max_correspondence_distances")
     levels = []
+    total_iterations = 0
+    max_distance = None
     for level, voxel_size in enumerate(scales):
         level_source = source_arr if voxel_size == 0.0 else voxel_downsample(source_arr, voxel_size)
         level_target = target_arr if voxel_size == 0.0 else voxel_downsample(target_arr, voxel_size)
@@ -1164,18 +1613,23 @@ def multi_scale_icp(
             raise ValueError("method must be 'point_to_point' or 'point_to_plane'")
 
         transform = result["transform"]
+        total_iterations += int(result["iterations"])
         levels.append({
             "voxel_size": voxel_size,
             "result": result,
         })
 
-    final_metrics = _registration_metrics(source_arr, target_arr, transform)
+    final_correspondences = _nearest_correspondences(
+        _transform_points_xyz(source_arr[:, :3], transform),
+        _PointIndex(target_arr),
+        max_distance,
+    )
     final = _registration_result(
         transform,
         source_arr,
         target_arr,
-        final_metrics["correspondences"],
-        int(sum(int(value) for value in iterations)),
+        final_correspondences,
+        total_iterations,
         bool(levels and levels[-1]["result"]["converged"]),
         f"multi_scale_{method}",
     )
@@ -1279,8 +1733,14 @@ def _registration_inputs(source: np.ndarray, target: np.ndarray, initial_transfo
     target_arr = _as_points(target)
     if source_arr.shape[0] == 0 or target_arr.shape[0] == 0:
         raise ValueError("source and target must contain at least one point")
+    if _finite_row_count(source_arr) == 0 or _finite_row_count(target_arr) == 0:
+        raise ValueError("source and target must contain at least one finite point")
     transform = np.eye(4, dtype=np.float64) if initial_transform is None else _as_transform_matrix(initial_transform)
     return source_arr, target_arr, transform.copy()
+
+
+def _finite_row_count(points: np.ndarray) -> int:
+    return int(np.isfinite(np.asarray(points[:, :3], dtype=np.float64)).all(axis=1).sum())
 
 
 def _transform_points_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -1291,16 +1751,22 @@ def _transform_points_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarr
 
 def _nearest_correspondences(
     transformed_source_xyz: np.ndarray,
-    target: np.ndarray,
+    target,
     max_correspondence_distance: float | None,
 ) -> dict[str, np.ndarray]:
+    """Match each finite source point to its nearest finite target point.
+
+    `target` is a point array or a prebuilt `_PointIndex`. With a gating
+    distance, matches farther than it are dropped.
+    """
+
+    index = target if isinstance(target, _PointIndex) else _PointIndex(target)
+    query = np.ascontiguousarray(transformed_source_xyz[:, :3], dtype=np.float64)
     if max_correspondence_distance is not None:
-        distances, target_indices, counts = hybrid_search(
-            target,
-            transformed_source_xyz,
-            radius=float(max_correspondence_distance),
-            max_neighbors=1,
-        )
+        radius = float(max_correspondence_distance)
+        if radius < 0:
+            raise ValueError("max_correspondence_distance must be non-negative")
+        distances, target_indices, counts = index.hybrid(query, radius, 1)
         mask = counts > 0
         source_indices = np.flatnonzero(mask).astype(np.int64, copy=False)
         return {
@@ -1309,9 +1775,13 @@ def _nearest_correspondences(
             "distances": distances[mask, 0],
         }
 
-    distances, target_indices = knn_search(target, transformed_source_xyz, k=1)
+    finite = np.isfinite(query).all(axis=1)
+    source_indices = np.flatnonzero(finite).astype(np.int64, copy=False)
+    if source_indices.size == 0 or index.finite_count == 0:
+        return _empty_correspondences()
+    distances, target_indices = index.knn(query if finite.all() else query[source_indices], 1)
     return {
-        "source_indices": np.arange(transformed_source_xyz.shape[0], dtype=np.int64),
+        "source_indices": source_indices,
         "target_indices": target_indices[:, 0],
         "distances": distances[:, 0],
     }
@@ -1350,11 +1820,18 @@ def _registration_normals(target: np.ndarray, target_normals: np.ndarray | None,
 
 
 def _point_to_plane_delta(source_xyz: np.ndarray, target_xyz: np.ndarray, normals: np.ndarray) -> np.ndarray:
-    cross_terms = np.cross(source_xyz, normals)
+    # Linearize the rotation about the source centroid instead of the world
+    # origin; otherwise the small-angle error scales with the clouds' distance
+    # from the origin and ICP diverges for georeferenced (e.g. UTM) data.
+    centroid = source_xyz.mean(axis=0)
+    source_centered = source_xyz - centroid
+    cross_terms = np.cross(source_centered, normals)
     a = np.column_stack((cross_terms, normals))
     b = -np.einsum("ij,ij->i", normals, source_xyz - target_xyz)
     twist, *_ = np.linalg.lstsq(a, b, rcond=None)
-    return _se3_from_twist(twist)
+    delta = _se3_from_twist(twist)
+    delta[:3, 3] += centroid - delta[:3, :3] @ centroid
+    return delta
 
 
 def _se3_from_twist(twist: np.ndarray) -> np.ndarray:
@@ -1378,29 +1855,29 @@ def _se3_from_twist(twist: np.ndarray) -> np.ndarray:
     return transform
 
 
-def _registration_metrics(
-    source: np.ndarray,
+def _point_to_plane_rmse(
+    transformed_source_xyz: np.ndarray,
     target: np.ndarray,
-    transform: np.ndarray,
-    target_normals: np.ndarray | None = None,
-    max_correspondence_distance: float | None = None,
-) -> dict:
-    transformed = _transform_points_xyz(source[:, :3], transform)
-    correspondences = _nearest_correspondences(
-        transformed,
-        target,
-        max_correspondence_distance=max_correspondence_distance,
-    )
-    return _metrics_from_correspondences(source, target, transform, correspondences, target_normals)
+    target_normals: np.ndarray,
+    correspondences: dict[str, np.ndarray],
+) -> float:
+    if correspondences["source_indices"].size == 0:
+        return np.inf
+    source_matches = transformed_source_xyz[correspondences["source_indices"]]
+    target_matches = target[correspondences["target_indices"], :3]
+    normals = target_normals[correspondences["target_indices"]]
+    residuals = np.abs(np.einsum("ij,ij->i", normals, source_matches - target_matches))
+    return float(np.sqrt(np.mean(residuals ** 2)))
 
 
 def _metrics_from_correspondences(
-    source: np.ndarray,
+    transformed_source_xyz: np.ndarray,
     target: np.ndarray,
-    transform: np.ndarray,
     correspondences: dict[str, np.ndarray],
-    target_normals: np.ndarray | None = None,
+    source_count: int,
 ) -> dict:
+    """Fitness (inliers / finite source points) and point-to-point inlier RMSE."""
+
     if correspondences["source_indices"].size == 0:
         return {
             "fitness": 0.0,
@@ -1408,17 +1885,11 @@ def _metrics_from_correspondences(
             "correspondences": correspondences,
         }
 
-    transformed = _transform_points_xyz(source[:, :3], transform)
-    source_matches = transformed[correspondences["source_indices"]]
+    source_matches = transformed_source_xyz[correspondences["source_indices"]]
     target_matches = target[correspondences["target_indices"], :3]
-    if target_normals is None:
-        residuals = np.linalg.norm(source_matches - target_matches, axis=1)
-    else:
-        normals = target_normals[correspondences["target_indices"]]
-        residuals = np.abs(np.einsum("ij,ij->i", normals, source_matches - target_matches))
-
+    residuals = np.linalg.norm(source_matches - target_matches, axis=1)
     return {
-        "fitness": float(correspondences["source_indices"].size / source.shape[0]),
+        "fitness": float(correspondences["source_indices"].size / max(source_count, 1)),
         "inlier_rmse": float(np.sqrt(np.mean(residuals ** 2))),
         "correspondences": correspondences,
     }
@@ -1432,10 +1903,14 @@ def _registration_result(
     iterations: int,
     converged: bool,
     method: str,
-    target_normals: np.ndarray | None = None,
     return_correspondences: bool = False,
 ) -> dict:
-    metrics = _metrics_from_correspondences(source, target, transform, correspondences, target_normals)
+    metrics = _metrics_from_correspondences(
+        _transform_points_xyz(source[:, :3], transform),
+        target,
+        correspondences,
+        _finite_row_count(source),
+    )
     result = {
         "transform": transform,
         "fitness": metrics["fitness"],
@@ -1722,6 +2197,28 @@ def _loop_closure_cloud(points, voxel_size: float | None) -> np.ndarray:
     if voxel_size is None:
         return cloud
     return voxel_downsample(cloud, voxel_size)
+
+
+def _default_loop_closure_gate(target: np.ndarray, voxel_size: float | None) -> float:
+    """Gating distance used by `verify_loop_closures` when none is given."""
+
+    if voxel_size is not None and voxel_size > 0:
+        return 2.0 * float(voxel_size)
+    return _LOOP_CLOSURE_SPACING_FACTOR * _median_point_spacing(target)
+
+
+def _median_point_spacing(points: np.ndarray) -> float:
+    """Median nearest-neighbor distance (sampled on up to ~2k query points)."""
+
+    xyz = np.asarray(points[:, :3], dtype=np.float64)
+    xyz = xyz[np.isfinite(xyz).all(axis=1)]
+    if xyz.shape[0] < 2:
+        return 0.0
+    stride = max(1, xyz.shape[0] // _SPACING_SAMPLE_COUNT)
+    distances, _ = _PointIndex(xyz).knn(np.ascontiguousarray(xyz[::stride]), 2)
+    spacing = distances[:, 1]
+    spacing = spacing[np.isfinite(spacing) & (spacing > 0.0)]
+    return float(np.median(spacing)) if spacing.size else 0.0
 
 
 def _iter_candidate_records(candidates):

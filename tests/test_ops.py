@@ -1220,7 +1220,7 @@ def test_coordinate_frame_transforms_for_poses_navsat_odometry_and_dem():
     odom[4] = [1.0, 0.0, 0.0, 0.0]
     odom[5] = [1.0, 4.0, 9.0, 0.0]
     odom[6] = [0.0, 1.0, 0.0, 0.0]
-    transformed_odom = transform_odometry(odom, transform)
+    transformed_odom = transform_odometry(odom, transform, twist_frame="parent")
     assert np.allclose(transformed_odom[0, :3], np.array([1.0, 3.0, 3.0]))
     assert np.allclose(transformed_odom[2, :4], np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)]))
     assert np.allclose(transformed_odom[4, :3], np.array([0.0, 1.0, 0.0]))
@@ -1687,14 +1687,8 @@ def test_navigation_operations():
     llh = enu_to_navsat(enu, 37.0, -122.0, 10.0)
     assert np.allclose(llh, np.array([[37.0001, -122.0001, 12.0]]))
 
-    navsat_samples = np.array([
-        [37.0, -122.0, 10.0],
-        [
-            37.0 + np.rad2deg(20.0 / 6378137.0),
-            -122.0 + np.rad2deg(10.0 / (6378137.0 * np.cos(np.deg2rad(37.0)))),
-            8.0,
-        ],
-    ])
+    # WGS84 fix 10 m east, 20 m north, 2 m down of the reference.
+    navsat_samples = np.array([[37.0, -122.0, 10.0], enu_to_navsat(np.array([10.0, 20.0, -2.0]), 37.0, -122.0, 10.0)])
     local_enu, reference = navsat_to_local(navsat_samples, frame="enu", return_reference=True)
     assert reference == {"lat": 37.0, "lon": -122.0, "alt": 10.0, "frame": "enu"}
     assert np.allclose(local_enu, np.array([[0.0, 0.0, 0.0], [10.0, 20.0, -2.0]]))
@@ -1905,10 +1899,7 @@ def test_sensor_streams_convert_to_common_trajectory_arrays():
     assert np.allclose(odom_traj["linear_velocity"][1], np.array([1.0, 1.0, 0.0]))
     assert np.allclose(odom_traj["trajectory"][1, :7], odom_traj["pose"][1])
 
-    navsat = np.array([
-        [37.0, -122.0, 10.0],
-        [37.0 + np.rad2deg(20.0 / 6378137.0), -122.0, 12.0],
-    ])
+    navsat = np.array([[37.0, -122.0, 10.0], enu_to_navsat(np.array([0.0, 20.0, 2.0]), 37.0, -122.0, 10.0)])
     nav_traj = navsat_to_trajectory(
         {
             "ts": timestamps,
@@ -2026,7 +2017,7 @@ def test_dem_raster_operations(tmp_path):
     elevation = np.array([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
     slope, aspect = slope_aspect(elevation, resolution=1.0)
     assert np.allclose(slope, np.full((3, 3), np.arctan(1.0)))
-    assert np.allclose(aspect, np.full((3, 3), -np.pi / 2.0))
+    assert np.allclose(aspect, np.full((3, 3), 1.5 * np.pi))  # compass bearing: downslope faces west
 
     shaded = hillshade(elevation)
     assert shaded.shape == elevation.shape
@@ -2034,8 +2025,8 @@ def test_dem_raster_operations(tmp_path):
 
     samples = sample_grid(mosaic, np.array([0.5]), np.array([0.5]))
     assert np.allclose(samples, np.array([2.5]))
-    edge_samples = sample_grid(mosaic, np.array([-1.0, 9.0]), np.array([-1.0, 9.0]))
-    assert np.allclose(edge_samples, np.array([1.0, 8.0]))
+    edge_samples = sample_grid(mosaic, np.array([-1.0, 9.0, -0.4]), np.array([-1.0, 9.0, 3.4]))
+    assert np.isnan(edge_samples[:2]).all() and np.isclose(edge_samples[2], 6.0)  # out of range -> NaN
 
     dz_dx, dz_dy = terrain_gradients(elevation, resolution=1.0)
     assert np.allclose(dz_dx, np.ones_like(elevation))
@@ -2079,7 +2070,7 @@ def test_dem_raster_operations(tmp_path):
 
     mesh = dem_to_mesh(np.array([[1.0, 2.0], [3.0, 4.0]]), resolution=2.0, origin=(10.0, 20.0))
     assert mesh["vertices"].shape == (4, 3)
-    assert mesh["faces"].tolist() == [[0, 2, 1], [1, 2, 3]]
+    assert mesh["faces"].tolist() == [[0, 1, 2], [1, 3, 2]]  # CCW from +z, like terrain_normals
 
     empty_mesh = dem_to_mesh(np.array([[1.0, np.nan], [3.0, 4.0]]))
     assert empty_mesh["vertices"].shape == (0, 3)
