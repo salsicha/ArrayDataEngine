@@ -291,10 +291,11 @@ def test_arrow_options_and_many_fragments_preserve_order(tmp_path):
 
 
 def test_backend_options_rejected_for_other_backends(tmp_path):
-    with pytest.raises(ValueError, match="arrow"):
+    # TileDB accepts flush_bytes/consolidate_max_bytes; arrow-only options are rejected.
+    with pytest.raises(ValueError, match="not supported by the 'tiledb' backend"):
         DataBuffer(
             StreamSource(), data_uri=str(tmp_path / "x") + "/", axis="sensor_topic",
-            use_db=True, backend="tiledb", backend_options={"flush_bytes": 1},
+            use_db=True, backend="tiledb", backend_options={"row_group_bytes": 1},
         )
 
 

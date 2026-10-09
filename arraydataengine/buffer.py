@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .source import DataSources
 
+from .buffers.common import holds_arrow_store, is_tiledb_store, normalize_ragged_topics, validate_capacity
 from .buffers.numpy_buffer import NumpyBuffer
 
 _logger = logging.getLogger(__name__)
@@ -21,6 +22,14 @@ class DataBuffer:
     """
 
     BACKENDS = ("memory", "arrow", "tiledb")
+    BACKEND_OPTIONS = {
+        "memory": frozenset(),
+        "arrow": frozenset({
+            "flush_bytes", "row_group_bytes", "compression", "batch_readahead", "fragment_readahead",
+            "use_threads", "row_overhead_bytes",
+        }),
+        "tiledb": frozenset({"flush_bytes", "consolidate_max_bytes", "row_overhead_bytes"}),
+    }
 
     def __init__(
         self,
@@ -33,6 +42,8 @@ class DataBuffer:
         preload=1,
         backend: str | None = None,
         backend_options: dict | None = None,
+        ragged_topics=None,
+        max_points: int | None = None,
     ):
         """Constructor
 
@@ -49,9 +60,24 @@ class DataBuffer:
         TileDB store, which keeps opening as ``"tiledb"`` for compatibility.
 
         `backend_options` is passed through to the backend constructor. The
-        arrow backend accepts `flush_bytes`, `row_group_bytes`,
-        `compression`, `batch_readahead`, `fragment_readahead`, and
-        `use_threads` (see `arraydataengine.buffers.arrow_buffer` for defaults).
+        arrow backend accepts `flush_bytes`, `row_overhead_bytes`,
+        `row_group_bytes`, `compression`, `batch_readahead`,
+        `fragment_readahead`, and `use_threads` (see
+        `arraydataengine.buffers.arrow_buffer` for defaults); the tiledb
+        backend accepts `flush_bytes`, `row_overhead_bytes`, and
+        `consolidate_max_bytes`.
+
+        `topics` limits buffering to those topics (plus `axis`); by default
+        every topic the source lists is buffered.
+
+        Variable-size topics (point clouds): a topic whose first message has
+        a `point_count` key, or that is listed in `ragged_topics` (a mapping
+        `{topic: capacity}` or a list of topics), stores each message's rows
+        zero-padded to the topic's capacity together with its real row count.
+        Reads then include a `lengths` array (structured `get_buffer()` arrays
+        a `length` field). The capacity is `ragged_topics[topic]`, else
+        `max_points`, else the source's `max_points`, else
+        `DEFAULT_MAX_POINTS`; a message with more rows raises ValueError.
         """
         if buffer_depth < 1:
             raise ValueError("buffer_depth must be at least 1")
@@ -59,26 +85,51 @@ class DataBuffer:
         self.buffer_depth = buffer_depth
         self._source_exhausted = False
         self._axis = axis
-        self.topics = [] if topics is None else list(topics)
+        self._requested_topics = None if topics is None else list(dict.fromkeys(topics))
+        self.topics = [] if topics is None else list(self._requested_topics)
         self._init_source = data_source
         self.group_uri = data_uri
         self.preload = preload
+        self.ragged_topics = normalize_ragged_topics(ragged_topics)
+        self.max_points = validate_capacity(max_points, "max_points")
         self.backend = self._resolve_backend(backend, use_db, data_uri)
         self.use_db = self.backend != "memory"
         self._backend_options = dict(backend_options or {})
-        if self._backend_options and self.backend != "arrow":
-            raise ValueError(f"backend_options are only supported by the arrow backend, not {self.backend!r}")
+        unsupported = set(self._backend_options) - self.BACKEND_OPTIONS[self.backend]
+        if unsupported:
+            supported = ", ".join(sorted(self.BACKEND_OPTIONS[self.backend])) or "none"
+            raise ValueError(
+                f"backend_options {sorted(unsupported)} are not supported by the {self.backend!r} backend "
+                f"(supported: {supported})"
+            )
 
         if self.backend == "tiledb":
-            import tiledb
-
-            # An existing directory (e.g. from mkdtemp()) still needs a group.
-            if tiledb.object_type(str(self.group_uri)) != "group":
-                os.makedirs(self.group_uri, exist_ok=True)
-                tiledb.group_create(str(self.group_uri))
+            self._prepare_tiledb_location()
 
         self.set_methods()
         self.reset()
+
+    def _prepare_tiledb_location(self) -> None:
+        """Create the TileDB group for a writer opening a missing or empty directory.
+
+        Read-only opens never write; directories holding an Arrow store are
+        refused; other non-empty directories get their group (if they hold
+        TileDB arrays) when the first topic is created.
+        """
+        import tiledb
+
+        uri = str(self.group_uri)
+        if holds_arrow_store(uri) and not is_tiledb_store(uri):
+            raise ValueError(f"{uri} holds an Arrow store; open it with backend='arrow' (or no backend)")
+        if self._init_source is None or tiledb.object_type(uri) == "group":
+            return
+        try:
+            empty = not os.listdir(uri)
+        except FileNotFoundError:
+            empty = True
+        if empty:
+            os.makedirs(uri, exist_ok=True)
+            tiledb.group_create(uri)
 
     @classmethod
     def _resolve_backend(cls, backend: str | None, use_db: bool, data_uri) -> str:
@@ -92,11 +143,20 @@ class DataBuffer:
 
     @staticmethod
     def _is_tiledb_store(data_uri) -> bool:
-        try:
-            entries = set(os.listdir(data_uri))
-        except OSError:
-            return False
-        return bool(entries & {"__tiledb_group.tdb", "__group", "__meta"})
+        return is_tiledb_store(data_uri)
+
+    def _source_max_points(self) -> int | None:
+        """The configured `max_points` of the source (or the source it wraps)."""
+        source = self._init_source
+        for candidate in (source, getattr(source, "source", None)):
+            value = getattr(candidate, "max_points", None) if candidate is not None else None
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool) and value > 0:
+                return int(value)
+        return None
+
+    def _ragged_options(self) -> dict:
+        max_points = self.max_points if self.max_points is not None else self._source_max_points()
+        return {"ragged_topics": self.ragged_topics, "max_points": max_points}
 
     @property
     def counters(self):
@@ -147,13 +207,32 @@ class DataBuffer:
             return iter(())
 
         if hasattr(data_source, "get_topics") and hasattr(data_source, "get_message"):
-            self.topics = data_source.get_topics()
-            return data_source.get_message()
+            source_topics = list(data_source.get_topics())
+            if self._requested_topics is None:
+                self.topics = source_topics
+            else:
+                self.topics = list(self._requested_topics)
+                if self._axis and self._axis not in self.topics and self._axis in source_topics:
+                    self.topics.append(self._axis)
+            messages = data_source.get_message()
+        elif callable(data_source):
+            if self._requested_topics is not None:
+                self.topics = list(dict.fromkeys([*self._requested_topics, *self.topics]))
+            messages = data_source()
+        else:
+            raise TypeError("data_source must expose get_message() or be a callable generator factory")
 
-        if callable(data_source):
-            return data_source()
+        if self._requested_topics is None:
+            return messages
+        return self._selected_messages(messages)
 
-        raise TypeError("data_source must expose get_message() or be a callable generator factory")
+    def _selected_messages(self, messages):
+        """Only messages of the requested topics (and the current axis)."""
+        wanted = frozenset(self._requested_topics)
+        for msg in messages:
+            topic = msg.get("topic") if isinstance(msg, dict) else None
+            if topic in wanted or topic == self._axis:
+                yield msg
 
     def _get_preload_count(self, preload) -> int:
         """Number of axis messages to roll during `reset()`.
@@ -174,10 +253,13 @@ class DataBuffer:
 
     def reset(self, preload=None) -> None:
         self.close()
+        self._source_exhausted = False
         self.data_source = self._get_data_source()
 
         if self.backend == "memory":
-            self.buffer_impl = NumpyBuffer(self.data_source, self.buffer_depth, self._axis, self.topics)
+            self.buffer_impl = NumpyBuffer(
+                self.data_source, self.buffer_depth, self._axis, self.topics, **self._ragged_options()
+            )
         elif self.backend == "arrow":
             from .buffers.arrow_buffer import ArrowBuffer
 
@@ -187,13 +269,22 @@ class DataBuffer:
                 self.group_uri,
                 self._axis,
                 self.topics,
+                **self._ragged_options(),
                 **self._backend_options,
             )
             self.topics = self.buffer_impl.topics
         else:
             from .buffers.tiledb_buffer import TileDBBuffer
 
-            self.buffer_impl = TileDBBuffer(self.data_source, self._init_source, self.group_uri, self._axis, self.topics)
+            self.buffer_impl = TileDBBuffer(
+                self.data_source,
+                self._init_source,
+                self.group_uri,
+                self._axis,
+                self.topics,
+                **self._ragged_options(),
+                **self._backend_options,
+            )
             self.topics = self.buffer_impl.topics
 
         if not self._axis:
@@ -219,28 +310,45 @@ class DataBuffer:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is not None:
-            self.close(closed=False)
-        else:
+        if exc_type is None:
             self.close_completed()
+            return False
+        # Leaving on an exception persists staged rows but keeps every
+        # topic's closed flag (partial topics stay resumable, complete ones
+        # stay closed), and never replaces the original exception.
+        try:
+            self.close()
+        except Exception as close_error:
+            _logger.warning("Closing the buffer after an error also failed: %r", close_error)
+            if isinstance(exc, BaseException):
+                exc.add_note(f"closing the buffer also failed: {close_error!r}")
         return False
 
     def close_completed(self) -> None:
         """Close the store, marking only topics known to be complete as closed.
 
-        A topic is complete once the source was exhausted, or once it holds
-        the source's `get_count(topic)` messages. Incomplete topics keep their
-        closed flag so a later run with the same source resumes them.
+        A topic is complete once it holds the source's `get_count(topic)`
+        messages, or once the source was exhausted after delivering it in this
+        session. Other topics keep their closed flag so a later run with the
+        same source resumes them.
         """
         buffer_impl = getattr(self, "buffer_impl", None)
         if buffer_impl is None:
             return
-        if self._source_exhausted:
-            self.close(closed=True)
-        elif hasattr(buffer_impl, "close_completed"):
-            buffer_impl.close_completed()
+        if hasattr(buffer_impl, "close_completed"):
+            buffer_impl.close_completed(source_exhausted=self._source_exhausted)
         else:
             self.close()
+
+    def compact(self, **kwargs) -> None:
+        """Merge fragments and vacuum superseded files (TileDB backend).
+
+        Run only while no other process reads the store; see
+        `TileDBBuffer.compact`. Other backends need no compaction.
+        """
+        compact = getattr(getattr(self, "buffer_impl", None), "compact", None)
+        if callable(compact):
+            compact(**kwargs)
 
     def reset_buffer(self):
         self.reset(preload=0)
@@ -260,11 +368,13 @@ class DataBuffer:
         return self.topics
 
     def get_size(self):
-        """Message count for the current axis: the number of buffered
-        messages on the numpy backend, the stored count on the arrow backend,
-        or the topic's expected total count (equal to buffered messages after
-        a full ingest) on the TileDB backend. TileDB topics whose source
-        reports no `get_count()` report their stored count."""
+        """Messages available for the current axis on every backend: rows
+        buffered in the memory ring, or rows stored (persisted and staged) in
+        a persistent store. `buffer[get_size() - 1]` is the newest message."""
+        buffer_impl = getattr(self, "buffer_impl", None)
+        get_size = getattr(buffer_impl, "get_size", None)
+        if callable(get_size):
+            return get_size(self._axis)
         return self.msg_len.get(self._axis, 0)
 
     def load_data_db(self, axis: str) -> None:
@@ -278,8 +388,11 @@ class DataBuffer:
                 _logger.info("Finished loading data source: %s", e)
 
                 if self.use_db:
-                    for topic in self.topics:
-                        self.buffer_impl.close_topic(topic, closed=True)
+                    # Mark complete only topics this source delivered; other
+                    # stored topics (e.g. derived ones) keep their flag.
+                    seen = getattr(self.buffer_impl, "_resume_seen", None)
+                    for topic in list(self.topics):
+                        self.buffer_impl.close_topic(topic, closed=True if seen is None or topic in seen else None)
                 return
 
     def get_data(self, axis):
@@ -368,8 +481,7 @@ class DataBuffer:
         return getattr(self.buffer_impl, "frame_ids", {}).get(axis)
 
     def _topic_data(self, axis: str, copy: bool = True):
-        # Prefer get_topic, which returns only rows holding real messages;
-        # get_buffer includes the zero-filled slots of a partially-full buffer.
+        # Prefer get_topic: one topic's rows holding real messages, oldest first.
         get_topic = getattr(self.buffer_impl, "get_topic", None)
         if callable(get_topic):
             return get_topic(axis, copy=copy)

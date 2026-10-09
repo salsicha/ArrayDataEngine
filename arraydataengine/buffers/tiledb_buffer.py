@@ -5,44 +5,64 @@ Each topic is a pair of dense TileDB arrays in the group at ``group_uri``:
 - ``<topic>`` stores payloads in the ``features`` attribute, one message per
   cell of the first dimension (tile extent 1 keeps random access cheap).
 - ``<topic>__timestamps`` is the row index: timestamp, message name, frame id,
-  and per-message spatial bounds used for query pushdown.
+  per-message spatial bounds used for query pushdown, and (for variable-size
+  topics) each message's real row count in ``length``.
 
 Appends stage rows in memory and write them as one fragment per array when
-the staged payload reaches ``flush_bytes`` or when the topic is closed, so the
-fragment count follows the data size instead of the message count. Reads merge
-persisted cells with staged rows and never force a write; metadata is written
-only when it changes. New arrays compress every attribute with Zstd. Closing a
-handle that wrote consolidates and vacuums the arrays it touched (data arrays
-that received more than ``consolidate_max_bytes`` in this session consolidate
-fragment metadata only, to avoid rewriting large payloads).
+the staged rows reach ``flush_bytes`` (payload plus ``row_overhead_bytes`` of
+bookkeeping per row) or when the topic is closed, so the fragment count
+follows the data size instead of the message count. Reads merge persisted
+cells with staged rows and never force a write; metadata is written only when
+it changes. New arrays compress every attribute with Zstd.
 
-A topic's capacity is the source's ``get_count(topic)`` when available; topics
-without a known count (direct appends, callable sources) get an effectively
-unbounded domain. Payload shape and dtype are fixed per topic.
+Closing a handle that wrote consolidates what is cheap and safe while other
+processes read the store: the index fragments this session wrote, fragment
+metadata, and array metadata. It never vacuums and never rewrites payload
+fragments, so concurrent readers keep working and appending one message to a
+large topic stays cheap. Call ``compact()`` (``DataBuffer.compact()``) when no
+reader has the store open to merge payload fragments (arrays up to
+``consolidate_max_bytes``) and vacuum superseded files.
+
+A topic's capacity is the source's ``get_count(topic)`` when the source lists
+the topic with a positive count; other topics (direct appends, derived topics,
+callable sources) get an effectively unbounded domain. Payload shape and
+dtype are fixed per topic (safe widening casts are applied on append; unicode
+payloads are stored as variable-length strings of any length). Variable-size
+topics are stored zero-padded to their capacity.
 """
 
 from __future__ import annotations
+import array
 import logging
+import math
 import os
 import re
 import shutil
 from contextlib import suppress
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 import numpy as np
 import tiledb
 
 from .common import (
     SPATIAL_INDEX_DIMS,
     apply_index_range,
-    check_message_schema,
     check_persistable_data,
+    conform_message,
     decode_frame_id as _decode_frame_id,
     encode_frame_id as _encode_frame_id,
     encode_name as _encode_name,
+    holds_arrow_store,
+    holds_tiledb_arrays,
     index_ranges_exhausted,
+    message_is_ragged,
     native_message_data,
+    new_ragged_schema,
+    normalize_ragged_topics,
+    pad_rows,
+    ragged_capacity,
     raise_collected,
     resolve_topic_path,
+    source_topic_count,
     spatial_bounds_for_data as _spatial_bounds_for_data,
     spatial_overlap_mask,
 )
@@ -51,6 +71,8 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_FLUSH_BYTES = 32 * 1024 * 1024
 CONSOLIDATE_MAX_BYTES = 256 * 1024 * 1024
+# Python bookkeeping per staged row, counted toward flush_bytes.
+DEFAULT_ROW_OVERHEAD_BYTES = 256
 # TileDB allocates this much per attribute while consolidating fragments; its
 # 50 MB default costs ~1.5 GB of RSS on the many-attribute timestamp index.
 _CONSOLIDATION_BUFFER_BYTES = 4 * 1024 * 1024
@@ -62,11 +84,43 @@ _SCAN_ROWS = 65536
 _TOPIC_DIR = re.compile(r"topic-(.*)\.data(?:\.\d+)?")
 
 
-def _new_stage() -> dict:
+def _new_stage(ragged_schema=None) -> dict:
+    """Rows staged for one topic. `ragged_schema` is the padded ``(shape,
+    dtype)`` of a variable-size topic, whose staged payloads are unpadded."""
     return {
-        "ts": [], "name": [], "frame_id": [], "spatial_valid": [], "spatial_min": [],
-        "spatial_max": [], "data": [], "bytes": 0,
+        "ts": array.array("d"), "name": [], "frame_id": [], "spatial_valid": array.array("B"),
+        "spatial_min": array.array("d"), "spatial_max": array.array("d"), "data": [], "length": [],
+        "bytes": 0, "ragged": ragged_schema,
     }
+
+
+def _local_path(uri: str) -> str | None:
+    parsed = urlparse(str(uri))
+    if parsed.scheme in ("", "file"):
+        return unquote(parsed.path) if parsed.scheme else str(uri)
+    return None
+
+
+def _tree_bytes(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            with suppress(OSError):
+                total += os.path.getsize(os.path.join(root, name))
+    return total
+
+
+def _fragments_bytes(fragment_uris) -> float:
+    """Bytes held by fragments (infinite when they are not local files)."""
+    total = 0
+    for uri in fragment_uris:
+        path = _local_path(uri)
+        if path is None:
+            return math.inf
+        total += _tree_bytes(path)
+    return total
 
 
 def _fallback_topic(entry: str) -> str:
@@ -87,20 +141,45 @@ def _runs(indices: np.ndarray) -> list[tuple[int, int]]:
     return [(int(indices[a]), int(indices[b - 1]) + 1) for a, b in zip(starts, stops)]
 
 
+def _array_values(values: array.array, positions: np.ndarray, dtype, width: int = 1, offset: int = 0) -> np.ndarray:
+    """Elements ``positions * width + offset`` of a staged ``array.array``,
+    copying only the spanned slice."""
+    if positions.size == 0:
+        return np.empty(0, dtype=dtype)
+    low, high = int(positions.min()), int(positions.max()) + 1
+    span = np.array(values[low * width:high * width], dtype=dtype)
+    return span[(positions - low) * width + offset]
+
+
+def _staged_items(values: list, positions) -> list:
+    if isinstance(positions, range) and positions.step == 1:
+        return values[positions.start:positions.stop]
+    return [values[i] for i in positions.tolist()]
+
+
 def _staged_column(stage: dict, attr: str, positions) -> np.ndarray:
+    if not isinstance(positions, range):
+        positions = np.asarray(positions, dtype=np.int64)
     if attr == "features":
-        return np.stack([stage["data"][i] for i in positions])
-    if attr == "timestamp":
-        return np.asarray([stage["ts"][i] for i in positions], dtype=np.float64)
+        rows = _staged_items(stage["data"], positions)
+        if stage.get("ragged") is not None:
+            shape, dtype = stage["ragged"]
+            return pad_rows(rows, _staged_items(stage["length"], positions), shape, dtype)
+        return np.stack(rows)
+    if attr == "length":
+        return np.asarray(_staged_items(stage["length"], positions), dtype=np.int64)
     if attr in ("name", "frame_id"):
-        return np.array([stage[attr][i] for i in positions], dtype="S256")
+        return np.array(_staged_items(stage[attr], positions), dtype="S256")
+    positions = np.asarray(positions, dtype=np.int64)
+    if attr == "timestamp":
+        return _array_values(stage["ts"], positions, np.float64)
     if attr == "spatial_valid":
-        return np.asarray([stage["spatial_valid"][i] for i in positions], dtype=np.uint8)
+        return _array_values(stage["spatial_valid"], positions, np.uint8)
     for kind in ("min", "max"):
         prefix = f"spatial_{kind}_"
         if attr.startswith(prefix):
             dim = int(attr[len(prefix):])
-            return np.asarray([stage[f"spatial_{kind}"][i][dim] for i in positions], dtype=np.float64)
+            return _array_values(stage[f"spatial_{kind}"], positions, np.float64, SPATIAL_INDEX_DIMS, dim)
     raise KeyError(attr)
 
 
@@ -193,6 +272,9 @@ class TileDBBuffer:
         topics=None,
         flush_bytes: int = DEFAULT_FLUSH_BYTES,
         consolidate_max_bytes: int = CONSOLIDATE_MAX_BYTES,
+        row_overhead_bytes: int = DEFAULT_ROW_OVERHEAD_BYTES,
+        ragged_topics=None,
+        max_points: int | None = None,
     ):
         self.data_source = data_source
         self.init_source = init_source
@@ -201,6 +283,9 @@ class TileDBBuffer:
         self.topics = [] if topics is None else list(topics)
         self.flush_bytes = int(flush_bytes)
         self.consolidate_max_bytes = int(consolidate_max_bytes)
+        self.row_overhead_bytes = int(row_overhead_bytes)
+        self.ragged_topics = normalize_ragged_topics(ragged_topics)
+        self.max_points = max_points
         self._init_state()
         # DataBuffer passes iter(()) (not None) for a source-less reopen, so
         # a missing init_source must also mark the buffer read-only.
@@ -214,6 +299,8 @@ class TileDBBuffer:
 
     def _init_state(self) -> None:
         self.counters = {}
+        # Per-topic capacity (rows of the topic's arrays); unbounded topics
+        # track their stored count. `get_size()` reports stored rows.
         self.msg_len = {}
         self.names = {}
         self.frame_ids = {}
@@ -224,6 +311,7 @@ class TileDBBuffer:
         self._persisted: dict[str, int] = {}
         self._staged: dict[str, dict] = {}
         self._schemas: dict[str, tuple[tuple[int, ...], np.dtype]] = {}
+        self._ragged: dict[str, bool] = {}
         self._unbounded: set[str] = set()
         self._sorted: dict[str, bool | None] = {}
         self._last_ts: dict[str, float] = {}
@@ -231,7 +319,10 @@ class TileDBBuffer:
         self._meta_written: dict[str, dict] = {}
         # Fragments, bytes, and metadata writes since the last consolidation.
         self._session: dict[str, dict] = {}
-        self._source_counts: dict[str, int | None] = {}
+        # Fragment URIs each array held before this session first wrote it.
+        self._session_base: dict[str, set] = {}
+        self._source_counts: dict = {}
+        self._interned: dict[bytes, bytes] = {}
 
     # -- layout ----------------------------------------------------------------
 
@@ -247,10 +338,32 @@ class TileDBBuffer:
             return self._topic_paths[topic]
         return resolve_topic_path(self.group_uri, topic, dict(self._topic_paths))
 
+    def get_size(self, topic: str) -> int:
+        """Messages stored (persisted + staged) for `topic`."""
+        return int(self.counters.get(topic, 0))
+
     def _ensure_group(self) -> None:
-        if tiledb.object_type(str(self.group_uri)) != "group":
-            os.makedirs(self.group_uri, exist_ok=True)
-            tiledb.group_create(str(self.group_uri))
+        """Make `group_uri` a TileDB group before creating the first topic.
+
+        Only a missing or empty directory (or a group-less directory of TileDB
+        arrays) becomes a group: Arrow stores and unrelated directories are
+        refused instead of being turned into an empty TileDB store.
+        """
+        uri = str(self.group_uri)
+        if holds_arrow_store(uri) and not holds_tiledb_arrays(uri):
+            raise ValueError(f"{uri} holds an Arrow store; open it with backend='arrow'")
+        if tiledb.object_type(uri) == "group":
+            return
+        try:
+            entries = os.listdir(uri)
+        except FileNotFoundError:
+            entries = []
+        if entries and not any(tiledb.object_type(os.path.join(uri, entry)) == "array" for entry in entries):
+            raise ValueError(
+                f"{uri} is not empty and is not a TileDB store; refusing to create a TileDB store there"
+            )
+        os.makedirs(uri, exist_ok=True)
+        tiledb.group_create(uri)
 
     def _add_group_member(self, uri: str, name: str) -> None:
         self._ensure_group()
@@ -269,6 +382,11 @@ class TileDBBuffer:
                 continue
             uri = os.path.join(self.group_uri, entry)
             if not os.path.isdir(uri) or tiledb.object_type(uri) != "array":
+                continue
+            if not os.path.exists(uri + "__timestamps") and len(tiledb.array_fragments(uri)) == 0:
+                # Creation was interrupted before the index existed and nothing
+                # was written; the next append of the topic recreates both.
+                _logger.warning("Ignoring TileDB array %s without a timestamp index or data", uri)
                 continue
             try:
                 info = self._read_topic_info(uri, _fallback_topic(entry))
@@ -307,9 +425,14 @@ class TileDBBuffer:
             shape = tuple(
                 int(domain.dim(i).domain[1]) - int(domain.dim(i).domain[0]) + 1 for i in range(1, domain.ndim)
             )
-            dtype = np.dtype(schema.attr("features").dtype)
+            attr = schema.attr("features")
+            dtype = np.dtype(attr.dtype)
+            if dtype.kind in "SU" and attr.isvar:
+                # Variable-length strings: any length of this kind (never `<U0`).
+                dtype = np.dtype(dtype.kind)
 
         ts_sorted = None
+        ragged = False
         timestamp_uri = uri + "__timestamps"
         if os.path.exists(timestamp_uri):
             with tiledb.open(timestamp_uri, "r") as timestamp_array:
@@ -317,10 +440,12 @@ class TileDBBuffer:
                 closed = bool(timestamp_array.meta.get("closed", closed))
                 if "ts_sorted" in timestamp_array.meta:
                     ts_sorted = bool(timestamp_array.meta["ts_sorted"])
+                # Stores written before lengths existed are fixed-shape.
+                ragged = "length" in timestamp_array.schema.attr_names
         return {
             "topic": topic, "count": count, "closed": closed, "name": _encode_name(name),
             "frame_id": frame_id, "capacity": capacity, "shape": shape, "dtype": dtype,
-            "ts_sorted": ts_sorted,
+            "ts_sorted": ts_sorted, "ragged": ragged,
         }
 
     def _adopt_topic(self, uri: str, info: dict) -> None:
@@ -342,6 +467,7 @@ class TileDBBuffer:
             # Rows without a frame make the topic frame unknown (None).
             self.frame_ids[topic] = info["frame_id"]
         self._schemas[topic] = (info["shape"], info["dtype"])
+        self._ragged[topic] = bool(info.get("ragged", False))
         self._sorted[topic] = info["ts_sorted"]
         self._last_ts.pop(topic, None)
         self._meta_written[topic] = self._metadata_values(topic)
@@ -355,17 +481,8 @@ class TileDBBuffer:
         return seen < existing_count
 
     def _source_count(self, topic: str) -> int | None:
-        """The source's total message count for `topic`, when it reports one."""
-        if topic not in self._source_counts:
-            get_count = getattr(self.init_source, "get_count", None)
-            count = None
-            if callable(get_count):
-                try:
-                    count = int(get_count(topic))
-                except Exception:
-                    count = None
-            self._source_counts[topic] = count
-        return self._source_counts[topic]
+        """The source's total message count for `topic`, when it lists the topic."""
+        return source_topic_count(self.init_source, topic, self._source_counts)
 
     def reset(self) -> None:
         self.close()
@@ -380,15 +497,26 @@ class TileDBBuffer:
         if topic not in self.msg_len and topic not in self._unbounded:
             count = self._source_count(topic)
             if count is None:
+                # Derived topics, unknown counts: never cap the topic.
                 self._unbounded.add(topic)
             else:
-                self.msg_len[topic] = max(count, 1)
+                self.msg_len[topic] = count
         self._init_tdb(msg)
+
+    def _message_schema(self, topic: str, data: np.ndarray, msg: dict) -> tuple[tuple, np.dtype, bool]:
+        """Stored ``(shape, dtype, ragged)`` for a topic's first message."""
+        if message_is_ragged(msg, self.ragged_topics):
+            capacity = ragged_capacity(topic, self.ragged_topics, self.max_points)
+            shape, dtype = new_ragged_schema(topic, data, msg, capacity)
+            check_persistable_data(topic, data, shape)
+            return shape, dtype, True
+        check_persistable_data(topic, data)
+        return tuple(data.shape), data.dtype, False
 
     def _init_tdb(self, msg: dict) -> None:
         topic = msg["topic"]
         data = native_message_data(msg["data"])
-        check_persistable_data(topic, data)
+        shape, dtype, ragged = self._message_schema(topic, data, msg)
         uri = self._get_array_uri(topic)
         timestamp_uri = self._get_timestamp_array_uri(topic)
         self.counters.setdefault(topic, 0)
@@ -419,44 +547,54 @@ class TileDBBuffer:
         dims = [tiledb.Dim(name="images", domain=(0, rows - 1), tile=1, dtype=np.int32)]
         dims += [
             tiledb.Dim(name=f"dim_{index}", domain=(0, extent - 1), tile=extent, dtype=np.int32)
-            for index, extent in enumerate(data.shape)
+            for index, extent in enumerate(shape)
         ]
         try:
             schema = tiledb.ArraySchema(
                 domain=tiledb.Domain(*dims),
                 sparse=False,
-                attrs=[tiledb.Attr(name="features", dtype=data.dtype, filters=_filters())],
+                attrs=[tiledb.Attr(name="features", dtype=dtype, filters=_filters())],
             )
         except (TypeError, tiledb.TileDBError) as exc:
-            raise ValueError(f"topic {topic} messages have dtype {data.dtype}, which TileDB cannot store") from exc
+            raise ValueError(f"topic {topic} messages have dtype {dtype}, which TileDB cannot store") from exc
 
+        index_attrs = [
+            tiledb.Attr(name="timestamp", dtype=np.float64, filters=_filters()),
+            tiledb.Attr(name="name", dtype="S256", filters=_filters()),
+            tiledb.Attr(name="frame_id", dtype="S256", filters=_filters()),
+            tiledb.Attr(name="spatial_valid", dtype=np.uint8, filters=_filters()),
+            *[
+                tiledb.Attr(name=f"spatial_min_{dim}", dtype=np.float64, filters=_filters())
+                for dim in range(SPATIAL_INDEX_DIMS)
+            ],
+            *[
+                tiledb.Attr(name=f"spatial_max_{dim}", dtype=np.float64, filters=_filters())
+                for dim in range(SPATIAL_INDEX_DIMS)
+            ],
+        ]
+        if ragged:
+            # Real rows of each zero-padded variable-size message.
+            index_attrs.append(tiledb.Attr(name="length", dtype=np.int64, filters=_filters()))
         timestamp_schema = tiledb.ArraySchema(
             domain=tiledb.Domain(
                 tiledb.Dim(name="message", domain=(0, rows - 1), tile=min(rows, _INDEX_TILE), dtype=np.int32)
             ),
             sparse=False,
-            attrs=[
-                tiledb.Attr(name="timestamp", dtype=np.float64, filters=_filters()),
-                tiledb.Attr(name="name", dtype="S256", filters=_filters()),
-                tiledb.Attr(name="frame_id", dtype="S256", filters=_filters()),
-                tiledb.Attr(name="spatial_valid", dtype=np.uint8, filters=_filters()),
-                *[
-                    tiledb.Attr(name=f"spatial_min_{dim}", dtype=np.float64, filters=_filters())
-                    for dim in range(SPATIAL_INDEX_DIMS)
-                ],
-                *[
-                    tiledb.Attr(name=f"spatial_max_{dim}", dtype=np.float64, filters=_filters())
-                    for dim in range(SPATIAL_INDEX_DIMS)
-                ],
-            ],
+            attrs=index_attrs,
         )
+        self._ensure_group()
         tiledb.Array.create(uri, schema)
         self._add_group_member(uri, os.path.basename(uri))
         tiledb.Array.create(timestamp_uri, timestamp_schema)
         self._add_group_member(timestamp_uri, os.path.basename(timestamp_uri))
 
         self._persisted[topic] = 0
-        self._schemas[topic] = (tuple(data.shape), data.dtype)
+        stored_dtype = np.dtype(dtype)
+        if stored_dtype.kind == "U":
+            # TileDB stores unicode as variable-length strings.
+            stored_dtype = np.dtype("U")
+        self._schemas[topic] = (tuple(shape), stored_dtype)
+        self._ragged[topic] = ragged
         self._sorted[topic] = True
         if topic not in self.topics:
             self.topics.append(topic)
@@ -486,7 +624,11 @@ class TileDBBuffer:
                 break
 
     def _is_full(self, topic: str) -> bool:
-        return topic not in self._unbounded and self.counters.get(topic, 0) >= self.msg_len.get(topic, 0)
+        count = self.counters.get(topic, 0)
+        if topic in self._unbounded:
+            # The int32 row domain still ends somewhere.
+            return count >= UNBOUNDED_CAPACITY
+        return count >= self.msg_len.get(topic, 0)
 
     def append_buffer(self, msg: dict) -> None:
         topic = msg['topic']
@@ -495,9 +637,10 @@ class TileDBBuffer:
         # Validate before touching any state: TileDB would otherwise cast
         # silently (e.g. 70000.0 into int16) or fail mid-write.
         if schema is None:
-            check_persistable_data(topic, data)
+            shape, dtype, ragged = self._message_schema(topic, data, msg)
         else:
-            check_message_schema(topic, data, *schema)
+            (shape, dtype), ragged = schema, self._ragged.get(topic, False)
+        rows, length = conform_message(topic, data, msg, shape, dtype, ragged)
         timestamp = float(msg['timestamp'])
         name = _encode_name(msg.get("name", topic))
         frame_id = _encode_frame_id(msg.get("frame_id"))
@@ -510,30 +653,39 @@ class TileDBBuffer:
         self.read_only = False
         if schema is None:
             self._register_topic({**msg, "data": data})
-            check_message_schema(topic, data, *self._schemas[topic])
+            # Registration may adopt an existing array with its own schema.
+            (shape, dtype), ragged = self._schemas[topic], self._ragged.get(topic, False)
+            rows, length = conform_message(topic, data, msg, shape, dtype, ragged)
             if self._is_full(topic):
                 raise ValueError(f"topic {topic} is already full at {self.counters[topic]} messages")
 
-        valid, mins, maxs = _spatial_bounds_for_data(data)
+        valid, mins, maxs = _spatial_bounds_for_data(rows)
         self.names[topic] = name
         self._record_frame_id(msg)
         self._update_sorted(topic, timestamp)
 
         stage = self._staged.get(topic)
         if stage is None:
-            stage = self._staged[topic] = _new_stage()
+            stage = self._staged[topic] = _new_stage((tuple(shape), np.dtype(dtype)) if ragged else None)
         stage["ts"].append(timestamp)
-        stage["name"].append(name)
-        stage["frame_id"].append(frame_id)
-        stage["spatial_valid"].append(valid)
-        stage["spatial_min"].append(mins)
-        stage["spatial_max"].append(maxs)
+        stage["name"].append(self._interned.setdefault(name, name))
+        stage["frame_id"].append(self._interned.setdefault(frame_id, frame_id))
+        stage["spatial_valid"].append(1 if valid else 0)
+        stage["spatial_min"].extend(mins.tolist())
+        stage["spatial_max"].extend(maxs.tolist())
         # Own staged payloads: sources may immediately reuse their arrays.
-        stage["data"].append(np.array(data, copy=True))
-        stage["bytes"] += data.nbytes
+        stage["data"].append(np.array(rows, copy=True))
+        if ragged:
+            stage["length"].append(length)
+            payload_bytes = int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize
+        else:
+            payload_bytes = rows.nbytes
+        stage["bytes"] += payload_bytes + self.row_overhead_bytes
         self.counters[topic] += 1
         if topic in self._unbounded:
             self.msg_len[topic] = self.counters[topic]
+        if len(self._interned) > 4096:
+            self._interned.clear()
 
         if stage["bytes"] >= self.flush_bytes:
             self._flush_topic(topic)
@@ -551,9 +703,13 @@ class TileDBBuffer:
 
     def _update_sorted(self, topic: str, timestamp: float) -> None:
         if self._sorted.get(topic) is not False:
-            last = self._last_timestamp(topic)
-            if last is not None and timestamp < last:
+            if not math.isfinite(timestamp):
+                # Bisection cannot order NaN/inf rows: filter every row instead.
                 self._sorted[topic] = False
+            else:
+                last = self._last_timestamp(topic)
+                if last is not None and not (timestamp >= last):
+                    self._sorted[topic] = False
         self._last_ts[topic] = timestamp
 
     def _record_frame_id(self, msg: dict) -> None:
@@ -574,6 +730,15 @@ class TileDBBuffer:
         session["bytes"] += nbytes
         session["meta"] += meta
 
+    def _note_session_fragments(self, *uris: str) -> None:
+        """Remember an array's fragments before this session first writes it."""
+        for uri in uris:
+            if uri not in self._session_base:
+                try:
+                    self._session_base[uri] = set(tiledb.array_fragments(uri).uri)
+                except tiledb.TileDBError:
+                    self._session_base[uri] = set()
+
     def _flush_topic(self, topic: str) -> None:
         stage = self._staged.get(topic)
         if not stage or not stage["ts"]:
@@ -581,14 +746,16 @@ class TileDBBuffer:
 
         start = self._persisted.get(topic, 0)
         rows = len(stage["ts"])
-        data = np.stack(stage["data"])
+        data = _staged_column(stage, "features", range(rows))
         key = (slice(start, start + rows),) + tuple(slice(None) for _ in data.shape[1:])
-        with tiledb.open(self._get_array_uri(topic), "w") as tiledb_array:
+        data_uri, index_uri = self._get_array_uri(topic), self._get_timestamp_array_uri(topic)
+        self._note_session_fragments(data_uri, index_uri)
+        with tiledb.open(data_uri, "w") as tiledb_array:
             tiledb_array[key] = data
-        with tiledb.open(self._get_timestamp_array_uri(topic), "w") as timestamp_array:
+        with tiledb.open(index_uri, "w") as timestamp_array:
             timestamp_array[start:start + rows] = self._index_values(timestamp_array.schema.attr_names, stage)
         self._persisted[topic] = start + rows
-        self._staged[topic] = _new_stage()
+        self._staged[topic] = _new_stage(stage.get("ragged"))
         self._record_session_write(topic, fragments=1, nbytes=data.nbytes)
         # Advance the committed count with each flush, so an interrupted
         # ingest resumes after the last flushed row.
@@ -626,40 +793,96 @@ class TileDBBuffer:
         self._meta_written[topic] = values
         self._record_session_write(topic, meta=1)
 
+    @staticmethod
+    def _consolidation_config(mode: str) -> tiledb.Config:
+        return tiledb.Config({
+            "sm.consolidation.mode": mode,
+            "sm.vacuum.mode": mode,
+            "sm.consolidation.buffer_size": str(_CONSOLIDATION_BUFFER_BYTES),
+        })
+
     def _consolidate(self, topic: str) -> None:
+        """Cheap, reader-safe consolidation of what this session wrote.
+
+        Merges this session's index fragments, fragment metadata, and array
+        metadata. Never vacuums (readers may hold the superseded files open)
+        and never rewrites payload fragments; `compact()` does both.
+        """
         session = self._session.pop(topic, None)
         if not session:
             return
-        meta_config = tiledb.Config({"sm.consolidation.mode": "array_meta", "sm.vacuum.mode": "array_meta"})
         for uri, holds_payload in (
             (self._get_array_uri(topic), True),
             (self._get_timestamp_array_uri(topic), False),
         ):
+            base = self._session_base.pop(uri, None)
             try:
-                if session["fragments"] and len(tiledb.array_fragments(uri)) > 1:
-                    mode = "fragments"
-                    if holds_payload and session["bytes"] > self.consolidate_max_bytes:
-                        mode = "fragment_meta"
-                    config = tiledb.Config({
-                        "sm.consolidation.mode": mode,
-                        "sm.vacuum.mode": mode,
-                        "sm.consolidation.buffer_size": str(_CONSOLIDATION_BUFFER_BYTES),
-                    })
-                    tiledb.consolidate(uri, config=config)
-                    tiledb.vacuum(uri, config=config)
-                if session["meta"]:
-                    tiledb.consolidate(uri, config=meta_config)
-                    tiledb.vacuum(uri, config=meta_config)
-            except tiledb.TileDBError as exc:
+                if session["fragments"]:
+                    fragments = tiledb.array_fragments(uri)
+                    if not holds_payload and base is not None:
+                        new = [os.path.basename(u) for u in fragments.uri if u not in base]
+                        if len(new) > 1:
+                            tiledb.consolidate(uri, config=self._consolidation_config("fragments"), fragment_uris=new)
+                            fragments = tiledb.array_fragments(uri)
+                    if len(fragments) > 1:
+                        tiledb.consolidate(uri, config=self._consolidation_config("fragment_meta"))
+                if session["meta"] > 1:
+                    tiledb.consolidate(uri, config=self._consolidation_config("array_meta"))
+            except (tiledb.TileDBError, TypeError) as exc:
                 # Data is already committed; consolidation only compacts it.
                 _logger.warning("Could not consolidate TileDB array %s: %s", uri, exc)
+
+    def compact(self, max_bytes: int | None = None) -> None:
+        """Merge fragments and vacuum superseded files of every topic.
+
+        Flushes staged rows first. Payload arrays holding more than
+        `max_bytes` (default ``consolidate_max_bytes``) of fragments only get
+        their fragment metadata consolidated, so compaction never rewrites
+        huge payloads. Vacuuming deletes files that other open readers may
+        still use: run this only while no other process reads the store.
+        """
+        if self.read_only:
+            # Compaction rewrites files: an explicit request is a write intent.
+            self.read_only = False
+        limit = self.consolidate_max_bytes if max_bytes is None else max_bytes
+        errors = []
+        for topic in list(self._schemas):
+            try:
+                self._flush_topic(topic)
+                self._write_metadata(topic)
+                self._session.pop(topic, None)
+                for uri, holds_payload in (
+                    (self._get_array_uri(topic), True),
+                    (self._get_timestamp_array_uri(topic), False),
+                ):
+                    self._session_base.pop(uri, None)
+                    fragments = tiledb.array_fragments(uri)
+                    if len(fragments) > 1:
+                        mode = "fragments"
+                        if holds_payload and _fragments_bytes(fragments.uri) > limit:
+                            mode = "fragment_meta"
+                        tiledb.consolidate(uri, config=self._consolidation_config(mode))
+                    for mode in ("fragments", "fragment_meta", "array_meta", "commits"):
+                        if mode == "array_meta":
+                            tiledb.consolidate(uri, config=self._consolidation_config(mode))
+                        tiledb.vacuum(uri, config=self._consolidation_config(mode))
+            except Exception as exc:
+                exc.add_note(f"while compacting TileDB topic {topic!r}")
+                errors.append(exc)
+        raise_collected(errors, "TileDB")
 
     def close_topic(self, topic: str, closed: bool | None = None) -> None:
         if self.read_only or topic not in self._schemas:
             return
-        self._flush_topic(topic)
+        previous = self.closed_topics.get(topic, False)
         if closed is not None:
+            # Set first, so the flush's metadata write carries the flag.
             self.closed_topics[topic] = bool(closed)
+        try:
+            self._flush_topic(topic)
+        except BaseException:
+            self.closed_topics[topic] = previous
+            raise
         self._write_metadata(topic)
         self._consolidate(topic)
 
@@ -678,10 +901,17 @@ class TileDBBuffer:
     def close(self, closed: bool | None = None):
         self._close_topics({topic: closed for topic in list(self.counters)})
 
-    def close_completed(self) -> None:
-        """Close, marking closed only topics that hold every source message."""
+    def close_completed(self, source_exhausted: bool = False) -> None:
+        """Close, marking closed only topics that hold every source message.
+
+        With `source_exhausted`, topics the source delivered in this session
+        are complete too; other topics keep their closed flag.
+        """
         self._close_topics({
-            topic: True if topic not in self._unbounded and self._is_full(topic) else None
+            topic: True
+            if (topic not in self._unbounded and self._is_full(topic))
+            or (source_exhausted and topic in self._resume_seen)
+            else None
             for topic in list(self.counters)
         })
 
@@ -700,6 +930,9 @@ class TileDBBuffer:
             schema=self._schemas.get(topic),
         )
 
+    def _lengths_for_topic(self, topic: str, lengths) -> dict:
+        return {"lengths": np.asarray(lengths, dtype=np.int64)} if self._ragged.get(topic) else {}
+
     def _metadata_for_topic(self, topic: str) -> dict:
         frame_id = self.frame_ids.get(topic)
         return {} if frame_id is None else {"frame_id": frame_id}
@@ -714,6 +947,7 @@ class TileDBBuffer:
             "frame_ids": np.array([], dtype=object),
             "topic": topic,
             "source_uri": self._source_uri(topic),
+            **self._lengths_for_topic(topic, []),
             **self._metadata_for_topic(topic),
         }
 
@@ -764,7 +998,9 @@ class TileDBBuffer:
         state = True
         for lower in range(0, reader.count, _SCAN_ROWS):
             timestamps = reader.read("timestamp", lower, min(reader.count, lower + _SCAN_ROWS))
-            if timestamps.size and (timestamps[0] < previous or np.any(np.diff(timestamps) < 0)):
+            if timestamps.size and (
+                not np.isfinite(timestamps).all() or timestamps[0] < previous or np.any(np.diff(timestamps) < 0)
+            ):
                 state = False
                 break
             if timestamps.size:
@@ -929,6 +1165,8 @@ class TileDBBuffer:
             "topic": axis,
             "source_uri": reader.data_uri,
         }
+        if self._ragged.get(axis):
+            result["lengths"] = np.asarray(reader.read_points("length", indices), dtype=np.int64)
         if self.frame_ids.get(axis) is not None:
             result["frame_id"] = self.frame_ids[axis]
         return result
@@ -1012,6 +1250,12 @@ class TileDBBuffer:
         if indices.size == 0:
             shape, dtype = self._schemas[topic]
             return np.squeeze(np.empty((0, *shape), dtype=dtype))
+        if isinstance(subscript, (int, np.integer)) and self._ragged.get(topic):
+            # One message of a variable-size topic: its real rows only.
+            with self._reader(topic) as reader:
+                data = self._read_data_attr(reader, indices)
+                length = int(reader.read_points("length", indices)[0])
+            return data[0, :length]
         order = np.argsort(indices, kind="stable")
         with self._reader(topic) as reader:
             data = self._read_data_attr(reader, indices[order])
@@ -1028,7 +1272,18 @@ class TileDBBuffer:
         if indices.size == 0:
             return True
         shape, dtype = self._schemas[topic]
-        values = np.broadcast_to(np.asarray(newval, dtype=dtype), (indices.size, *shape))
+        new_lengths = None
+        candidate = np.asarray(newval)
+        if (
+            self._ragged.get(topic) and isinstance(subscript, (int, np.integer))
+            and candidate.ndim == len(shape) and candidate.shape[1:] == tuple(shape[1:])
+            and candidate.shape[0] <= shape[0]
+        ):
+            # Replace one variable-size message (rows up to the capacity).
+            padded = np.zeros(shape, dtype=dtype)
+            padded[:candidate.shape[0]] = candidate
+            candidate, new_lengths = padded, np.array([candidate.shape[0]], dtype=np.int64)
+        values = np.broadcast_to(np.asarray(candidate, dtype=dtype), (indices.size, *shape))
         order = np.argsort(indices, kind="stable")
         indices, values = indices[order], values[order]
 
@@ -1038,23 +1293,31 @@ class TileDBBuffer:
         offset = 0
         uri = self._get_array_uri(topic)
         timestamp_uri = self._get_timestamp_array_uri(topic)
+        self._note_session_fragments(uri, timestamp_uri)
         for start, stop in _runs(indices):
             part = values[offset:offset + stop - start]
             offset += stop - start
             key = (slice(start, stop),) + tuple(slice(None) for _ in shape)
             with tiledb.open(uri, "w") as tiledb_array:
                 tiledb_array[key] = np.ascontiguousarray(part)
-            self._refresh_spatial_index(timestamp_uri, start, stop, part)
+            self._refresh_spatial_index(timestamp_uri, start, stop, part, new_lengths)
             self._record_session_write(topic, fragments=1, nbytes=part.nbytes)
         return True
 
-    def _refresh_spatial_index(self, timestamp_uri: str, start: int, stop: int, values: np.ndarray) -> None:
-        """Keep stored bounds in sync with overwritten payloads (pruning relies on them)."""
+    def _refresh_spatial_index(
+        self, timestamp_uri: str, start: int, stop: int, values: np.ndarray, lengths=None
+    ) -> None:
+        """Keep stored bounds (and lengths) in sync with overwritten payloads."""
         with tiledb.open(timestamp_uri, "r") as timestamp_array:
             attr_names = timestamp_array.schema.attr_names
             if "spatial_valid" not in attr_names:
                 return
             rows = dict(timestamp_array[start:stop])
+        if "length" in rows:
+            if lengths is not None:
+                rows["length"] = np.asarray(lengths, dtype=np.int64)
+            # Padding rows of variable-size messages are not points.
+            values = [value[:int(length)] for value, length in zip(values, rows["length"])]
         bounds = [_spatial_bounds_for_data(value) for value in values]
         rows["spatial_valid"] = np.array([valid for valid, _, _ in bounds], dtype=np.uint8)
         for dim in range(SPATIAL_INDEX_DIMS):

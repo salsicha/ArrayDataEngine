@@ -305,8 +305,8 @@ def test_spatial_pushdown_keeps_rows_without_valid_bounds(tmp_path, backend, mon
 # 8, 12: memory/TileDB validation ---------------------------------------------------
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
-@pytest.mark.parametrize("bad", [np.array([[7.0, 8.0, 9.0]]), np.zeros((4, 3), dtype=np.float32)],
-                         ids=["smaller-cloud", "float32"])
+@pytest.mark.parametrize("bad", [np.array([[7.0, 8.0, 9.0]]), np.zeros((4, 3), dtype=np.complex64)],
+                         ids=["smaller-cloud", "complex64"])  # safe widening casts (float32) are accepted
 def test_backends_reject_shape_and_dtype_changes(tmp_path, backend, bad):
     buf = open_buffer(backend, tmp_path, Source(2, shape=(4, 3)), **({"buffer_depth": 3} if backend == "memory" else {}))
     with pytest.raises(ValueError, match="must keep"):
@@ -339,7 +339,8 @@ def test_arrow_point_reads_touch_only_needed_row_groups(tmp_path, monkeypatch):
     import pyarrow.parquet as pq
 
     with DataBuffer(Source(60, shape=(8,)), data_uri=str(tmp_path / "s"), backend="arrow", axis="t", preload=0,
-                    backend_options={"flush_bytes": 64 * 20, "row_group_bytes": 64 * 4}) as buf:
+                    backend_options={"flush_bytes": 64 * 20, "row_group_bytes": 64 * 4,
+                                     "row_overhead_bytes": 0}) as buf:
         buf.load_data_db("t")
     reader = DataBuffer(None, data_uri=str(tmp_path / "s"), backend="arrow", axis="t")
     assert len(reader.buffer_impl._fragments["t"]) == 3
@@ -577,6 +578,7 @@ def test_tiledb_flushes_in_batches_and_resumes_after_last_flush(tmp_path):
     uri = str(tmp_path / "store")
     buf = DataBuffer(Source(10), data_uri=uri, backend="tiledb", axis="t", preload=0)
     buf.buffer_impl.flush_bytes = 16 * 4
+    buf.buffer_impl.row_overhead_bytes = 0  # count payload bytes only
     for _ in range(9):
         buf.roll_buffer("t")
     fragments = len(tiledb.array_fragments(buf.buffer_impl._get_array_uri("t")))
@@ -593,6 +595,7 @@ def test_reads_merge_persisted_and_staged_rows(tmp_path, backend):
     source = Source(25, frames=["map", "odom"] * 13, shape=(3,))
     buf = DataBuffer(source, data_uri=str(tmp_path / backend), backend=backend, axis="t", preload=0)
     buf.buffer_impl.flush_bytes = 24 * 10  # rows 0-19 flushed, 20-22 staged
+    buf.buffer_impl.row_overhead_bytes = 0  # count payload bytes only
     for _ in range(23):
         buf.roll_buffer("t")
     assert buf.buffer_impl._persisted["t"] == 20
