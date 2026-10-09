@@ -333,11 +333,14 @@ def sample_grid(
             term = np.where(weight > 0.0, arr[rr, cc] * weight, 0.0)
             sampled = term if sampled is None else sampled + term
 
+    # A scalar query indexes to a NumPy scalar; work on a 0-d array so the
+    # out-of-grid mask can be applied, and hand back a scalar at the end.
+    sampled = np.asarray(sampled)
     result = sampled.astype(np.result_type(sampled.dtype, fill_value), copy=False)
     if not valid.all():
         result = result.copy()
         result[~valid] = fill_value
-    return result
+    return result[()] if result.ndim == 0 else result
 
 
 def terrain_gradients(

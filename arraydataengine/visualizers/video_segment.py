@@ -41,8 +41,38 @@ class VisTool:
         self.repeat_delay = 1000
         self.animated = True
 
-        self.fig, self.ax = plt.subplots()
+        # The animation figure is created on first use, so a VisTool that only
+        # calls show(image) does not leave an empty figure in notebooks.
+        self._fig = None
+        self._ax = None
         self.images = []
+
+
+    def _ensure_figure(self):
+        if self._fig is None:
+            self._fig, self._ax = plt.subplots()
+
+
+    @property
+    def fig(self):
+        self._ensure_figure()
+        return self._fig
+
+
+    @fig.setter
+    def fig(self, value):
+        self._fig = value
+
+
+    @property
+    def ax(self):
+        self._ensure_figure()
+        return self._ax
+
+
+    @ax.setter
+    def ax(self, value):
+        self._ax = value
 
 
     def get_show_animation(self, embed):

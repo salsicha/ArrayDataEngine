@@ -901,3 +901,35 @@ def test_box_colours_are_drawn_in_rgb_order(monkeypatch):
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
     drawn = tool.frame_vis_generator(frame, _FakeBoxes((10, 10, 60, 60), 3, 1, (100, 100)))
     assert np.allclose(drawn[40, 60].astype(float), colors[3], atol=1.0)
+
+
+def test_dem_vistool_merge_keeps_shared_srtm_edges_once():
+    pytest.importorskip("matplotlib")
+    from arraydataengine.visualizers.dem import VisTool
+
+    tile, rows, cols = 5, 2, 3
+    grid = np.arange(((rows * (tile - 1) + 1) * (cols * (tile - 1) + 1)), dtype=float).reshape(
+        rows * (tile - 1) + 1, cols * (tile - 1) + 1)
+    images = []  # DEMSource order: south first, then east to west; tiles are north-up
+    for n in range(rows):
+        for w in range(cols):
+            r0 = (rows - 1 - n) * (tile - 1)
+            c0 = (cols - 1 - w) * (tile - 1)
+            images.append(grid[r0:r0 + tile, c0:c0 + tile])
+    tool = VisTool.__new__(VisTool)
+    merged = tool.merge_geotiffs(images, north=[37, 37 + rows], west=[122, 122 + cols])
+    np.testing.assert_array_equal(merged, grid)
+    padded = tool.merge_geotiffs(images, north=[37, 37 + rows], west=[122, 122 + cols], overlap=0)
+    assert padded.shape == (rows * tile, cols * tile)
+
+
+def test_video_vistool_creates_its_figure_lazily():
+    plt = pytest.importorskip("matplotlib.pyplot")
+    from arraydataengine.visualizers.video_segment import VisTool
+
+    before = len(plt.get_fignums())
+    tool = VisTool(embed=True)
+    assert len(plt.get_fignums()) == before
+    tool.append_img(np.zeros((4, 4, 3), dtype=np.uint8))
+    assert len(plt.get_fignums()) == before + 1 and tool.fig is tool.ax.figure
+    plt.close(tool.fig)

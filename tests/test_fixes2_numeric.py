@@ -619,3 +619,15 @@ def test_ml_splits_and_windows_keep_ragged_lengths_and_frame_ids():
     batch = ml.collate_samples(windows)
     assert batch["lengths"].shape == (5, 2) and batch["lengths"][2].tolist() == [4, 2]
     assert batch["data_lengths"].tolist() == [1, 2, 2, 2, 2]
+
+
+def test_sample_grid_scalar_queries_outside_or_nan_return_fill():
+    raster = np.arange(9.0).reshape(3, 3)
+    assert np.isnan(dem.sample_grid(raster, 10.0, 1.0))
+    assert np.isnan(dem.sample_grid(raster, float("nan"), 1.0, bilinear=False))
+    assert dem.sample_grid(raster, 1.0, 1.0) == 4.0
+    assert np.ndim(dem.sample_grid(raster, 1.0, 1.0)) == 0
+    assert dem.sample_grid(raster, 10.0, 1.0, fill_value=-1.0) == -1.0
+    rgb = np.ones((3, 3, 3))
+    assert np.isnan(dem.sample_grid(rgb, 10.0, 1.0)).all()
+    assert np.isnan(dem.sample_elevation_at_latlon(raster, 50.0, 0.5, bounds=(0, 0, 1, 1)))
