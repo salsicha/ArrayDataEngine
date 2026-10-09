@@ -622,3 +622,33 @@ def test_new_numeric_helpers_are_exported():
     assert callable(pose_to_trajectory) and callable(sample_elevation_at_latlon)
     assert {"pose_to_trajectory", "sample_elevation_at_latlon", "topic_rows", "topic_lengths"} <= set(ops.__all__)
     assert all(hasattr(ops, name) for name in ops.__all__)
+
+
+@pytest.mark.parametrize("backend", ["memory", "arrow", "tiledb"])
+def test_source_pipeline_to_buffer_forwards_capacity_options(tmp_path, backend):
+    def clouds():
+        rng = np.random.default_rng(0)
+        for i, n in enumerate((40, 120, 80)):  # larger than the capacity the source advertises
+            yield {"topic": "/c", "timestamp": float(i), "name": str(i),
+                   "data": rng.normal(size=(n, 3)), "point_count": n}
+
+    class Source:
+        max_points = 50
+
+        def get_topics(self):
+            return ["/c"]
+
+        def get_count(self, topic):
+            return 3
+
+        def get_message(self):
+            return clouds()
+
+    kwargs = {} if backend == "memory" else {"use_db": True, "backend": backend, "data_uri": str(tmp_path / backend)}
+    small = {**kwargs, "data_uri": str(tmp_path / "small")} if kwargs else {}
+    with pytest.raises(ValueError, match="capacity|max_points"):  # the source's own limit (50) is too small
+        source_pipeline(Source()).to_buffer(buffer_depth=3, **small)
+    buffer = source_pipeline(Source()).to_buffer(buffer_depth=3, max_points=128, **kwargs)
+    stored = buffer.get_index_range("/c")
+    assert stored["lengths"].tolist() == [40, 120, 80]
+    assert stored["data"].shape[1] == 128

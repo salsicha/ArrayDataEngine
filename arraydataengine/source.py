@@ -16,6 +16,9 @@ class DataSources:
         period: seconds between images of an image source.
         bounds: ``[[north_min, north_max], [west_min, west_max]]`` for DEM.
         cache_dir, refresh_cache, timeout: DEM download options.
+        base_url, allow_insecure_http: DEM tile server (defaults to NASA LP
+            DAAC, or ``ADE_DEM_BASE_URL``) and the explicit opt-in that a
+            plain ``http://`` mirror needs.
         max_points: point clouds with more finite points than this are
             skipped with a warning; ``None`` (default) means no limit.
             Clouds are always yielded unpadded as ``(N, 3)`` with
@@ -38,6 +41,8 @@ class DataSources:
         max_points: int | None = None,
         topics=None,
         color_order: str = "rgb",
+        base_url: str | None = None,
+        allow_insecure_http: bool = False,
     ):
         """Constructor"""
 
@@ -53,7 +58,7 @@ class DataSources:
         bounds = [[0, 0], [0, 0]] if bounds is None else bounds
 
         # Image globs such as "*.PNG" match regardless of extension case.
-        is_image = extension in _IMAGE_EXTENSIONS
+        is_image = extension in _IMAGE_EXTENSIONS or self._is_image_glob(data_path)
         ros_options = {"max_points": max_points, "topics": topics}
 
         if extension == ".bag" and self._is_sqlite_rosbag(data_path):
@@ -81,6 +86,8 @@ class DataSources:
                 timeout=timeout,
                 cache_dir=cache_dir,
                 refresh_cache=refresh_cache,
+                base_url=base_url,
+                allow_insecure_http=allow_insecure_http,
             )
         else:
             raise ValueError(
@@ -95,6 +102,24 @@ class DataSources:
 
         if not self.source.data_exists():
             raise FileNotFoundError(f"No data found for {data_path}")
+        if self._topics is not None:
+            self._check_requested_topics(data_path)
+
+
+    def _check_requested_topics(self, data_path) -> None:
+        """Fail fast on topic names the recording does not contain (a typo would
+        otherwise silently yield no messages). Topics that exist but cannot be
+        decoded only log a warning, from the ROS reader."""
+
+        known = set(self.get_topic_types())
+        if not known:
+            getter = getattr(self.source, "get_topics", None)
+            known = set(getter()) if callable(getter) else set()
+        missing = [topic for topic in self._topics if topic not in known]
+        if known and missing:
+            raise ValueError(
+                f"topic(s) {missing} not found in {data_path}; available topics: {sorted(known)}"
+            )
 
 
     @property
@@ -109,6 +134,17 @@ class DataSources:
         """Topics this source was restricted to (None = all)."""
 
         return self._topics
+
+
+    @staticmethod
+    def _is_image_glob(data_path):
+        """A wildcard pattern such as ``frames/*.tif*`` that matches image files."""
+
+        if not any(char in data_path for char in "*?["):
+            return False
+        from glob import iglob
+
+        return any(os.path.splitext(match)[1].lower() in _IMAGE_EXTENSIONS for match in iglob(data_path))
 
 
     @staticmethod

@@ -99,6 +99,7 @@ from .geometry import (
 from .image import (
     align_image,
     align_images,
+    register_with_fixed_pattern,
     apply_image_mask,
     close_mask,
     convert_color,
@@ -256,6 +257,7 @@ __all__ = [
     "align_exact",
     "align_image",
     "align_images",
+    "register_with_fixed_pattern",
     "align_nearest",
     "align_topic",
     "angular_velocity_from_quaternions",

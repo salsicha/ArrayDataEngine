@@ -2070,12 +2070,18 @@ class SourcePipeline:
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
+        max_points: int | None = None,
+        ragged_topics=None,
+        backend_options: dict | None = None,
     ):
         """Stream processed messages into a `DataBuffer`.
 
         `backend` follows DataBuffer semantics: None picks memory for
         `use_db=False` and arrow (or an existing TileDB store) for
-        `use_db=True`.
+        `use_db=True`. `max_points`, `ragged_topics`, and `backend_options`
+        are passed to the new `DataBuffer` (for example, `max_points` sizes the
+        storage of variable-size point clouds beyond the source's limit or the
+        30000-row default); they are ignored when `buffer` is given.
 
         Resuming a persistent store: the store's per-topic row counts are
         the source of truth. A checkpoint is used to skip already-processed
@@ -2127,6 +2133,9 @@ class SourcePipeline:
             use_db=use_db,
             backend=backend,
             preload=0,
+            max_points=max_points,
+            ragged_topics=ragged_topics,
+            backend_options=backend_options,
         )
         if result.use_db and _checkpoint_processed(checkpoint) > 0:
             # The checkpoint may run ahead of (crash before flush) or behind
@@ -2164,6 +2173,9 @@ class SourcePipeline:
         cancel_token: Any | None = None,
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
+        max_points: int | None = None,
+        ragged_topics=None,
+        backend_options: dict | None = None,
     ):
         """Stream processed messages into a TileDB-backed `DataBuffer`."""
 
@@ -2177,6 +2189,9 @@ class SourcePipeline:
             cancel_token=cancel_token,
             checkpoint=checkpoint,
             progress_interval=progress_interval,
+            max_points=max_points,
+            ragged_topics=ragged_topics,
+            backend_options=backend_options,
         )
 
     def _with_operation(self, kind: str, *args, topics: Iterable[str] | None = None, **kwargs) -> "SourcePipeline":

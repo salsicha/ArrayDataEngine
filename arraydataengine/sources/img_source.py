@@ -8,6 +8,8 @@ import cv2
 import os
 import re
 
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
 _COLOR_ORDERS = ("rgb", "bgr")
 
 
@@ -45,6 +47,9 @@ class ImgSource(BaseSource):
         self.color_order = color_order
 
         images = glob(data_path)
+        if any(char in os.path.basename(data_path) for char in "*?["):
+            # A wildcard pattern (e.g. "*.tif*") may also match sidecar files.
+            images = [path for path in images if os.path.splitext(path)[1].lower() in _IMAGE_EXTENSIONS]
         if not images and os.path.isfile(data_path):
             images = [data_path]
         images.sort(key=_natural_key)

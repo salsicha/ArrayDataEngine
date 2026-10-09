@@ -649,8 +649,8 @@ def test_topics_filter_skips_decoding_other_topics(tmp_path, monkeypatch):
     images = tmp_path / "imgs"
     images.mkdir()
     cv2.imwrite(str(images / "a.png"), np.zeros((2, 2), np.uint8))
-    assert DataSources(str(images / "*.png"), topics=["/other"]).get_topics() == []
-    assert list(DataSources(str(images / "*.png"), topics=["/other"]).get_message()) == []
+    with pytest.raises(ValueError, match="not found"):  # a typo fails fast instead of yielding nothing
+        DataSources(str(images / "*.png"), topics=["/other"])
     assert len(list(DataSources(str(images / "*.png"), topics="images").get_message())) == 1
 
 
@@ -803,3 +803,48 @@ def test_rosbags_yielding_nothing_falls_back_to_sqlite(tmp_path, monkeypatch, ca
         assert [m["timestamp"] for m in source.get_message()] == [1.0, 2.0]
         assert [m["timestamp"] for m in source.get_message()] == [1.0, 2.0]
     assert caplog.text.count("rosbags yielded none of its 2 listed messages") == 1
+
+
+def test_datasources_forwards_dem_base_url_and_http_opt_in(tmp_path):
+    from arraydataengine.source import DataSources
+
+    source = DataSources("DEM", bounds=[[37, 38], [122, 123]], cache_dir=tmp_path,
+                         base_url="http://mirror.example/srtm", allow_insecure_http=True)
+    assert source.source.base_url == "http://mirror.example/srtm"
+    assert source.source.allow_insecure_http is True
+    default = DataSources("DEM", bounds=[[37, 38], [122, 123]], cache_dir=tmp_path)
+    assert default.source.allow_insecure_http is False
+
+
+def test_datasources_rejects_unknown_topic_names(tmp_path):
+    from arraydataengine.source import DataSources
+
+    from pathlib import Path
+
+    db3 = Path(__file__).resolve().parents[1] / "example" / "mapeverything_0.db3"
+    with open(db3, "rb") as handle:
+        if handle.read(64).startswith(b"version https://git-lfs"):
+            pytest.skip("example recording is a Git LFS pointer")
+    with pytest.raises(ValueError, match=r"/mapping/pos'\] not found.*available topics: \[.*'/mapping/pose'"):
+        DataSources(str(db3), topics=["/mapping/pose", "/mapping/pos"])
+    assert DataSources(str(db3), topics=["/mapping/pose"]).get_topics() == ["/mapping/pose"]
+
+    from PIL import Image
+    Image.fromarray(np.zeros((2, 2, 3), np.uint8)).save(tmp_path / "f0.png")
+    assert DataSources(str(tmp_path / "*.png"), topics=["images"]).get_topics() == ["images"]
+    with pytest.raises(ValueError, match="not found"):
+        DataSources(str(tmp_path / "*.png"), topics=["camera"])
+
+
+def test_image_glob_with_wildcard_extension_reads_only_images(tmp_path):
+    from PIL import Image
+    from arraydataengine.source import DataSources
+
+    for i in range(3):
+        Image.fromarray(np.full((4, 5), i, np.uint16)).save(tmp_path / f"f{i}.tiff")
+    (tmp_path / "f0.tiff.aux.xml").write_text("<PAMDataset/>")  # sidecar a *.tif* glob also matches
+    source = DataSources(str(tmp_path / "*.tif*"))
+    frames = [m["data"] for m in source.get_message()]
+    assert source.get_count("images") == 3 and [int(f[0, 0]) for f in frames] == [0, 1, 2]
+    with pytest.raises(ValueError, match="not supported"):
+        DataSources(str(tmp_path / "*.xml*"))

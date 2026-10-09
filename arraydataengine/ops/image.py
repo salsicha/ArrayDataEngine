@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 
@@ -710,7 +712,12 @@ def align_images(
     incremental: bool = True,
     return_shifts: bool = False,
 ):
-    """Collect a sequence aligned to the first frame."""
+    """Collect a sequence aligned to the first frame.
+
+    Sensors with fixed-pattern noise (thermal cameras in particular) bias the
+    phase correlation toward "no motion"; use `register_with_fixed_pattern`
+    for those.
+    """
 
     if return_shifts:
         pairs = list(iter_aligned_images(
@@ -735,6 +742,70 @@ def align_images(
         return _empty_aligned_result(images)
     return np.stack(aligned, axis=0)
 
+
+
+def register_with_fixed_pattern(
+    images,
+    max_shift: int | tuple[int, int] | None = None,
+    frozen=None,
+    highpass_size: int = 11,
+    iterations: int = 2,
+):
+    """Register a sequence whose sensor adds fixed-pattern noise (FPN).
+
+    FPN (column/row/pixel offsets of thermal and some CMOS sensors) stays put
+    on the sensor while the scene moves. Phase correlation weights every
+    spatial frequency equally, so it pulls `align_images` toward "no motion",
+    and frame-to-frame estimates of sub-pixel steps accumulate that bias. This
+    removes a first FPN estimate (the temporal median of high-passed frames),
+    registers every frame directly against the first one, re-estimates the FPN
+    from the registered scene (the median residual), and registers again.
+    The pattern can only be told apart from the scene when the scene moves
+    across the sensor: use a few tens of frames whose motion is large compared
+    with `highpass_size`.
+
+    Args:
+        images: ``(N, H, W)`` single-channel frames.
+        max_shift: largest shift searched, as in `align_images`.
+        frozen: optional boolean mask of frames to leave out of the FPN and
+            scene estimates (e.g. flat-field-correction freeze frames). They
+            are still registered.
+        highpass_size: box size in pixels of the local mean removed for the
+            first FPN estimate.
+        iterations: FPN refinement passes.
+
+    Returns:
+        ``(shifts, aligned, fixed_pattern)``: the integer ``(row, col)`` shift
+        of each frame relative to the first (the `align_images` convention:
+        ``aligned = translate_image(frame, -shift)``); the FPN-corrected,
+        registered frames as float32 with NaN where a frame does not cover the
+        first one; and the estimated fixed pattern (zero median).
+    """
+
+    frames = np.asarray(images, dtype=np.float32)
+    if frames.ndim != 3 or frames.shape[0] == 0:
+        raise ValueError("images must have shape (N, H, W) with at least one frame")
+    keep = np.ones(frames.shape[0], dtype=bool) if frozen is None else ~np.asarray(frozen, dtype=bool)
+    if keep.shape != (frames.shape[0],) or not keep.any():
+        raise ValueError("frozen must be one flag per frame and leave at least one frame")
+    highpass = frames - local_mean(frames, size=highpass_size, spatial_axes=(1, 2))
+    fixed_pattern = np.median(highpass[keep], axis=0)
+    del highpass
+    with warnings.catch_warnings():  # pixels no frame covers have all-NaN medians
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for _ in range(max(1, int(iterations))):
+            _, shifts = align_images(frames - fixed_pattern, max_shift=max_shift, incremental=False,
+                                     return_shifts=True)
+            registered = np.stack([translate_image(f, -s, fill_value=np.nan) for f, s in zip(frames, shifts)])
+            scene = np.nanmedian(registered[keep], axis=0)
+            del registered
+            residual = np.stack([f - translate_image(scene, s, fill_value=np.nan) for f, s in zip(frames, shifts)])
+            fixed_pattern = np.nan_to_num(np.nanmedian(residual[keep], axis=0))
+            del residual
+            fixed_pattern -= np.median(fixed_pattern)
+    _, shifts = align_images(frames - fixed_pattern, max_shift=max_shift, incremental=False, return_shifts=True)
+    aligned = np.stack([translate_image(f, -s, fill_value=np.nan) for f, s in zip(frames - fixed_pattern, shifts)])
+    return np.rint(shifts).astype(np.int64), aligned, fixed_pattern.astype(np.float32)
 
 def _empty_aligned_result(images) -> np.ndarray:
     # Empty lists and exhausted generators carry no frame shape at all;

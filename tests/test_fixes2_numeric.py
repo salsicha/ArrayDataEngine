@@ -631,3 +631,33 @@ def test_sample_grid_scalar_queries_outside_or_nan_return_fill():
     rgb = np.ones((3, 3, 3))
     assert np.isnan(dem.sample_grid(rgb, 10.0, 1.0)).all()
     assert np.isnan(dem.sample_elevation_at_latlon(raster, 50.0, 0.5, bounds=(0, 0, 1, 1)))
+
+
+def test_register_with_fixed_pattern_recovers_motion_that_fpn_hides():
+    # Thermal-like scene: smooth gradients and blobs plus a few warm structures with
+    # sharp edges, seen through column/row/pixel fixed-pattern noise while the camera pans.
+    rng = np.random.default_rng(0)
+    height, width, margin, frames_n, pan = 128, 160, 24, 30, 16
+    yy, xx = np.mgrid[0:height + 2 * margin, 0:width + 2 * margin]
+    world = 100.0 * yy / yy.shape[0]
+    for _ in range(12):
+        cy, cx, sigma = rng.uniform(0, yy.shape[0]), rng.uniform(0, yy.shape[1]), rng.uniform(15, 40)
+        world += rng.uniform(-40, 40) * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma ** 2))
+    for _ in range(6):
+        r, c = rng.integers(0, yy.shape[0] - 30), rng.integers(0, yy.shape[1] - 30)
+        world[r:r + rng.integers(10, 40), c:c + rng.integers(10, 50)] += rng.uniform(20, 50)
+    fpn = (rng.normal(0, 8, width)[None, :] + rng.normal(0, 3, height)[:, None]
+           + rng.normal(0, 8, (height, width)))
+    true = np.array([(int(round(2 * np.sin(k / 3))), int(round(pan * k / (frames_n - 1)))) for k in range(frames_n)])
+    frames = np.stack([world[margin + dy:margin + dy + height, margin + dx:margin + dx + width] + fpn
+                       + rng.normal(0, 4, (height, width)) for dy, dx in true])
+    expected = np.abs(true - true[0])
+
+    _, plain = image.align_images(frames, max_shift=margin, incremental=False, return_shifts=True)
+    assert np.abs(np.abs(plain) - expected).max() >= pan  # FPN pins plain phase correlation at "no motion"
+    shifts, aligned, pattern = image.register_with_fixed_pattern(frames, max_shift=margin)
+    np.testing.assert_array_equal(np.abs(shifts), expected)
+    assert aligned.shape == frames.shape and np.isnan(aligned[-1]).any()
+    assert np.corrcoef(pattern.ravel(), (fpn - np.median(fpn)).ravel())[0, 1] > 0.9
+    with pytest.raises(ValueError):
+        image.register_with_fixed_pattern(frames, frozen=np.ones(len(frames), bool))
