@@ -34,6 +34,19 @@ registry release.
   odometry topics.
 - `ade --max-points`, `ade ingest --force`, and an `ade_source.json` record of
   the recording behind each ingested store.
+- `scripts/run_notebooks.py` runs the notebooks in isolated copies, offline or
+  against real data. `scripts/datasets/` fetches and checksums the test
+  datasets (KITTI, MOT17, SRTM, CIFAR-10), converts KITTI raw drives to ROS 2
+  bags, generates synthetic Boson LWIR beacon sequences, and checks the
+  Earthdata download with your credentials.
+- `DataSources("DEM", ...)` forwards `base_url` and `allow_insecure_http`.
+- `register_with_fixed_pattern()` registers image sequences from sensors with
+  fixed-pattern noise (thermal cameras), where plain phase correlation reports
+  no motion.
+- `SourcePipeline.to_buffer()` / `persist_to_tiledb()` accept `max_points`,
+  `ragged_topics`, and `backend_options` for the buffer they create.
+- Image sources accept wildcard extensions such as `frames/*.tif*` and skip
+  non-image files the pattern matches.
 - `sensor_msgs/CompressedImage` decoding for CDR and rosbridge JSON payloads
   (requires OpenCV), and `get_topic_types()` on ROS sources.
 - `DataBuffer.close_completed()`, `DEMSource(allow_insecure_http=...)`, and
@@ -71,6 +84,9 @@ registry release.
   operations receive just the data, so `map(voxel_downsample)` raises instead
   of using a timestamp as the voxel size.
 - `get_topics()`/`get_count()` list only topics whose type can be decoded.
+- `DataSources(..., topics=[...])` raises `ValueError`, listing the available
+  topics, when a requested topic is not in the recording, instead of silently
+  yielding nothing.
 - Unknown image encodings raise instead of returning raw bytes; OpenCV-style
   (`32FC1`, `16SC1`, ...), Bayer, and YUV422 encodings are decoded.
 - The DepthAnythingCalibration body `frame_id` is exposed as

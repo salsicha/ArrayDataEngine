@@ -265,6 +265,8 @@ rgbd_cloud = fuse_rgbd_frames(depth_frames[:10], frames[:10], fx=525.0, fy=525.0
 depth_calibration, metric_depth = calibrate_depth_metric_scale(relative_depth, lidar_points, fx=525.0, fy=525.0, cx=319.5, cy=239.5, return_adjusted=True)
 ```
 
+Image registration uses phase correlation. On sensors with fixed-pattern noise, such as thermal cameras with column/row/pixel offsets, the pattern stays put while the scene moves, and plain `align_images` then reports no motion. `register_with_fixed_pattern(frames, max_shift=..., frozen=...)` estimates and removes the pattern while it registers. It returns integer shifts, the corrected registered frames, and the pattern. It needs a few tens of frames in which the scene moves across the sensor.
+
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 
 ```python
@@ -776,6 +778,22 @@ python -m pytest -q
 ```
 
 Release packaging and Python registry publishing steps are tracked in [TODO.md](TODO.md).
+
+Run the notebooks (each in an isolated copy, so nothing they write lands in the repository; needs `pip install nbclient`):
+
+```bash
+python scripts/run_notebooks.py                    # all notebooks, offline defaults
+python scripts/run_notebooks.py --save             # refresh the committed outputs
+```
+
+To test them against real recordings, fetch the test datasets (about 700 MB, stored in `~/.cache/arraydataengine/test-data`, verified against pinned checksums) and run the `real` profile:
+
+```bash
+python scripts/datasets/fetch_test_datasets.py
+python scripts/run_notebooks.py --profile real
+```
+
+The datasets are the KITTI raw drive 2011_09_26_drive_0001 (GPS/IMU, Velodyne, and camera; CC BY-NC-SA 3.0), converted to ROS 2 bags in both SQLite and MCAP storage by `scripts/datasets/kitti_to_rosbag2.py`. They also include MOT17-05 (CC BY-NC-SA 3.0), San Francisco Bay Area SRTM-format elevation tiles from the AWS Open Data terrain-tiles bucket (SRTM and USGS 3DEP with ETOPO1 bathymetry offshore; public domain, attribution requested), CIFAR-10, and synthetic FLIR Boson LWIR sequences with blinking beacons from `scripts/datasets/make_lwir_sequence.py`, because no open thermal dataset contains pulsed beacons. The `ros1` profile replays the example recording's ROS 1 bag. The `dem-download` profile exercises `DEMSource`'s download branch against a local server holding the real tiles. The NASA Earthdata login itself needs an account, so `scripts/datasets/check_earthdata_download.py` tests that step with your own credentials.
 
 Build and run the notebook container:
 
