@@ -95,7 +95,8 @@ def test_bag_source_mocked(mock_any_reader):
 
     # Test get_duration
     duration = source.get_duration()
-    assert duration == 1.0  # (2e9 - 1e9) * 1e-9 = 1.0
+    # rosbags' end_time is 1 ns past the last message: (2e9 - 1 - 1e9) * 1e-9
+    assert duration == pytest.approx(1.0, abs=1e-8)
 
     # Test get_count
     count = source.get_count("/camera/image")
@@ -120,7 +121,7 @@ def test_bag_source_caches_metadata(mock_any_reader):
 
     assert source.get_topics() == ["/camera/image"]
     assert source.get_count("/camera/image") == 10
-    assert source.get_duration() == 1.0
+    assert source.get_duration() == pytest.approx(1.0, abs=1e-8)
     assert mock_any_reader.call_count == 1
 
 

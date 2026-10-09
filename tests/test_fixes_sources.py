@@ -215,11 +215,10 @@ def test_rosbags_and_sqlite_paths_yield_identical_messages(tmp_path, caplog):
     assert by_topic["/pose_nohdr"]["name"] == "Pose"
     assert by_topic["/pose_zero_stamp"]["timestamp"] == pytest.approx(LOG_NS * 1e-9)
     assert by_topic["/pose_nohdr"]["timestamp"] == pytest.approx((LOG_NS + 1) * 1e-9)
-    # Clouds: NaN rows dropped, zero padded to max_points, valid count reported.
+    # Clouds: NaN rows dropped, unpadded, valid count reported.
     cloud = by_topic["/cloud_nan"]
-    assert cloud["data"].shape == (20, 3) and cloud["point_count"] == 2
-    np.testing.assert_array_equal(cloud["data"][:2], [[1, 2, 3], [4, 5, 6]])
-    assert not cloud["data"][2:].any()
+    assert cloud["data"].shape == (2, 3) and cloud["point_count"] == 2
+    np.testing.assert_array_equal(cloud["data"], [[1, 2, 3], [4, 5, 6]])
     # float64 xyz keeps its precision.
     f64 = by_topic["/cloud_f64"]["data"]
     assert f64.dtype == np.float64
@@ -240,7 +239,7 @@ def test_max_points_is_configurable_through_sources(tmp_path):
 
     source = DataSources(str(bag_dir), max_points=64)
     [message] = list(source.get_message())
-    assert message["data"].shape == (64, 3)
+    assert message["data"].shape == (40, 3)
     assert message["point_count"] == 40
     with pytest.raises(ValueError, match="max_points"):
         DataSources(str(bag_dir), max_points=0)
@@ -380,7 +379,8 @@ def test_compressed_image_is_decoded_and_counted(tmp_path):
     assert source.get_count("/image/compressed") == 1
     [message] = list(source.get_message())
     assert message["name"] == "CompressedImage"
-    np.testing.assert_array_equal(message["data"], pixels)
+    # OpenCV encoded `pixels` as BGR; sources return RGB.
+    np.testing.assert_array_equal(message["data"], pixels[..., ::-1])
 
 
 # -- #8: storage detection ----------------------------------------------------------

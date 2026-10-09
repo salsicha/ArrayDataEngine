@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from functools import partial
 from io import BytesIO
+import logging
 from pathlib import Path
 import tempfile
 from urllib.parse import urlparse
@@ -14,7 +15,10 @@ import numpy as np
 
 from .base_source import BaseSource
 
+_logger = logging.getLogger(__name__)
+
 EARTHDATA_AUTH_HOST = "urs.earthdata.nasa.gov"
+_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 def _ordered_range(bounds) -> list[int]:
@@ -22,27 +26,43 @@ def _ordered_range(bounds) -> list[int]:
     return [min(first, last), max(first, last)]
 
 
-def _rebuild_earthdata_auth(prepared_request, response, allow_insecure_http: bool = False) -> None:
+def _endpoint(url: str) -> tuple[str, str | None, int | None]:
+    """(scheme, hostname, effective port) of `url`."""
+
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:  # malformed port: never trusted
+        return scheme, None, None
+    return scheme, parsed.hostname, port if port is not None else _DEFAULT_PORTS.get(scheme)
+
+
+def _rebuild_earthdata_auth(
+    prepared_request,
+    response,
+    allow_insecure_http: bool = False,
+    tile_url: str | None = None,
+) -> None:
     """requests `Session.rebuild_auth` replacement (NASA Earthdata pattern).
 
-    Keeps the Authorization header only on same-host redirects and on
-    redirects to or from urs.earthdata.nasa.gov, and never over plain HTTP
-    unless explicitly allowed. Any other redirect (e.g. to a CDN) drops the
-    credentials.
+    A redirect keeps the Authorization header only when its target is the
+    DEM tile host (`tile_url`'s host and port; the default SRTM host when not
+    given) or urs.earthdata.nasa.gov on port 443, and only over HTTPS unless
+    `allow_insecure_http` (which never applies to the login host). Every
+    other target, including one reached by a redirect *from* the login host,
+    loses the credentials.
     """
 
     headers = prepared_request.headers
     if "Authorization" not in headers:
         return
-    original = urlparse(response.request.url)
-    redirect = urlparse(prepared_request.url)
-    insecure = redirect.scheme.lower() != "https" and not allow_insecure_http
-    trusted = (
-        original.hostname == redirect.hostname
-        or redirect.hostname == EARTHDATA_AUTH_HOST
-        or original.hostname == EARTHDATA_AUTH_HOST
-    )
-    if insecure or not trusted:
+    scheme, host, port = _endpoint(prepared_request.url)
+    _, tile_host, tile_port = _endpoint(tile_url or DEMSource.DEFAULT_BASE_URL)
+    secure = scheme == "https"
+    to_tile_host = host is not None and host == tile_host and port == tile_port
+    to_login_host = secure and host == EARTHDATA_AUTH_HOST and port == 443
+    if not (to_login_host or (to_tile_host and (secure or allow_insecure_http))):
         del headers["Authorization"]
 
 
@@ -130,29 +150,40 @@ class DEMSource(BaseSource):
         - "data": numpy array
         - "timestamp"
         - "topic": "images" for an img source
-        - "name": file name
+        - "name": tile name, e.g. "N37W122"
+        - "encoding": "16SC1" (int16 elevations in metres)
+        - "source_uri": cached tile path (None without cache_dir)
+
+        Tiles missing on the server (404, e.g. all-ocean cells) are skipped
+        with a warning.
         '''
 
         session_context = None
         session = None
-        credentials = None
         try:
             for n in range(self.north[0], self.north[-1]):
                 for w in range(self.west[0], self.west[-1]):
                     # SRTM tile names are zero-padded: 2-digit lat, 3-digit lon
                     name = self.tile_name(n, w)
-                    hgt_content = self._read_cached_hgt(name)
-                    if hgt_content is None:
+                    data = self._read_cached_tile(name)
+                    if data is None:
                         if session is None:
-                            session_context, session, credentials = self._open_session()
-                        hgt_content = self._download_hgt(session, credentials, name)
+                            session_context, session = self._open_session()
+                        hgt_content = self._download_hgt(session, name)
+                        if hgt_content is None:
+                            # No SRTM tile exists for all-ocean cells.
+                            _logger.warning("No DEM tile %s on the server (404); skipping it", name)
+                            continue
+                        # Validate before caching so a bad download is never trusted later.
+                        data = self._decode_hgt(hgt_content)
                         self._write_cached_hgt(name, hgt_content)
 
                     yield {
-                        "data": self._decode_hgt(hgt_content),
+                        "data": data,
                         "timestamp": 0,
                         "topic": "images",
                         "name": name,
+                        "encoding": "16SC1",
                         "source_uri": str(self._cache_path(name)) if self.cache_dir is not None else None,
                     }
         finally:
@@ -170,11 +201,15 @@ class DEMSource(BaseSource):
         session_context = requests.Session()
         session = session_context.__enter__() if hasattr(session_context, "__enter__") else session_context
         session.auth = (username, password)
-        # Earthdata login redirects through urs.earthdata.nasa.gov; keep the
-        # credentials only for that hop instead of re-sending them to whatever
-        # host the download finally redirects to.
-        session.rebuild_auth = partial(_rebuild_earthdata_auth, allow_insecure_http=self.allow_insecure_http)
-        return session_context, session, (username, password)
+        # Earthdata login redirects through urs.earthdata.nasa.gov; send the
+        # credentials only to that login host and the tile host, never to
+        # whatever host a redirect points at next.
+        session.rebuild_auth = partial(
+            _rebuild_earthdata_auth,
+            allow_insecure_http=self.allow_insecure_http,
+            tile_url=self.base_url,
+        )
+        return session_context, session
 
     def _tile_url(self, name: str) -> str:
         url = f"{self.base_url.rstrip('/')}/{name}.SRTMGL1.hgt.zip"
@@ -185,15 +220,27 @@ class DEMSource(BaseSource):
             )
         return url
 
-    def _download_hgt(self, session, credentials: tuple[str, str], name: str) -> bytes:
-        response = session.get(self._tile_url(name), timeout=self.timeout)
+    def _download_hgt(self, session, name: str) -> bytes | None:
+        """Raw HGT bytes of tile `name`; None when the server has no such tile (404)."""
+
+        url = self._tile_url(name)
+        response = session.get(url, timeout=self.timeout)
+        if getattr(response, "status_code", None) == 404:
+            return None
         response.raise_for_status()
-        with zipfile.ZipFile(BytesIO(response.content)) as zip_file:
-            return zip_file.read(f"{name}.hgt")
+        try:
+            with zipfile.ZipFile(BytesIO(response.content)) as zip_file:
+                return zip_file.read(f"{name}.hgt")
+        except zipfile.BadZipFile as exc:
+            raise ValueError(
+                f"DEM download from {url} is not a zip archive (check the Earthdata credentials)"
+            ) from exc
+        except KeyError as exc:
+            raise ValueError(f"DEM archive from {url} does not contain {name}.hgt") from exc
 
     def _decode_hgt(self, hgt_content: bytes) -> np.ndarray:
         side = int(np.sqrt(len(hgt_content) / 2))
-        if side * side * 2 != len(hgt_content):
+        if side == 0 or side * side * 2 != len(hgt_content):
             raise ValueError("HGT payload length does not describe a square int16 tile")
         # HGT samples are big-endian; return a native, writable int16 array.
         return np.frombuffer(hgt_content, dtype=">i2").astype(np.int16).reshape((side, side))
@@ -210,6 +257,18 @@ class DEMSource(BaseSource):
         if not path.exists():
             return None
         return path.read_bytes()
+
+    def _read_cached_tile(self, name: str) -> np.ndarray | None:
+        """Decoded cached tile; None when absent or corrupt (it is then downloaded again)."""
+
+        hgt_content = self._read_cached_hgt(name)
+        if hgt_content is None:
+            return None
+        try:
+            return self._decode_hgt(hgt_content)
+        except ValueError as exc:
+            _logger.warning("Ignoring corrupt cached DEM tile %s: %s", name, exc)
+            return None
 
     def _write_cached_hgt(self, name: str, hgt_content: bytes) -> None:
         if self.cache_dir is None:

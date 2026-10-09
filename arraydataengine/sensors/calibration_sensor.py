@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 
 from .base_sensor import BaseSensor
@@ -13,11 +15,26 @@ def _plain(value):
     return value
 
 
+def _message_fields(msg) -> list[str]:
+    """Field names of a deserialized message in definition order."""
+
+    if dataclasses.is_dataclass(msg):
+        names = [field.name for field in dataclasses.fields(msg)]
+    else:
+        slots = getattr(type(msg), "__slots__", None)
+        names = list(slots) if isinstance(slots, (list, tuple)) else []
+    # rosbags also stores constants (upper case) and __msgtype__ as fields.
+    return [name for name in names if not name.startswith("_") and not name.isupper()]
+
+
 class DepthAnythingCalibrationSensor(BaseSensor):
     """Convert mapeverything_msgs/DepthAnythingCalibration messages.
 
-    Used for payloads the dedicated CDR decoder cannot read (e.g. ROS1 bags);
-    produces the same array and `extra` fields as `decode_depth_anything_calibration`.
+    Used for payloads the dedicated CDR decoder cannot read (ROS1 bags) and for
+    rosbag2 recordings that embed the message definition, so newer schema
+    versions decode by field name. Produces the same array and `extra` fields
+    as `decode_depth_anything_calibration`, plus any additional scalar or
+    string body fields a newer definition adds.
     """
 
     def __init__(self, rawdata, msgtype, deserializer=None):
@@ -38,5 +55,12 @@ class DepthAnythingCalibrationSensor(BaseSensor):
             if hasattr(msg, name)
         }
         decoded = depth_anything_calibration_message(fields, ts, self.frame_id)
-        self.extra = decoded.extra
+        extra = dict(decoded.extra or {})
+        for name in _message_fields(msg):
+            if name == "header" or name in fields:
+                continue
+            value = _plain(getattr(msg, name, None))
+            if isinstance(value, (bool, int, float, str)):
+                extra.setdefault(name, value)
+        self.extra = extra
         return decoded.data, decoded.name, decoded.timestamp

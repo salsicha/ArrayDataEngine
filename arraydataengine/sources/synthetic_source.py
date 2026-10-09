@@ -23,8 +23,9 @@ class SyntheticSource:
     positions convert the trajectory to WGS84 around a reference coordinate.
 
     Message layouts match the ROS-backed sources: IMU messages are ``(6, 4)``
-    arrays, odometry ``(8, 4)``, point clouds ``(N, 3)``, navsat
-    ``[lat, lon, alt]``, images ``(H, W)`` float64.
+    arrays, odometry ``(8, 4)``, point clouds unpadded ``(N, 3)`` with a
+    ``point_count`` key (at most the topic's ``points``, exposed as
+    `max_points`), navsat ``[lat, lon, alt]``, images ``(H, W)`` float64.
 
     Args:
         topics: iterable of dicts with keys ``name``, ``kind``
@@ -56,6 +57,11 @@ class SyntheticSource:
                 raise ValueError(f"unsupported kind {kind!r}; expected one of {sorted(_SUPPORTED_KINDS)}")
             if topic["rate"] <= 0:
                 raise ValueError("topic rate must be positive")
+
+        # Largest point cloud any topic yields, so buffers can size storage
+        # (None when there are no point-cloud topics), like ROS sources.
+        cloud_sizes = [int(topic.get("points", 120)) for topic in self.topics if topic["kind"] == "pointcloud"]
+        self.max_points = max(cloud_sizes) if cloud_sizes else None
 
         rng = np.random.default_rng(self.seed)
         # Fixed world landmarks observed by every point-cloud scan.
@@ -123,12 +129,8 @@ class SyntheticSource:
         visible = local[in_range]
         if visible.shape[0] > points:
             visible = visible[:points]
-        visible = visible + rng.normal(0.0, 0.01, size=visible.shape)
-        # Buffers need a fixed per-topic message shape (like PointCloudSensor,
-        # which pads to max_points); zero-pad the scan to exactly `points`.
-        scan = np.zeros((points, 3), dtype=np.float64)
-        scan[: visible.shape[0]] = visible
-        return scan
+        # Like ROS sources, scans are unpadded; buffers pad internally.
+        return visible + rng.normal(0.0, 0.01, size=visible.shape)
 
     def _navsat_message(self, t: float) -> np.ndarray:
         from ..ops.nav import enu_to_navsat
@@ -201,6 +203,10 @@ class SyntheticSource:
             }
             if frame is not None:
                 message["frame_id"] = frame
+            if kind == "pointcloud":
+                message["point_count"] = int(data.shape[0])
+            elif kind == "image":
+                message["encoding"] = "64FC1"
             yield message
 
     def get_message(self):

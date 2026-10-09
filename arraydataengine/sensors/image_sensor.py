@@ -30,6 +30,78 @@ _CV_ENCODING = re.compile(r"(8|16|32|64)([usf])c(\d+)")
 # Raw Bayer mosaics are single-channel images.
 _BAYER_ENCODING = re.compile(r"bayer_(?:rggb|bggr|gbrg|grbg)(8|16)")
 _CV_KINDS = {"u": "u", "s": "i", "f": "f"}
+# Colour encodings returned in RGB(A) order: source encoding -> returned encoding.
+_TO_RGB = {
+    "bgr8": "rgb8",
+    "bgr": "rgb8",
+    "rgb": "rgb8",
+    "bgr16": "rgb16",
+    "bgra8": "rgba8",
+    "bgra16": "rgba16",
+}
+_NAMED_ARRAY_ENCODINGS = {
+    (np.dtype(np.uint8), 1): "mono8",
+    (np.dtype(np.uint8), 3): "rgb8",
+    (np.dtype(np.uint8), 4): "rgba8",
+    (np.dtype(np.uint16), 1): "mono16",
+    (np.dtype(np.uint16), 3): "rgb16",
+    (np.dtype(np.uint16), 4): "rgba16",
+}
+_CV_DEPTHS = {"u": "U", "i": "S", "f": "F"}
+
+
+def canonical_encoding(encoding: str) -> str:
+    """Normalized encoding name: OpenCV-style upper case (``32FC1``), others lower case."""
+
+    key = str(encoding).strip().lower()
+    if _CV_ENCODING.fullmatch(key):
+        return key.upper()
+    return key
+
+
+def array_encoding(image, color_order: str = "rgb") -> str:
+    """sensor_msgs-style encoding describing an image array as returned.
+
+    uint8/uint16 arrays with 1, 3, or 4 channels are ``mono8``/``rgb8``/
+    ``rgba8`` (``mono16``/``rgb16``/``rgba16``; ``bgr*`` when `color_order`
+    is "bgr"); anything else uses the OpenCV form, e.g. ``32FC1``.
+    """
+
+    array = np.asarray(image)
+    channels = 1 if array.ndim == 2 else int(array.shape[-1])
+    named = _NAMED_ARRAY_ENCODINGS.get((array.dtype.newbyteorder("="), channels))
+    if named is not None:
+        if color_order == "bgr" and channels in (3, 4):
+            named = named.replace("rgb", "bgr")
+        return named
+    kind = _CV_DEPTHS.get(array.dtype.kind)
+    if kind is None:
+        raise ValueError(f"No image encoding for dtype {array.dtype}")
+    return f"{array.dtype.itemsize * 8}{kind}C{channels}"
+
+
+_CV_COLOR_DTYPES = (np.dtype(np.uint8), np.dtype(np.uint16), np.dtype(np.float32))
+
+
+def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
+    """New array with the colour channels of a BGR or BGRA image swapped (alpha stays last).
+
+    Arrays that are not 3- or 4-channel images are returned unchanged.
+    """
+
+    if image.ndim != 3 or image.shape[-1] not in (3, 4):
+        return image
+    if image.dtype in _CV_COLOR_DTYPES:
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+        if cv2 is not None:
+            # ~20x faster than a NumPy channel gather on large frames.
+            code = cv2.COLOR_BGR2RGB if image.shape[-1] == 3 else cv2.COLOR_BGRA2RGBA
+            return cv2.cvtColor(np.ascontiguousarray(image), code)
+    order = [2, 1, 0] if image.shape[-1] == 3 else [2, 1, 0, 3]
+    return np.ascontiguousarray(image[..., order])
 
 
 def image_encoding_layout(encoding: str) -> tuple[np.dtype, int]:
@@ -57,12 +129,16 @@ def image_encoding_layout(encoding: str) -> tuple[np.dtype, int]:
 
 
 class ImageSensor(BaseSensor):
-    """Image Sensor Class
-    Attributes:
-    Args:
-    Returns:
+    """Convert sensor_msgs/Image messages to arrays.
+
+    Colour images are returned in RGB(A) channel order (``bgr8``/``bgra8``/
+    ``bgr16``/``bgra16`` are converted); `extra["encoding"]` names the
+    returned layout, e.g. ``rgb8``, ``mono16``, or ``32FC1``.
     """
 
+    def __init__(self, rawdata, msgtype, deserializer=None):
+        super().__init__(rawdata, msgtype, deserializer=deserializer)
+        self.extra: dict | None = None
 
     def numpyify(self) -> tuple:
         msg = self.deserialize()
@@ -105,4 +181,10 @@ class ImageSensor(BaseSensor):
         else:
             npified = data.reshape((msg.height, msg.width, channels))
 
+        encoding = canonical_encoding(msg.encoding)
+        if encoding in _TO_RGB:
+            if encoding.startswith("bgr"):
+                npified = bgr_to_rgb(npified)
+            encoding = _TO_RGB[encoding]
+        self.extra = {"encoding": encoding}
         return npified, msg.__class__.__name__, ts

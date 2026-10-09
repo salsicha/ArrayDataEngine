@@ -137,9 +137,10 @@ def test_pointcloud_sensor_pads_points_and_rejects_oversized_clouds(monkeypatch)
 
     assert name == "PointCloud2"
     assert ts == 3.5
-    assert npified.shape == (4, 3)
-    assert np.allclose(npified[:2], xyz)
-    assert np.allclose(npified[2:], np.zeros((2, 3), dtype=np.float32))
+    # Clouds are no longer zero-padded to max_points; buffers pad internally.
+    assert npified.shape == (2, 3)
+    assert np.allclose(npified, xyz)
+    assert sensor.point_count == 2
 
     oversized = PointCloudSensor(rawdata=b"", msgtype="sensor_msgs/msg/PointCloud2", max_points=1)
     with patch.object(PointCloudSensor, "deserialize", return_value=msg):

@@ -14,8 +14,12 @@ DEPTH_ANYTHING_CALIBRATION_TYPE = "mapeverything_msgs/msg/DepthAnythingCalibrati
 
 # Types with a dedicated (rosbags-free) CDR decoder in this module.
 CDR_DECODED_TYPES = frozenset(
-    {POSE_STAMPED_TYPE, POINTCLOUD2_TYPE, DEPTH_ANYTHING_CALIBRATION_TYPE}
+    {POSE_STAMPED_TYPE, NAVSATFIX_TYPE, POINTCLOUD2_TYPE, DEPTH_ANYTHING_CALIBRATION_TYPE}
 )
+# Non-standard types whose definition may change between recordings: when a
+# bag embeds a definition, decoding by that definition beats the fixed field
+# order of the dedicated decoder.
+CUSTOM_CDR_TYPES = frozenset({DEPTH_ANYTHING_CALIBRATION_TYPE})
 # Types decode_rosbridge_json_message understands; CompressedImage also needs cv2.
 JSON_DECODED_TYPES = frozenset(
     {POSE_STAMPED_TYPE, NAVSATFIX_TYPE, POINTCLOUD2_TYPE, DEPTH_ANYTHING_CALIBRATION_TYPE}
@@ -88,8 +92,14 @@ class CDRReader:
     def read_bool(self) -> bool:
         return bool(self.read("?", 1))
 
+    def read_int8(self) -> int:
+        return int(self.read("b", 1))
+
     def read_uint8(self) -> int:
         return int(self.read("B", 1))
+
+    def read_uint16(self) -> int:
+        return int(self.read("H", 2))
 
     def read_int32(self) -> int:
         return int(self.read("i", 4))
@@ -131,18 +141,19 @@ def json_type_supported(msgtype: str) -> bool:
     return msgtype in JSON_DECODED_TYPES
 
 
+def cdr_decoder(msgtype: str):
+    """The dedicated CDR decoder function for `msgtype`, or None."""
+
+    return _CDR_DECODERS.get(msgtype)
+
+
 def decode_supported_cdr_message(rawdata: bytes, msgtype: str) -> DecodedMessage | None:
     # Bags recorded through rosbridge/foxglove can carry JSON envelopes
     # instead of CDR; route those to the JSON decoder.
     if _looks_like_json(rawdata):
         return decode_rosbridge_json_message(rawdata, msgtype)
-    if msgtype == POSE_STAMPED_TYPE:
-        return decode_pose_stamped(rawdata)
-    if msgtype == POINTCLOUD2_TYPE:
-        return decode_pointcloud2(rawdata)
-    if msgtype == DEPTH_ANYTHING_CALIBRATION_TYPE:
-        return decode_depth_anything_calibration(rawdata)
-    return None
+    decoder = _CDR_DECODERS.get(msgtype)
+    return None if decoder is None else decoder(rawdata)
 
 
 _JSON_LEADING_BYTES = frozenset(b"{ \t\r\n")
@@ -180,17 +191,23 @@ def _json_bytes(value) -> bytes:
 
 
 def decode_rosbridge_json_message(rawdata: bytes, msgtype: str) -> DecodedMessage | None:
-    """Decode a rosbridge-style JSON envelope ({"op": "publish", "msg": ...})."""
+    """Decode a rosbridge-style JSON envelope ({"op": "publish", "msg": ...}).
 
+    Returns None for message types without a JSON decoder and raises
+    ValueError for malformed envelopes.
+    """
+
+    if msgtype not in JSON_DECODED_TYPES and msgtype != COMPRESSED_IMAGE_TYPE:
+        return None
     try:
-        envelope = json.loads(rawdata.decode(errors="replace"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        envelope = json.loads(bytes(rawdata).decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Malformed rosbridge JSON payload: {exc}") from exc
     if not isinstance(envelope, dict):
-        return None
+        raise ValueError("Malformed rosbridge JSON payload: expected an object")
     msg = envelope.get("msg", envelope)
     if not isinstance(msg, dict):
-        return None
+        raise ValueError("Malformed rosbridge JSON payload: 'msg' is not an object")
 
     header = msg.get("header")
     if not isinstance(header, dict):
@@ -217,6 +234,8 @@ def decode_rosbridge_json_message(rawdata: bytes, msgtype: str) -> DecodedMessag
         return DecodedMessage(values, "PoseStamped", timestamp, frame_id)
 
     if msgtype == NAVSATFIX_TYPE:
+        from ..sensors.nav_sensor import navsat_extra
+
         values = np.array(
             [
                 float(msg.get("latitude", 0.0)),
@@ -225,7 +244,12 @@ def decode_rosbridge_json_message(rawdata: bytes, msgtype: str) -> DecodedMessag
             ],
             dtype=np.float64,
         )
-        return DecodedMessage(values, "NavSatFix", timestamp, frame_id)
+        status = msg.get("status")
+        status = status.get("status") if isinstance(status, dict) else None
+        extra = navsat_extra(
+            None if status is None else int(status), msg.get("position_covariance")
+        )
+        return DecodedMessage(values, "NavSatFix", timestamp, frame_id, extra)
 
     if msgtype == POINTCLOUD2_TYPE:
         fields = [dict(field) for field in msg.get("fields", [])]
@@ -241,12 +265,18 @@ def decode_rosbridge_json_message(rawdata: bytes, msgtype: str) -> DecodedMessag
         return DecodedMessage(points, "PointCloud2", timestamp, frame_id)
 
     if msgtype == COMPRESSED_IMAGE_TYPE:
-        from ..sensors.compressed_image_sensor import compressed_image_available, decode_compressed_image
+        from ..sensors.compressed_image_sensor import (
+            compressed_image_available,
+            decode_compressed_image_with_encoding,
+        )
 
         if not compressed_image_available():
             return None
-        image = decode_compressed_image(_json_bytes(msg.get("data", "")))
-        return DecodedMessage(image, "CompressedImage", timestamp, frame_id)
+        fmt = msg.get("format")
+        image, encoding = decode_compressed_image_with_encoding(
+            _json_bytes(msg.get("data", "")), fmt if isinstance(fmt, str) else None
+        )
+        return DecodedMessage(image, "CompressedImage", timestamp, frame_id, {"encoding": encoding})
 
     if msgtype == DEPTH_ANYTHING_CALIBRATION_TYPE:
         return depth_anything_calibration_message(msg, timestamp, frame_id)
@@ -309,6 +339,21 @@ def decode_pose_stamped(rawdata: bytes) -> DecodedMessage:
         dtype=np.float64,
     )
     return DecodedMessage(pose, "PoseStamped", timestamp, frame_id)
+
+
+def decode_navsatfix(rawdata: bytes) -> DecodedMessage:
+    from ..sensors.nav_sensor import navsat_extra
+
+    reader = CDRReader(rawdata)
+    timestamp, frame_id = decode_header(reader)
+    status = reader.read_int8()
+    reader.read_uint16()  # service
+    values = np.array(
+        [reader.read_float64(), reader.read_float64(), reader.read_float64()], dtype=np.float64
+    )
+    covariance = [reader.read_float64() for _ in range(9)]
+    reader.read_uint8()  # position_covariance_type
+    return DecodedMessage(values, "NavSatFix", timestamp, frame_id, navsat_extra(status, covariance))
 
 
 def decode_depth_anything_calibration(rawdata: bytes) -> DecodedMessage:
@@ -398,9 +443,8 @@ def pointcloud_xyz(
     output_dtype = np.result_type(np.float32, *(dtype.newbyteorder("=") for _, dtype in layout))
 
     point_count = height * width
-    output = np.empty((point_count, 3), dtype=output_dtype)
     if point_count == 0:
-        return output
+        return np.empty((0, 3), dtype=output_dtype)
 
     if point_step <= 0:
         raise ValueError(f"PointCloud2 point_step must be positive for {point_count} points, got {point_step}")
@@ -430,6 +474,9 @@ def pointcloud_xyz(
             f"for {height}x{width} points with point_step {point_step}"
         )
 
+    # Allocate only after the header is known to match the payload, so a
+    # corrupt height/width cannot request an enormous array.
+    output = np.empty((point_count, 3), dtype=output_dtype)
     for column, (offset, dtype) in enumerate(layout):
         if padded_rows:
             values = np.ndarray(
@@ -449,6 +496,14 @@ def pointcloud_xyz(
             )
         output[:, column] = values
     return output
+
+
+_CDR_DECODERS = {
+    POSE_STAMPED_TYPE: decode_pose_stamped,
+    NAVSATFIX_TYPE: decode_navsatfix,
+    POINTCLOUD2_TYPE: decode_pointcloud2,
+    DEPTH_ANYTHING_CALIBRATION_TYPE: decode_depth_anything_calibration,
+}
 
 
 def point_field_dtype(datatype: int, byteorder: str) -> np.dtype:

@@ -7,6 +7,24 @@ from numbers import Real
 AnyReader = None
 
 
+class _LowerSuffixPath(type(Path())):
+    """Path whose `suffix` is lower case.
+
+    rosbags picks the bag format from the exact suffix (".bag", ".mcap",
+    ".db3"); this lets it open files named e.g. ``REC.BAG`` or ``REC.MCAP``.
+    """
+
+    @property
+    def suffix(self):
+        return super().suffix.lower()
+
+
+def rosbags_path(path) -> Path:
+    path = Path(path)
+    suffix = path.suffix
+    return path if suffix == suffix.lower() else _LowerSuffixPath(path)
+
+
 def accepts_parameter(func, name: str) -> bool:
     """True when `func` can be called with keyword argument `name`."""
 
@@ -75,7 +93,7 @@ class BaseSource:
             from rosbags.highlevel import AnyReader as Reader
 
             AnyReader = Reader
-        paths = [Path(path) for path in (paths if paths is not None else [self.data_path])]
+        paths = [rosbags_path(path) for path in (paths if paths is not None else [self.data_path])]
         if accepts_parameter(AnyReader, "default_typestore"):
             # rosbag2 recordings made with Humble or older embed no message
             # definitions; AnyReader needs a default typestore to decode them.
@@ -87,12 +105,19 @@ class BaseSource:
     def clear_metadata_cache(self) -> None:
         self._metadata_cache = None
 
-    def _connection_supported(self, connection) -> bool:
+    def _connection_supported(self, connection, formats: dict | None = None) -> bool:
         """Whether get_topics/get_count should report this reader connection."""
 
         return True
 
-    def _reader_metadata(self, reader_context=None) -> dict:
+    def _reader_metadata(self, reader_context=None, formats: dict | None = None) -> dict:
+        """Topics, counts, and time range of a rosbags reader.
+
+        `formats` maps topics to the serialization format stored in the bag's
+        storage files (see RosSource). The end time is the latest message's
+        log time (rosbags reports one nanosecond past it).
+        """
+
         topics = []
         counts = {}
         types = {}
@@ -104,7 +129,7 @@ class BaseSource:
                 msgtype = getattr(connection, "msgtype", None)
                 if isinstance(msgtype, str):
                     types.setdefault(connection.topic, msgtype)
-                if not self._connection_supported(connection):
+                if not self._connection_supported(connection, formats):
                     continue
                 topic = connection.topic
                 if topic not in counts:
@@ -114,6 +139,15 @@ class BaseSource:
 
             start = getattr(reader, "start_time", None)
             end = getattr(reader, "end_time", None)
+
+        if isinstance(start, Real) and isinstance(end, Real):
+            if end > start:
+                # rosbags' end_time is one nanosecond after the latest message;
+                # match the SQLite reader, which reports the latest log time.
+                end -= 1
+            elif end < start:
+                # rosbags reports (2**63 - 1, 0) for recordings without messages.
+                start = end = None
 
         return {
             "topics": topics,
