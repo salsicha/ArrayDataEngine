@@ -787,4 +787,17 @@ docker compose up jupyter
 Jupyter uses `JUPYTER_TOKEN` from your environment when it is set; otherwise it
 generates a token and prints the login URL (`docker compose logs jupyter`).
 
-Notebook examples live in `notebooks/`.
+Notebook examples live in `notebooks/`. They run offline out of the box on the example recording (`example/mapeverything_0.db3`), `SyntheticSource`, or seeded synthetic data, and each has a configuration cell near the top whose `ADE_*` environment variables point it at your own recordings, image folders, or DEM tiles. Files they generate go under `__`-prefixed paths, which git ignores.
+
+| Notebook | Shows |
+| --- | --- |
+| `demo.ipynb` | Tour of the library: lidar ICP and mapping, image sequences, INS trajectories, DEM terrain, IR beacon detection |
+| `circular_buffer.ipynb` | Rolling `DataBuffer` windows, time and index slices, variable-size scans |
+| `iterator_example.ipynb` | Reading messages, `get_data`, lazy topic and source pipelines, alignment |
+| `bag_to_TileDB.ipynb` | Persisting a recording to TileDB, reopening it, and training a small PyTorch model from it |
+| `loam_example.ipynb` | Scan-to-scan and scan-to-map ICP against the recorded poses, HTML map viewer |
+| `ins.ipynb` | IMU/odometry/NavSat trajectories, gravity and bias correction, dead reckoning |
+| `mot.ipynb` | Segmentation and IoU tracking on a synthetic video, CLEAR-MOT scores |
+| `dem.ipynb` | SRTM tiles (offline synthetic cache by default), mosaics, terrain analysis, lat/lon sampling |
+| `tiff.ipynb`, `pulsed_encoded_beacons.ipynb` | Thermal (LWIR) frame registration and blinking-beacon detection by frequency |
+| `mlp.ipynb` | A small PyTorch classifier fed through the ML helpers (CIFAR-10 optional) |

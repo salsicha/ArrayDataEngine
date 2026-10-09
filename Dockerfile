@@ -48,20 +48,6 @@ RUN mkdir /dataengine
 COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
 
-## ros2_numpy
-# The arraydataengine package does not use it; it is kept for the notebooks
-# (notebooks/iterator_example.ipynb imports it). The source is pinned to the
-# commit of tag v2.0.12-jazzy and the checkout is verified against that hash,
-# so a moved tag or a tampered download fails the build.
-ARG ROS2_NUMPY_COMMIT=d5ebf723e1d2457d36fa89bf021b212e340c3c11
-RUN . /opt/ros/$ROS2_DISTRO/setup.bash && . /venv/bin/activate && \
-    git init -q /tmp/ros2_numpy && cd /tmp/ros2_numpy && \
-    git fetch -q --depth 1 https://github.com/Box-Robotics/ros2_numpy.git "$ROS2_NUMPY_COMMIT" && \
-    git checkout -q --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = "$ROS2_NUMPY_COMMIT" && \
-    mkdir build && cd build && cmake .. && make install && \
-    cd / && rm -rf /tmp/ros2_numpy
-
 WORKDIR /dataengine
 
 COPY arraydataengine /dataengine/arraydataengine

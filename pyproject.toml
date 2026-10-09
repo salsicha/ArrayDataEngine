@@ -45,7 +45,6 @@ arrow = [
     "pyarrow",
 ]
 dem = [
-    "rasterio",
     "requests",
 ]
 dev = [
@@ -68,7 +67,6 @@ ros = [
 ]
 tiledb = [
     "tiledb",
-    "tiledb-ml",
 ]
 visualization = [
     "ipython",

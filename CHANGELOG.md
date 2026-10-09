@@ -53,6 +53,10 @@ registry release.
 
 ### Changed
 
+- The notebooks were rewritten for the current API. They run offline on the
+  example recording, `SyntheticSource`, or seeded synthetic data, take their
+  own data through `ADE_*` settings, and no longer hard-code dataset paths or
+  credentials.
 - Every ROS read path returns the same messages: short type names, log-time
   fallback for zero stamps, and point clouds at their real size `(N, 3)` with
   non-finite rows dropped, in the field dtype (float64 stays float64). There is
@@ -109,6 +113,8 @@ registry release.
 ### Removed
 
 - Unused `TopicSource` and `ros2_numpy`-based sensor code paths.
+- `ros2_numpy` from the Docker image, and `rasterio` and `tiledb-ml` from the
+  `dem` and `tiledb` extras; nothing uses them any more.
 
 ### Fixed
 
@@ -220,6 +226,10 @@ registry release.
   smoothing keeps NaN rows NaN; `image_gradients` axes, `transform_odometry`
   covariances, and DEM nearest-sample ties are correct; `split_topic` and
   `iter_ml_windows` keep `lengths` and frame IDs.
+- Scalar out-of-range or NaN queries to `sample_grid` and the elevation
+  samplers return NaN instead of raising; `visualizers.dem.VisTool.merge_geotiffs`
+  keeps shared SRTM edges once; the video `VisTool` no longer opens an empty
+  figure when created.
 - `ade` refuses to resume a store from a different recording, gives one-line
   errors for corrupt, empty, or Git LFS pointer recordings and unwritable
   outputs, exits 130 on Ctrl-C, parses `ADE_DEBUG` values, and lists topics it

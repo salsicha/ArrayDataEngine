@@ -757,14 +757,15 @@ def test_check_dist_requires_the_ade_console_script(tmp_path, monkeypatch, entry
         assert any(expected in error for error in errors), errors
 
 
-def test_dockerfile_copies_license_and_pins_ros2_numpy():
+def test_dockerfile_copies_license_and_skips_unverified_downloads():
     dockerfile = (ROOT / "Dockerfile").read_text()
     copy_lines = [line for line in dockerfile.splitlines() if line.startswith("COPY ")]
     assert any("LICENSE" in line.split() for line in copy_lines)
     assert "archive/refs/tags" not in dockerfile and ".zip" not in dockerfile
-    commit = re.search(r"ROS2_NUMPY_COMMIT=([0-9a-f]{40})\b", dockerfile)
-    assert commit, "ros2_numpy must be pinned to a full commit hash"
-    assert 'test "$(git rev-parse HEAD)" = "$ROS2_NUMPY_COMMIT"' in dockerfile
+    # Nothing (package or notebooks) uses ros2_numpy any more, so the image
+    # neither builds it nor sources its setup script.
+    assert "ros2_numpy" not in dockerfile
+    assert "ros2_numpy" not in (ROOT / "entrypoint.sh").read_text()
 
 
 def _workflow(name: str) -> dict:

@@ -22,16 +22,11 @@ cvxopt
 rosbags
 rosbags-dataframe
 rosbags-image
-pycocotools
-ultralytics
-wandb
 cryptography
 pyopenssl
 torch
 torchvision
-rasterio
 tiledb
-tiledb-ml
 rosdep
 colcon-common-extensions
 lark
