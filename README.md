@@ -84,7 +84,7 @@ ade demo -o demo/                 # end-to-end synthetic showcase, no data neede
                                   # stitched point-cloud map (HTML), TUM trajectory, NPZ export
 ade info my_bag.db3 --messages 500   # topics, counts, duration, rates, jitter
 ade topics my_bag.db3
-ade export my_bag.db3 -t /points -o points.npz
+ade export my_bag.db3 -t /points -o points.npz   # or -o exports/ for exports/points.npz
 ade viewer my_bag.db3 -t /points -o viewer.html --stride 5
 ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by default, --backend tiledb)
 ```
@@ -96,18 +96,31 @@ Standalone SQLite recordings (`.db3`, or a single SQLite `.bag`) are read with
 the built-in decoder and need no extras; ROS 1 bags, MCAP files, and split
 rosbag2 directories require the `ros` extra. `ade ingest` also requires the
 extra for its storage backend: new stores default to `arrow`, while an existing
-output store is reopened with the backend it was written with (`--backend`
-overrides this, and non-store directories are refused). Missing files, unsupported
-message types, and missing extras are reported as one-line errors with an install
-hint; pass `--debug` (or set `ADE_DEBUG=1`) for a full traceback.
+output store is reopened with the backend it was written with. A `--backend`
+that doesn't match an existing store, and any non-empty directory that isn't
+a store, are refused.
+
+Point clouds of any size are read by default. `--max-points N` (on `info`,
+`topics`, `export`, `viewer`, and `ingest`) skips clouds with more than N
+points, and the command says so when every message of a topic was skipped.
+`ade export` zero-pads variable-size clouds to the largest exported cloud and
+stores the real row counts in the archive's `lengths` array. `ade ingest`
+stores up to `--max-points` rows per cloud (30000 when omitted). It records the
+recording it read in the store's `ade_source.json`, and refuses to resume the
+store from a different recording or with a different `--max-points`
+(`--force` appends anyway). `ade info` also lists topics it cannot decode and
+the extra they need. Missing, empty, corrupt, or Git LFS pointer recordings,
+unsupported message types, unwritable outputs, and missing extras are reported
+as one-line errors (exit status 2; Ctrl-C exits with 130). Pass `--debug`
+(before or after the subcommand) or set `ADE_DEBUG=1` for a full traceback.
 
 ## Supported Sources
 
 | Input | Adapter | Topic(s) | Notes |
 | --- | --- | --- | --- |
-| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob. |
+| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob (a literal path containing `[` or `*` also works). Colour images are RGB; pass `color_order="bgr"` for OpenCV's order. |
 | `.bag` | `BagSource` | Bag topics | ROS1 bags with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. SQLite rosbag2 files named `.bag` are routed to `DB3Source`. |
-| `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. Bags without embedded message definitions (Humble and older) are supported. rosbridge/foxglove JSON payloads are decoded for PoseStamped, NavSatFix, PointCloud2, CompressedImage, and DepthAnything calibration messages. |
+| `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. Bags without embedded message definitions (Humble and older) are supported. rosbridge/foxglove JSON payloads are decoded for PoseStamped, NavSatFix, PointCloud2, CompressedImage, and DepthAnything calibration messages; the serialization format recorded in the `.db3` takes precedence over `metadata.yaml`. `compressed_depth_image_transport` (`compressedDepth`) images are decoded too. |
 | `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles over HTTPS using Earthdata credentials. |
 | `SyntheticSource` | (import directly) | configurable | Deterministic synthetic IMU/odometry/point-cloud/navsat/image streams on a circular trajectory. |
 
@@ -122,7 +135,7 @@ Each yielded message has this shape:
 }
 ```
 
-ROS messages also carry `frame_id` (from the message header). The `name` of a ROS message is its short type name, such as `PointCloud2`. Point clouds drop non-finite points and are zero-padded to a fixed `(max_points, 3)` array (default 30000, set it with `DataSources(path, max_points=...)`), keeping the field dtype. Their messages also carry `point_count`, the number of real points. Scans larger than `max_points`, and messages that fail to decode, are skipped with a logged warning. `get_topics()` and `get_count()` only report topics whose message type can be decoded.
+ROS messages also carry `frame_id` (from the message header). The `name` of a ROS message is its short type name, such as `PointCloud2`. Point clouds drop non-finite points and are yielded at their real size as an `(N, 3)` array in the field dtype, with `point_count` (= N) on the message. Pass `DataSources(path, max_points=...)` to skip scans larger than a limit (there is none by default). Messages that fail to decode are skipped with a logged warning. Every source yields colour images as RGB (or RGBA), and image messages carry an `encoding` key such as `rgb8`, `mono16`, or `32FC1`. NavSatFix messages also carry `status` (`-1` means no fix) and a 3×3 `position_covariance`. `get_topics()` and `get_count()` only report topics whose message type can be decoded, and `DataSources(path, topics=[...])` decodes only the topics you name.
 
 ## Quick Start
 
@@ -213,15 +226,15 @@ Time ranges are inclusive and return the same `{"id", "ts", "data"}` shape for i
 The `arraydataengine.ops` package provides NumPy-first helpers for common robotics data operations. They work on topic arrays returned by `DataBuffer.get_buffer()`, `get_time_range()`, and `get_last_seconds()`.
 
 ```python
-from arraydataengine.ops import map_topic, random_downsample, select_time_range, voxel_downsample
+from arraydataengine.ops import map_topic, random_downsample, select_time_range, topic_view, voxel_downsample
 
 window = buffer.get_buffer()
 images = select_time_range(window["images"], start=12.0, end=12.5)
 normalized = map_topic(images, lambda frame: frame.astype("float32") / 255.0)
 
-points = window["/points"]["data"][-1]
+points = topic_view(window["/points"]).rows()[-1]  # latest scan, without storage padding
 reduced_points = voxel_downsample(points, voxel_size=0.25)
-preview_points = random_downsample(points, count=10_000, seed=42)
+preview_points = random_downsample(points, count=min(10_000, len(points)), seed=42)
 ```
 
 Image and depth sequences can be resized, cropped, padded, normalized, color-converted, dtype-converted, backprojected, converted to normals, motion-aligned, and fused as NumPy stacks.
@@ -265,13 +278,13 @@ distances, indices, counts = hybrid_search(points, query_points, radius=0.5, max
 components = connected_components(points, radius=0.5, min_component_size=20)
 ground, obstacles, ground_mask = segment_ground(points, distance_threshold=0.15)
 registration = multi_scale_icp(scan_a, scan_b, voxel_sizes=(1.0, 0.5, 0.25))
-open3d_cloud = to_open3d_point_cloud(points, color_columns=(3, 4, 5))
+open3d_cloud = to_open3d_point_cloud(colored_points, color_columns=(3, 4, 5))  # x, y, z, r, g, b columns
 
 closures = verify_loop_closures(point_cloud_sequence, trajectory, radius=3.0, min_separation=60, voxel_size=0.25)
 scale_calibration, metric_points = calibrate_point_cloud_metric_scale(relative_points, lidar_points, return_adjusted=True)
 ```
 
-Registration metrics are always gated: `fitness` is the fraction of finite source points with a target correspondence within the gating distance, and `inlier_rmse` is the point-to-point RMSE of those inliers for every ICP method. `verify_loop_closures` uses `max_correspondence_distance` when given; otherwise it gates at 2×`voxel_size`, or at 3× the target cloud's median point spacing, so unrelated scans are rejected. Nearest-neighbour searches use `scipy.spatial.cKDTree` when SciPy is installed and a memory-bounded chunked search otherwise. Non-finite points are ignored, and per-point outputs such as normals return NaN for them.
+Registration metrics are always gated: `fitness` is the fraction of finite source points with a target correspondence within the gating distance, and `inlier_rmse` is the point-to-point RMSE of those inliers for every ICP method. `verify_loop_closures` uses `max_correspondence_distance` when given. Otherwise it scores fitness at 2×`voxel_size`, or at 3× the target cloud's median point spacing, so unrelated scans are rejected. It first registers coarse to fine (5×, √5× and 1× that gate) so ordinary odometry drift still converges; pass an explicit gate when the seed may be off by much more than about 15× the point spacing. Nearest-neighbour searches use `scipy.spatial.cKDTree` when SciPy is installed and a memory-bounded chunked search otherwise. Non-finite points are ignored, and per-point outputs such as normals return NaN for them.
 
 SE(3) coordinate-frame helpers work across common robotics arrays:
 
@@ -320,7 +333,7 @@ rendered_depth = points_to_depth_image(points_in_camera, image_shape=rgb_image.s
 dem_pixels, dem_mask = project_dem_to_image(elevation, fx=525.0, fy=525.0, cx=319.5, cy=239.5, image_shape=rgb_image.shape[:2])
 ```
 
-`colorize_points`, `sample_image_at_points`, `points_to_depth_image`, and `rgbd_to_points` accept `distortion=` for raw (unrectified) images. Undistortion iterates to a tolerance (`iterations=50`, `tolerance=1e-12` by default), and distorted projection marks points beyond the lens model's fold radius as not visible instead of wrapping them back into the image.
+`colorize_points`, `sample_image_at_points`, `points_to_depth_image`, and `rgbd_to_points` accept `distortion=` for raw (unrectified) images. Undistortion iterates to a tolerance (`iterations=50`, `tolerance=1e-12` by default) and falls back to a damped Newton solve where OpenCV's fixed-point iteration does not converge. Points with no valid solution, or beyond the lens model's fold radius, come back as NaN. Distorted projection likewise marks points beyond the fold radius as not visible instead of wrapping them back into the image.
 
 Crop/select helpers cover row masks, axis-aligned bounds, oriented 3D bounds, and geographic bounding boxes.
 
@@ -333,7 +346,7 @@ vehicle_box = crop_oriented_bounds(points, center=pose_xyz, extent=[8.0, 4.0, 3.
 gps_window = crop_geographic_bounds(gps_samples, min_lat=36.9, min_lon=-122.3, max_lat=37.8, max_lon=-121.7)
 ```
 
-IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing. NavSat conversions use exact WGS84 geodetic/ECEF/ENU math and wrap longitudes across ±180°; the default local reference is the first finite sample with a valid fix. `odometry_to_trajectory` rotates the ROS body-frame twist into the odometry parent frame (pass `twist_frame="parent"` if yours is already world-frame), so `dead_reckon_trajectory` integrates it with its default world-frame velocity. IMU and odometry samples without an orientation (all-zero quaternion or `orientation_covariance[0] == -1`) become NaN rows instead of raising, and the nav helpers accept `DataBuffer.get_buffer()` topic arrays directly.
+IMU, odometry, and NavSat arrays can be normalized into one trajectory representation with `pose` as `[x, y, z, qx, qy, qz, qw]` and `trajectory` as pose plus linear and angular velocity. Resampling uses SLERP for orientation and linear interpolation for position, velocity, acceleration, and covariance fields. Quaternion/Euler conversion, gravity compensation, bias correction, WGS84-to-local ENU/NED conversions, trajectory smoothing, differentiation, integration, dead reckoning, covariance propagation, and quality/status masks cover common navigation preprocessing. NavSat conversions use exact WGS84 geodetic/ECEF/ENU math and wrap longitudes across ±180°; the default local reference is the first finite sample with a valid fix. `odometry_to_trajectory` rotates the ROS body-frame twist into the odometry parent frame (pass `twist_frame="parent"` if yours is already world-frame), so `dead_reckon_trajectory` integrates it with its default world-frame velocity. IMU and odometry samples without an orientation (all-zero quaternion or `orientation_covariance[0] == -1`) become NaN rows instead of raising, and the nav helpers accept `DataBuffer.get_buffer()` topic arrays directly. `pose_to_trajectory` (or `sensor_to_trajectory(kind="pose")`) converts PoseStamped `[x, y, z, qx, qy, qz, qw]` topics.
 
 ```python
 from arraydataengine.ops import (
@@ -475,6 +488,10 @@ normalized = buffer.map_topic("images", lambda frame: frame.astype("float32") / 
 recent_windows = list(buffer.window_topic("images", size=5))
 ```
 
+Row functions passed to `map`, `filter`, and `reduce` receive the row's data. They also receive its timestamp and message id as extra positional arguments, but only when they ask for them. That means either parameters named like a timestamp (`ts`, `t`, `time`, `timestamp`, `stamp`) and an id (`id`, `message_id`, `name`, `idx`, `i`), or a plain function or lambda of your own with two or three required positional parameters, such as `lambda frame, ts: ...`. NumPy ufuncs, `functools.partial` objects, `operator.itemgetter`, and the library's own operations always receive just the data. Bind extra arguments explicitly: `view.map(functools.partial(voxel_downsample, voxel_size=0.1))`. Calling `map(voxel_downsample)` raises a `TypeError` instead of silently using a timestamp as the voxel size.
+
+Variable-size rows, such as point clouds of different sizes, are stored zero-padded to a per-topic capacity together with each row's real length. Results then carry a `lengths` array next to the padded `data`. Row functions always receive trimmed rows, and `TopicView.rows()` / `topic_rows(result)` return them as a list.
+
 ML-ready helpers turn lazy topic windows into plain iterator datasets, materialized NumPy datasets, or optional PyTorch datasets. They also provide deterministic split helpers, lightweight augmentations, and padding collation for mixed-rate windows and variable-size point clouds.
 
 ```python
@@ -506,16 +523,9 @@ Use `source_pipeline()` when you want operations to run while messages stream fr
 ```python
 import json
 
-import numpy as np
+from functools import partial
 
-from arraydataengine.ops import (
-    CancellationToken,
-    PipelineCancelled,
-    random_downsample,
-    source_pipeline,
-    valid_point_cloud_points,
-    voxel_downsample,
-)
+from arraydataengine.ops import CancellationToken, PipelineCancelled, source_pipeline, voxel_downsample
 from arraydataengine.source import DataSources
 
 source = DataSources("/data/rosbag2/split_recording/")
@@ -523,26 +533,15 @@ checkpoint = {}
 persistent_checkpoint = {}
 cancel_token = CancellationToken()
 
-POINTS_PER_SCAN = 2048  # buffers and stores keep one fixed shape per topic
-
 def report(progress):
     print(progress.processed, progress.emitted, progress.topic)
-
-def downsample_scan(points):
-    # Drop the source's zero padding, voxelize, then cap and re-pad to a fixed shape.
-    points = voxel_downsample(valid_point_cloud_points(points), voxel_size=0.1)
-    if points.shape[0] > POINTS_PER_SCAN:
-        points = random_downsample(points, count=POINTS_PER_SCAN, seed=0)
-    padded = np.zeros((POINTS_PER_SCAN, 3), dtype=points.dtype)
-    padded[: points.shape[0]] = points
-    return padded
 
 pipeline = (
     source_pipeline(source)
     .select_topics("/points")
     .time_range(12.0, 20.0)
-    .filter(lambda msg: valid_point_cloud_points(msg["data"]).shape[0] > 0)
-    .map(lambda msg: {**msg, "data": downsample_scan(msg["data"])})
+    .map(partial(voxel_downsample, voxel_size=0.1))  # scans keep their own sizes
+    .filter(lambda msg: msg["data"].shape[0] > 0)
 )
 
 try:
@@ -594,7 +593,7 @@ with DataBuffer(
     print(buffer.get_group_uri())
 ```
 
-Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed; `close_completed()` does the same without leaving the context. Topics that are still incomplete stay open, so a later run resumes them. Each topic has one fixed payload shape and dtype in every backend. A message that differs is rejected with `ValueError` rather than silently broadcast or cast, so pad variable-length data such as point clouds to a fixed shape. Both persistent backends stage rows in memory and write them in batches, and reads include staged rows without flushing them. Call `close()` (or use the context manager) so the last batch is written; after a crash, a resumed ingest replays only the rows that were never flushed.
+Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed; `close_completed()` does the same without leaving the context. Topics that are still incomplete stay open, so a later run resumes them. Each topic has one payload dtype and trailing shape in every backend. Safe widening casts (for example `int32` into an `int64` topic) are applied; anything else raises `ValueError` rather than being silently broadcast or cast. Point-cloud topics, and any topic listed in `DataBuffer(ragged_topics={topic: capacity})`, may vary in their first dimension. They are stored zero-padded to a capacity, set by `DataBuffer(max_points=...)` or the source's `max_points` and defaulting to 30000 rows, with each message's real length. Reads return `lengths` next to the padded `data`, `buf[i]` returns the trimmed row, and `topic(...).rows()` returns trimmed rows. `DataBuffer(topics=[...])` limits which topics are buffered, the in-memory ring grows as messages arrive, and `get_buffer()` returns only filled rows in time order. `get_size()` is the number of stored rows on every backend. Both persistent backends stage rows in memory and write them in batches, and reads include staged rows without flushing them. Call `close()` (or use the context manager) so the last batch is written; after a crash, a resumed ingest replays only the rows that were never flushed.
 
 New stores use escaped topic directory names so topics such as `/a/b` and `/a_b` remain distinct. Existing stores retain their original directories when reopened. Query results expose each topic's location as `source_uri`.
 
@@ -616,9 +615,12 @@ buffer = DataBuffer(
         "batch_readahead": 1,                 # scanner prefetch depth; raise for throughput,
         "fragment_readahead": 1,              #   keep at 1 for minimal scan memory
         "use_threads": False,                 # parallel scans (off preserves order + bounds memory)
+        "row_overhead_bytes": 256,            # per-row bookkeeping counted toward flush_bytes
     },
 )
 ```
+
+The TileDB backend accepts `flush_bytes`, `row_overhead_bytes`, and `consolidate_max_bytes` the same way. Closing a TileDB store consolidates only what is safe while other processes read it (this session's index fragments and the metadata). Run `buffer.compact()` when no reader has the store open to merge payload fragments (arrays up to `consolidate_max_bytes`) and vacuum superseded files. Unknown `backend_options` raise `ValueError` for every backend.
 
 Existing stores can be reopened without the original source:
 
@@ -665,7 +667,7 @@ Pass `cache_dir` to reuse downloaded HGT payloads. Cached tiles can be read with
 source = DataSources("DEM", bounds=[north, west], cache_dir="/tmp/ade-dem-cache")
 ```
 
-Downloads require HTTPS, and Earthdata credentials are only sent to the Earthdata login host (`urs.earthdata.nasa.gov`) or to the tile host itself; redirects to any other host never receive them. A custom `http://` base URL requires an explicit `allow_insecure_http=True`. Cache writes are atomic, and tiles are yielded as native, writable `int16` arrays.
+Downloads require HTTPS, and Earthdata credentials are only sent to the Earthdata login host (`urs.earthdata.nasa.gov`) or to the tile host itself; redirects to any other host never receive them. A custom `http://` base URL requires an explicit `allow_insecure_http=True`. Tiles are validated before they are cached, cache writes are atomic, a missing (404) tile such as open ocean is skipped with a warning, and tiles are yielded as native, writable `int16` arrays.
 
 DEM helper functions operate on NumPy windows, so they can be used on individual tiles, cropped patches, or lazy pipeline chunks:
 
@@ -716,9 +718,9 @@ write_dem_cache("/tmp/ade-dem-cache", tile["name"], elevation, metadata={"bounds
 cached_elevation, metadata = read_dem_cache("/tmp/ade-dem-cache", tile["name"], return_metadata=True)
 ```
 
-`mosaic_dem_tiles` also accepts `{name: raster}` mappings or `(name, raster)` pairs and fills sparse regions when adjacent SRTM tiles are missing. Adjacent SRTM tiles share one edge row/column, so standard 1201- and 3601-sample tiles are merged with `overlap=1` automatically. SRTM voids (`-32768`) become `fill_value` (NaN by default).
+`mosaic_dem_tiles` also accepts `{name: raster}` mappings or `(name, raster)` pairs and fills sparse regions when adjacent SRTM tiles are missing. Adjacent SRTM tiles share one edge row/column, so tiles named like SRTM tiles (`N37W122`) with the standard 1201 or 3601 samples are merged with `overlap=1` automatically; pass `overlap=` explicitly for other rasters. SRTM voids (`-32768`) become `fill_value` (NaN by default).
 
-DEM rasters decoded from HGT tiles are north-up (row 0 is the northern edge). Pass `north_up=True` to the helpers that map rows to `y`: `slope_aspect`, `hillshade`, `terrain_gradients`, `terrain_normals`, `terrain_patch`, `sample_elevation`, `sample_elevation_at_navsat`, `dem_to_point_cloud`, `dem_to_mesh`, and `reproject_raster`. The default, `north_up=False`, treats increasing row index as `+y`. In both conventions `origin` is the south-west cell, `aspect` is a compass bearing in `[0, 2π)` with NaN for flat cells, and `sample_elevation` returns NaN for points outside the grid. `resolution` also accepts `(dx, dy)`, because the east-west cell size of a geographic tile shrinks with latitude.
+DEM rasters decoded from HGT tiles are north-up (row 0 is the northern edge). Pass `north_up=True` to the helpers that map rows to `y`: `slope_aspect`, `hillshade`, `terrain_gradients`, `terrain_normals`, `terrain_patch`, `sample_elevation`, `sample_elevation_at_navsat`, `dem_to_point_cloud`, `dem_to_mesh`, `reproject_raster`, `dem_grid_to_points`, `transform_dem_grid`, and `project_dem_to_image`. For geographic (lat/lon) rasters such as SRTM mosaics, sample with `sample_elevation_at_latlon(raster, lat, lon, bounds=(west, south, east, north))` or the index from `mosaic_dem_tiles(..., return_index=True)`, or pass `bounds=`/`index=` to `sample_elevation_at_navsat`. Local ENU coordinates do not map onto a lat/lon grid exactly. The default, `north_up=False`, treats increasing row index as `+y`. In both conventions `origin` is the south-west cell, `aspect` is a compass bearing in `[0, 2π)` with NaN for flat cells, and `sample_elevation` returns NaN for points outside the grid. `resolution` also accepts `(dx, dy)`, because the east-west cell size of a geographic tile shrinks with latitude.
 
 ## Benchmarks
 
@@ -744,9 +746,9 @@ Results below were measured on 2026-07-28 with Python 3.14 on arm64 (Apple Silic
 | `DEMOps.synthetic` | terrain normals, roughness, traversability, and point-cloud conversion over a DEM grid | 16,384 | 0.005833s | 2,808,726 cells/s | 0.4 us/cell |
 | `TopicPipeline.iter_chunks` | lazy in-memory time/index pushdown and row map over 50k synthetic samples | 10,000 | 0.035091s | 284,972 items/s | 3.5 us/item |
 | `TileDB.TopicPipeline.time_range` | lazy TileDB time-range pushdown and row map over a temp persisted topic | 100 | 0.205731s | 486 items/s | 2057.3 us/item |
+| `Arrow.TopicPipeline.time_range` | same pipeline over the Arrow/Parquet backend | 100 | 0.001433s | 69,796 items/s | 14.3 us/item |
 
 The TileDB rows above predate the batched, compressed TileDB writer; see [Storage backends](#storage-backends) for current backend measurements.
-| `Arrow.TopicPipeline.time_range` | same pipeline over the Arrow/Parquet backend | 100 | 0.001433s | 69,796 items/s | 14.3 us/item |
 
 `voxel_downsample` groups 1M points at 0.5 m resolution in ~70 ms (packed int64 voxel keys; ~7-9x faster than the previous row-wise grouping).
 

@@ -13,8 +13,27 @@ registry release.
 
 ### Added
 
-- `max_points` option on `DataSources`, `BagSource`, and `DB3Source`; point-cloud
-  messages carry `point_count`, the number of real points before zero padding.
+- Variable-size topics: point clouds (and topics listed in
+  `DataBuffer(ragged_topics=...)`) are stored padded to a capacity
+  (`DataBuffer(max_points=...)`, default 30000 rows) with each message's real
+  length. Results carry `lengths`, row functions receive trimmed rows, and
+  `TopicView.rows()`, `topic_rows()`, and `topic_lengths()` return them; `.npz`
+  exports round-trip `lengths`.
+- `max_points` and `topics=` options on `DataSources`, `BagSource`, and
+  `DB3Source`; point-cloud messages carry `point_count`; NavSatFix messages
+  carry `status` and `position_covariance`; image messages carry `encoding`.
+- `compressedDepth` CompressedImage decoding, and decoding DepthAnything
+  calibration messages through definitions embedded in the bag.
+- `DataBuffer.compact()` (TileDB merge and vacuum), TileDB `backend_options`
+  (`flush_bytes`, `consolidate_max_bytes`), and `row_overhead_bytes`.
+- `pose_to_trajectory`, `sensor_to_trajectory(kind="pose")`,
+  `sample_elevation_at_latlon`, `bounds=`/`index=` on
+  `sample_elevation_at_navsat`, and `north_up`/`(dx, dy)` resolution on
+  `dem_grid_to_points`, `transform_dem_grid`, and `project_dem_to_image`.
+- `nearest_time_index(assume_sorted=...)`; TUM/KITTI export accepts pose and
+  odometry topics.
+- `ade --max-points`, `ade ingest --force`, and an `ade_source.json` record of
+  the recording behind each ingested store.
 - `sensor_msgs/CompressedImage` decoding for CDR and rosbridge JSON payloads
   (requires OpenCV), and `get_topic_types()` on ROS sources.
 - `DataBuffer.close_completed()`, `DEMSource(allow_insecure_http=...)`, and
@@ -35,10 +54,18 @@ registry release.
 ### Changed
 
 - Every ROS read path returns the same messages: short type names, log-time
-  fallback for zero stamps, and point clouds with non-finite rows dropped and
-  zero-padded to `(max_points, 3)` in the field dtype (float64 stays float64).
-  Oversized or undecodable messages are skipped with a warning instead of
-  ending the stream.
+  fallback for zero stamps, and point clouds at their real size `(N, 3)` with
+  non-finite rows dropped, in the field dtype (float64 stays float64). There is
+  no point limit by default; with `max_points` set, larger scans are skipped
+  with a warning. Undecodable messages are skipped instead of ending the stream.
+- Every source returns colour images as RGB (or RGBA), including `bgr8`,
+  CompressedImage, and `ImgSource` (`color_order="bgr"` restores OpenCV order).
+- Row functions passed to `map`/`filter`/`reduce` receive the timestamp and id
+  only when they ask for them (parameters named like `ts`/`id`, or a plain
+  function or lambda of your own with two or three required positional parameters).
+  NumPy ufuncs, `functools.partial`, `operator.itemgetter`, and library
+  operations receive just the data, so `map(voxel_downsample)` raises instead
+  of using a timestamp as the voxel size.
 - `get_topics()`/`get_count()` list only topics whose type can be decoded.
 - Unknown image encodings raise instead of returning raw bytes; OpenCV-style
   (`32FC1`, `16SC1`, ...), Bayer, and YUV422 encodings are decoded.
@@ -48,18 +75,27 @@ registry release.
   `odometry_to_trajectory` rotates it into the parent frame, matching
   `nav_msgs/Odometry` semantics.
 - NavSat conversions use exact WGS84 geodetic/ECEF/ENU math.
-- `verify_loop_closures` always gates registration (2×`voxel_size`, or 3× the
-  median point spacing when no distance is given); `inlier_rmse` is
+- `verify_loop_closures` always gates fitness (2×`voxel_size`, or 3× the
+  median point spacing when no distance is given) after registering coarse to
+  fine, so ordinary odometry drift still converges; `inlier_rmse` is
   point-to-point for every ICP method.
-- Undistortion iterates to a tolerance and returns NaN outside the lens
-  model's domain.
+- Undistortion iterates to a tolerance, falls back to a damped Newton solve
+  where the fixed-point iteration does not converge, and returns NaN for points
+  with no valid solution.
+- `convert_image_dtype` follows `skimage.util.img_as_*` for every type pair,
+  including 64-bit targets.
 - DEM aspect is a compass bearing in `[0, 2π)` with NaN for flat cells, and
   `sample_grid` returns NaN outside the grid instead of clamping.
-- Memory and TileDB buffers reject messages whose shape or dtype differs from
-  the topic's instead of broadcasting or casting them.
-- TileDB batches writes, compresses attributes with Zstd, and consolidates with
-  bounded buffers on close: ingesting the example bag takes 6.5 s and 119 MB
-  instead of ~100 s and 900 MB.
+- Memory and TileDB buffers reject messages whose dtype or trailing shape
+  differs from the topic's instead of broadcasting or casting them; safe
+  widening casts are applied.
+- `DataBuffer(topics=...)` limits what is buffered and the in-memory ring grows
+  as messages arrive; `get_buffer()` returns only filled rows in time order;
+  `get_size()` is the number of stored rows on every backend.
+- TileDB batches writes and compresses attributes with Zstd: ingesting the
+  example bag takes 6.5 s and 119 MB instead of ~100 s and 900 MB. Closing never
+  vacuums or rewrites payload fragments, so concurrent readers keep working;
+  use `compact()` for a full merge.
 - Pipelines without row operations pass whole chunks through and copy data
   once; `align_nearest`, quaternion interpolation, neighbour searches (SciPy
   `cKDTree` when available, memory-bounded chunks otherwise), normals, and
@@ -157,10 +193,46 @@ registry release.
   `filename.gif` into the working directory; colormaps load through
   `matplotlib.colormaps`.
 
+- Sources no longer zero-pad point clouds, which made ICP report zero motion,
+  outlier filters keep only padding, plane fits pass through the origin, and
+  radius searches run out of memory.
+- Arrow stores written by 0.3.1 resume bool topics and open despite a truncated
+  fragment; a non-store `manifest.json` (for example in a web project passed to
+  `ade ingest -o`) is never adopted or overwritten; a second creator of the same
+  topic is refused; files follow the umask and stale temp files are removed.
+- TileDB no longer creates groups inside Arrow stores or on read-only opens,
+  resumes unicode and half-created topics, treats derived topics as unbounded,
+  and handles NaN timestamps.
+- Callables without a usable signature (`functools.partial`, `itemgetter`,
+  `methodcaller`) work in `map`/`reduce`; unmapped rows keep their dtype;
+  `.npz` files store bytes rows exactly; a raising progress callback no longer
+  loses a row; `to_buffer(buffer=...)` resumes against the store; checkpoints
+  are JSON-safe and never cover undelivered rows.
+- Split recordings whose `.db3` and `metadata.yaml` disagree on the
+  serialization format (as the mapeverything recorder writes them) read
+  through the built-in SQLite reader; rosbags 0.11.6 returned no messages for
+  them.
+- A corrupt CompressedImage or PointCloud2 header no longer ends the stream;
+  rosbridge-JSON bags labelled `cdr` decode consistently; bags with partial or
+  unparsable embedded definitions, WAL bags in read-only directories, and UNC
+  paths open; upper-case extensions are recognised.
+- Multi-worker PyTorch datasets transform each sample once; quaternion
+  smoothing keeps NaN rows NaN; `image_gradients` axes, `transform_odometry`
+  covariances, and DEM nearest-sample ties are correct; `split_topic` and
+  `iter_ml_windows` keep `lengths` and frame IDs.
+- `ade` refuses to resume a store from a different recording, gives one-line
+  errors for corrupt, empty, or Git LFS pointer recordings and unwritable
+  outputs, exits 130 on Ctrl-C, parses `ADE_DEBUG` values, and lists topics it
+  cannot decode with the extra they need; the point-cloud viewer no longer
+  keeps the process alive when Open3D is installed.
+
 ### Security
 
-- The Docker image fetches the ROS apt key over verified TLS and no longer
-  ships a fixed or empty Jupyter token.
+- The Docker image fetches the ROS apt key over verified TLS, no longer ships
+  a fixed or empty Jupyter token, and pins `ros2_numpy` to a verified commit.
+- Earthdata credentials are sent only over HTTPS to the tile host (matching
+  port) or the Earthdata login host, including on redirects from the login
+  host.
 - Removed the unrelated PyPI `tk` package from `requirements.txt`.
 
 ## 0.3.1 - 2026-08-14
