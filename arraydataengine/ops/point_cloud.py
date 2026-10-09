@@ -22,6 +22,9 @@ _KNN_MAX_QUERY_CHUNK = 1024
 _KNN_CHUNK_ELEMENTS = 1 << 21
 # Queries per cKDTree.query_ball_point call (bounds the Python-list output).
 _BALL_QUERY_CHUNK = 4096
+# Upper bound on candidate (query, point) pairs the memory-bounded radius
+# helpers (counts, hybrid search, components, DBSCAN) materialize at once.
+_PAIR_CHUNK = 1 << 20
 # Tree searches use a slightly inflated radius; candidates are then filtered
 # with the exact squared-distance test so results match the brute-force path.
 _RADIUS_SEARCH_SLACK = 1.0e-9
@@ -30,6 +33,11 @@ _NEIGHBORHOOD_CHUNK = 1 << 15
 # verify_loop_closures without a gating distance or voxel size gates at this
 # multiple of the target cloud's median nearest-neighbor spacing.
 _LOOP_CLOSURE_SPACING_FACTOR = 3.0
+# Without an explicit gate, loop closures register coarse to fine with these
+# multiples of the scoring gate: wide enough to pull in typical odometry drift
+# (~15x the point spacing), narrow enough that lidar ground rings do not drag
+# the scans back toward the seed.
+_LOOP_CLOSURE_GATE_FACTORS = (5.0, float(np.sqrt(5.0)), 1.0)
 _SPACING_SAMPLE_COUNT = 2048
 
 
@@ -268,6 +276,11 @@ class _PointIndex:
     Rows with non-finite XYZ are excluded, and every returned index refers to
     the original array. Building the index once and querying it repeatedly
     (e.g. across ICP iterations) avoids rebuilding the tree.
+
+    Identical points are grouped (`unique()`): radius counts, hybrid search,
+    connected components, and DBSCAN work on the distinct points with their
+    multiplicities, in memory-bounded chunks, so clouds with thousands of
+    duplicate points never materialize all duplicate pairs.
     """
 
     def __init__(self, points: np.ndarray):
@@ -284,6 +297,9 @@ class _PointIndex:
         self._tree = None
         self._tree_built = False
         self._buckets: dict[float, dict[tuple[int, int, int], np.ndarray]] = {}
+        self._unique: _UniquePoints | None = None
+        self._unique_tree = None
+        self._unique_tree_built = False
 
     @property
     def finite_count(self) -> int:
@@ -299,6 +315,24 @@ class _PointIndex:
             if ckdtree is not None and self.finite_count:
                 self._tree = ckdtree(np.ascontiguousarray(self.xyz))
         return self._tree
+
+    def unique(self) -> "_UniquePoints":
+        """Distinct finite points with multiplicities and (sorted) member rows."""
+
+        if self._unique is None:
+            self._unique = _UniquePoints(self.xyz)
+        return self._unique
+
+    def unique_tree(self):
+        if not self._unique_tree_built:
+            self._unique_tree_built = True
+            unique = self.unique()
+            ckdtree = _scipy_ckdtree()
+            if ckdtree is not None and unique.size:
+                # Indexed in distinct-point order (lexicographic), which
+                # differs from the input order even without duplicates.
+                self._unique_tree = ckdtree(unique.points)
+        return self._unique_tree
 
     def knn(self, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         width = min(k, self.size)
@@ -326,7 +360,9 @@ class _PointIndex:
         return distances, indices
 
     def radius_neighbors(self, query: np.ndarray, radius: float) -> list[np.ndarray]:
-        if radius == 0.0 or self.tree() is None:
+        if radius == 0.0:
+            return self._exact_neighbors(query)
+        if self.tree() is None:
             return self._grid_radius_neighbors(query, radius)
         rows, cols = self._tree_radius_pairs(query, radius, np.flatnonzero(np.isfinite(query).all(axis=1)))
         counts = np.bincount(rows, minlength=query.shape[0])
@@ -336,12 +372,130 @@ class _PointIndex:
         """Return `(query_rows, point_indices)` within `radius`, sorted by row then index."""
 
         if radius == 0.0 or self.tree() is None:
-            neighborhoods = self._grid_radius_neighbors(query, radius)
+            neighborhoods = self.radius_neighbors(query, radius)
             counts = np.fromiter(map(len, neighborhoods), dtype=np.int64, count=len(neighborhoods))
             rows = np.repeat(np.arange(len(neighborhoods), dtype=np.int64), counts)
             cols = np.concatenate(neighborhoods) if neighborhoods else np.empty((0,), dtype=np.int64)
             return rows, cols.astype(np.int64, copy=False)
         return self._tree_radius_pairs(query, radius, np.flatnonzero(np.isfinite(query).all(axis=1)))
+
+    def exact_unique_ids(self, query: np.ndarray) -> np.ndarray:
+        """Distinct-point id equal to each query row (`-1` when none or non-finite)."""
+
+        unique = self.unique()
+        ids = np.full(query.shape[0], -1, dtype=np.int64)
+        rows = np.flatnonzero(np.isfinite(query).all(axis=1))
+        if rows.size == 0 or unique.size == 0:
+            return ids
+        keys = _xyz_keys(query[rows] + 0.0)
+        position = np.searchsorted(unique.keys, keys)
+        inside = position < unique.size
+        candidate = np.where(inside, position, 0)
+        match = inside & (unique.points[candidate] == query[rows]).all(axis=1)
+        ids[rows[match]] = candidate[match]
+        return ids
+
+    def _exact_neighbors(self, query: np.ndarray) -> list[np.ndarray]:
+        unique = self.unique()
+        empty = np.empty((0,), dtype=np.int64)
+        result = []
+        for unique_id in self.exact_unique_ids(query):
+            result.append(empty if unique_id < 0 else self._original(unique.members_of(int(unique_id))))
+        return result
+
+    def iter_unique_pairs(self, query: np.ndarray, radius: float):
+        """Yield `(query_rows, unique_ids)` with distinct points within `radius`.
+
+        Chunks never split a query row and hold at most about `_PAIR_CHUNK`
+        candidate pairs, so memory stays bounded however dense the cloud is.
+        """
+
+        unique = self.unique()
+        query_rows = np.flatnonzero(np.isfinite(query).all(axis=1))
+        if query_rows.size == 0 or unique.size == 0:
+            return
+        if radius == 0.0:
+            ids = self.exact_unique_ids(query[query_rows])
+            hit = ids >= 0
+            yield query_rows[hit], ids[hit]
+            return
+
+        radius_squared = radius * radius
+        tree = self.unique_tree()
+        if tree is not None:
+            ball = radius * (1.0 + _RADIUS_SEARCH_SLACK)
+            lengths = np.asarray(tree.query_ball_point(query[query_rows], ball, return_length=True), dtype=np.int64)
+            for chunk in _budget_chunks(query_rows, lengths, _PAIR_CHUNK):
+                neighborhoods = tree.query_ball_point(query[chunk], ball, return_sorted=False)
+                counts = np.fromiter(map(len, neighborhoods), dtype=np.int64, count=len(neighborhoods))
+                ids = np.fromiter(chain.from_iterable(neighborhoods), dtype=np.int64, count=int(counts.sum()))
+                rows = np.repeat(chunk, counts)
+                diff = unique.points[ids] - query[rows]
+                inside = np.einsum("ij,ij->i", diff, diff) <= radius_squared
+                yield rows[inside], ids[inside]
+            return
+
+        buckets = unique.grid_buckets(float(radius))
+        offsets = tuple(product((-1, 0, 1), repeat=3))
+        row_parts: list[np.ndarray] = []
+        id_parts: list[np.ndarray] = []
+        pending = 0
+        for row in query_rows:
+            item = query[row]
+            cell = np.floor(item / radius).astype(np.int64)
+            keys = ((int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz)) for dx, dy, dz in offsets)
+            parts = [bucket for key in keys if (bucket := buckets.get(key)) is not None]
+            if not parts:
+                continue
+            candidates = np.concatenate(parts)
+            diff = unique.points[candidates] - item
+            found = candidates[np.einsum("ij,ij->i", diff, diff) <= radius_squared]
+            if found.size:
+                row_parts.append(np.full(found.size, row, dtype=np.int64))
+                id_parts.append(found)
+                pending += found.size
+            if pending >= _PAIR_CHUNK:
+                yield np.concatenate(row_parts), np.concatenate(id_parts)
+                row_parts, id_parts, pending = [], [], 0
+        if row_parts:
+            yield np.concatenate(row_parts), np.concatenate(id_parts)
+
+    def radius_counts(self, query: np.ndarray, radius: float) -> np.ndarray:
+        """Number of finite points within `radius` of each query (exact `<=` test)."""
+
+        counts = np.zeros(query.shape[0], dtype=np.int64)
+        query_rows = np.flatnonzero(np.isfinite(query).all(axis=1))
+        if query_rows.size == 0 or self.finite_count == 0:
+            return counts
+        # Identical queries have identical counts: evaluate each once.
+        distinct = _UniquePoints(query[query_rows])
+        targets = distinct.points
+        unique = self.unique()
+        tree = self.tree()
+        if radius > 0.0 and tree is not None:
+            # Counting needs no neighbor lists. The two radii bracket the
+            # exact test; only queries with points in between need lists.
+            upper = np.asarray(
+                tree.query_ball_point(targets, radius * (1.0 + _RADIUS_SEARCH_SLACK), return_length=True),
+                dtype=np.int64,
+            )
+            lower = np.asarray(
+                tree.query_ball_point(targets, radius * (1.0 - _RADIUS_SEARCH_SLACK), return_length=True),
+                dtype=np.int64,
+            )
+            totals = upper
+            unsure = np.flatnonzero(upper != lower)
+            if unsure.size:
+                exact = np.zeros(unsure.size, dtype=np.int64)
+                for rows, ids in self.iter_unique_pairs(targets[unsure], radius):
+                    exact += np.bincount(rows, weights=unique.counts[ids], minlength=unsure.size).astype(np.int64)
+                totals[unsure] = exact
+        else:
+            totals = np.zeros(targets.shape[0], dtype=np.int64)
+            for rows, ids in self.iter_unique_pairs(targets, radius):
+                totals += np.bincount(rows, weights=unique.counts[ids], minlength=targets.shape[0]).astype(np.int64)
+        counts[query_rows] = totals[distinct.inverse]
+        return counts
 
     def hybrid(self, query: np.ndarray, radius: float, max_neighbors: int):
         n_query = query.shape[0]
@@ -351,85 +505,108 @@ class _PointIndex:
         if n_query == 0 or self.finite_count == 0:
             return distances, indices, counts
 
-        tree = self.tree()
-        if radius == 0.0 or tree is None:
-            rows, cols = self.radius_pairs(query, radius)
-            self._fill_nearest(query, rows, cols, max_neighbors, distances, indices, counts)
-            return distances, indices, counts
-
-        # Ask the tree for one neighbor more than needed: if the extra one is
-        # clearly farther than the last kept one, the kept set is exact.
-        # Rows with a (near) tie at that boundary are resolved with a complete
-        # ball query so tie-breaking matches the brute-force path (lowest index).
         query_rows = np.flatnonzero(np.isfinite(query).all(axis=1))
         if query_rows.size == 0:
             return distances, indices, counts
-        request = min(max_neighbors + 1, self.finite_count)
-        search_radius = radius * (1.0 + _RADIUS_SEARCH_SLACK)
-        _, found = tree.query(query[query_rows], k=request, distance_upper_bound=search_radius)
-        found = np.asarray(found, dtype=np.int64).reshape(-1, request)
-        present = found < self.finite_count
+        distinct = _UniquePoints(query[query_rows])
+        if distinct.size < query_rows.size or query_rows.size < n_query:
+            # Identical queries have identical answers: search each once.
+            found = self.hybrid(distinct.points, radius, max_neighbors)
+            for target, values in zip((distances, indices, counts), found):
+                target[query_rows] = values[distinct.inverse]
+            return distances, indices, counts
 
-        row_slot, slot = np.nonzero(present)
-        rows = query_rows[row_slot]
-        cols = found[row_slot, slot]
-        diff = self.xyz[cols] - query[rows]
-        inside = np.einsum("ij,ij->i", diff, diff) <= radius * radius
-        rows, cols = rows[inside], self._original(cols[inside])
+        unique = self.unique()
+        tree = self.unique_tree()
+        if radius == 0.0 or tree is None:
+            for rows, ids in self.iter_unique_pairs(query, radius):
+                self._fill_from_unique(query, rows, ids, max_neighbors, distances, indices, counts)
+            return distances, indices, counts
+        # Ask the tree for one distinct neighbor more than needed. Every point
+        # that can rank in the top `max_neighbors` is then among them, except
+        # when that extra neighbor ties with the boundary distance; those rows
+        # are completed with a ball query over the distinct points (bounded:
+        # duplicates are a single distinct point).
+        request = min(max_neighbors + 1, unique.size)
+        radius_squared = radius * radius
+        _, found = tree.query(query[query_rows], k=request, distance_upper_bound=radius * (1.0 + _RADIUS_SEARCH_SLACK))
+        found = np.asarray(found, dtype=np.int64).reshape(-1, request)
+        present = found < unique.size
+        safe = np.where(present, found, 0)
+        diff = unique.points[safe] - query[query_rows][:, None, :]
+        squared = np.einsum("ijk,ijk->ij", diff, diff)
+        present &= squared <= radius_squared
 
         if request > max_neighbors:
-            full_rows = query_rows[present.all(axis=1)]
-            if full_rows.size:
-                full = found[present.all(axis=1)]
-                exact = np.linalg.norm(self.xyz[full] - query[full_rows][:, None, :], axis=2)
-                exact.sort(axis=1)
-                tied = exact[:, max_neighbors] <= exact[:, max_neighbors - 1] * (1.0 + 1.0e-12)
-                if tied.any():
-                    # Every point that can rank in the top `max_neighbors`
-                    # lies within the extra neighbor's distance.
-                    tie_rows = full_rows[tied]
-                    keep = ~np.isin(rows, tie_rows)
-                    tie_pairs = self._tree_radius_pairs(
-                        query,
-                        radius,
-                        tie_rows,
-                        ball_radius=np.minimum(exact[tied, max_neighbors], radius) * (1.0 + _RADIUS_SEARCH_SLACK),
-                    )
-                    rows = np.concatenate((rows[keep], tie_pairs[0]))
-                    cols = np.concatenate((cols[keep], tie_pairs[1]))
+            multiplicity = np.where(present, unique.counts[safe], 0)
+            reached = np.cumsum(multiplicity, axis=1) >= max_neighbors
+            boundary = np.argmax(reached, axis=1)
+            boundary_distance = np.sqrt(squared[np.arange(found.shape[0]), boundary])
+            tied = (
+                reached.any(axis=1)
+                & present[:, max_neighbors]
+                & (np.sqrt(squared[:, max_neighbors]) <= boundary_distance * (1.0 + 1.0e-12))
+            )
+            if tied.any():
+                present[tied] = False
+                tie_rows = query_rows[tied]
+                balls = tree.query_ball_point(
+                    query[tie_rows],
+                    np.minimum(boundary_distance[tied], radius) * (1.0 + _RADIUS_SEARCH_SLACK),
+                    return_sorted=False,
+                )
+                lengths = np.fromiter(map(len, balls), dtype=np.int64, count=len(balls))
+                tie_ids = np.fromiter(chain.from_iterable(balls), dtype=np.int64, count=int(lengths.sum()))
+                tie_query = np.repeat(tie_rows, lengths)
+                tie_diff = unique.points[tie_ids] - query[tie_query]
+                inside = np.einsum("ij,ij->i", tie_diff, tie_diff) <= radius_squared
+                self._fill_from_unique(
+                    query, tie_query[inside], tie_ids[inside], max_neighbors, distances, indices, counts
+                )
 
-        self._fill_nearest(query, rows, cols, max_neighbors, distances, indices, counts)
+        row_slot, slot = np.nonzero(present)
+        self._fill_from_unique(
+            query, query_rows[row_slot], found[row_slot, slot], max_neighbors, distances, indices, counts
+        )
         return distances, indices, counts
 
-    def _fill_nearest(self, query, rows, cols, max_neighbors, distances, indices, counts) -> None:
+    def _fill_from_unique(self, query, rows, unique_ids, max_neighbors, distances, indices, counts) -> None:
+        """Rank candidate distinct points per query row and fill the nearest slots.
+
+        Each query row's candidates must all arrive in a single call. Ties in
+        distance are broken by the lowest original index, like brute force.
+        """
+
         if rows.size == 0:
             return
-        candidate_distances = np.linalg.norm(self.points_xyz[cols] - query[rows], axis=1)
-        order = np.lexsort((cols, candidate_distances, rows))
-        rows = rows[order]
-        cols = cols[order]
+        unique = self.unique()
+        taken = np.minimum(unique.counts[unique_ids], max_neighbors)
+        source = np.repeat(np.arange(rows.size), taken)
+        rank_in_group = np.arange(source.size) - np.repeat(np.cumsum(taken) - taken, taken)
+        members = unique.members[unique.starts[unique_ids[source]] + rank_in_group]
+        candidate_rows = rows[source]
+        candidate_cols = self._original(members)
+        candidate_distances = np.linalg.norm(unique.points[unique_ids] - query[rows], axis=1)[source]
+        order = np.lexsort((candidate_cols, candidate_distances, candidate_rows))
+        candidate_rows = candidate_rows[order]
+        candidate_cols = candidate_cols[order]
         candidate_distances = candidate_distances[order]
-        rank = np.arange(rows.size) - np.searchsorted(rows, rows, side="left")
+        rank = np.arange(candidate_rows.size) - np.searchsorted(candidate_rows, candidate_rows, side="left")
         keep = rank < max_neighbors
-        rows, rank = rows[keep], rank[keep]
-        distances[rows, rank] = candidate_distances[keep]
-        indices[rows, rank] = cols[keep]
-        counts += np.bincount(rows, minlength=counts.size)
+        candidate_rows, rank = candidate_rows[keep], rank[keep]
+        distances[candidate_rows, rank] = candidate_distances[keep]
+        indices[candidate_rows, rank] = candidate_cols[keep]
+        counts += np.bincount(candidate_rows, minlength=counts.size)
 
-    def _tree_radius_pairs(self, query: np.ndarray, radius: float, query_rows: np.ndarray, ball_radius=None):
+    def _tree_radius_pairs(self, query: np.ndarray, radius: float, query_rows: np.ndarray):
         tree = self.tree()
         radius_squared = radius * radius
-        if ball_radius is None:
-            ball_radius = np.full(query_rows.size, radius * (1.0 + _RADIUS_SEARCH_SLACK))
+        ball_radius = radius * (1.0 + _RADIUS_SEARCH_SLACK)
         row_parts = []
         col_parts = []
         for start in range(0, query_rows.size, _BALL_QUERY_CHUNK):
             chunk_rows = query_rows[start:start + _BALL_QUERY_CHUNK]
-            neighborhoods = tree.query_ball_point(
-                query[chunk_rows],
-                ball_radius[start:start + _BALL_QUERY_CHUNK],
-                return_sorted=False,
-            )
+            neighborhoods = tree.query_ball_point(query[chunk_rows], ball_radius, return_sorted=False)
             lengths = np.fromiter(map(len, neighborhoods), dtype=np.int64, count=len(neighborhoods))
             cols = np.fromiter(chain.from_iterable(neighborhoods), dtype=np.int64, count=int(lengths.sum()))
             rows = np.repeat(chunk_rows, lengths)
@@ -449,13 +626,6 @@ class _PointIndex:
         if self.finite_count == 0:
             return [empty for _ in range(query.shape[0])]
         query_finite = np.isfinite(query).all(axis=1)
-
-        if radius == 0.0:
-            return [
-                self._original(np.flatnonzero(np.all(self.xyz == item, axis=1)).astype(np.int64, copy=False))
-                if finite else empty
-                for item, finite in zip(query, query_finite)
-            ]
 
         cell_size = float(radius)
         radius_squared = cell_size * cell_size
@@ -487,14 +657,114 @@ class _PointIndex:
     def _grid_buckets(self, cell_size: float) -> dict[tuple[int, int, int], np.ndarray]:
         buckets = self._buckets.get(cell_size)
         if buckets is None:
-            cells = np.floor(self.xyz / cell_size).astype(np.int64)
-            unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
-            inverse = inverse.reshape(-1)
-            order = np.argsort(inverse, kind="stable")
-            splits = np.split(order.astype(np.int64, copy=False), np.cumsum(np.bincount(inverse))[:-1])
-            buckets = {tuple(int(value) for value in cell): members for cell, members in zip(unique_cells, splits)}
+            buckets = _grid_buckets(self.xyz, cell_size)
             self._buckets[cell_size] = buckets
         return buckets
+
+
+class _UniquePoints:
+    """Distinct rows of an `(N, 3)` float array (`-0.0` folded into `0.0`).
+
+    `points` are sorted lexicographically, `inverse` maps each input row to
+    its distinct point, and `members[starts[u]:starts[u] + counts[u]]` lists
+    the input rows equal to point `u` in increasing order.
+    """
+
+    def __init__(self, xyz: np.ndarray):
+        xyz = np.asarray(xyz, dtype=np.float64) + 0.0
+        n_rows = xyz.shape[0]
+        order = np.lexsort((xyz[:, 2], xyz[:, 1], xyz[:, 0])).astype(np.int64, copy=False)
+        ordered = xyz[order]
+        first = np.ones(n_rows, dtype=bool)
+        if n_rows > 1:
+            first[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
+        self.starts = np.flatnonzero(first).astype(np.int64, copy=False)
+        self.counts = np.diff(np.append(self.starts, n_rows)).astype(np.int64, copy=False)
+        self.points = np.ascontiguousarray(ordered[self.starts])
+        self.members = order
+        self.inverse = np.empty(n_rows, dtype=np.int64)
+        self.inverse[order] = np.cumsum(first) - 1
+        self.size = int(self.starts.size)
+        self._keys = None
+        self._buckets: dict[float, dict[tuple[int, int, int], np.ndarray]] = {}
+
+    @property
+    def keys(self) -> np.ndarray:
+        if self._keys is None:
+            self._keys = _xyz_keys(self.points)
+        return self._keys
+
+    @property
+    def first_members(self) -> np.ndarray:
+        return self.members[self.starts]
+
+    def members_of(self, unique_id: int) -> np.ndarray:
+        start = self.starts[unique_id]
+        return self.members[start:start + self.counts[unique_id]]
+
+    def grid_buckets(self, cell_size: float) -> dict[tuple[int, int, int], np.ndarray]:
+        buckets = self._buckets.get(cell_size)
+        if buckets is None:
+            buckets = _grid_buckets(self.points, cell_size)
+            self._buckets[cell_size] = buckets
+        return buckets
+
+
+def _xyz_keys(xyz: np.ndarray) -> np.ndarray:
+    """View `(N, 3)` float64 rows as sortable structured scalars."""
+
+    dtype = np.dtype([("x", np.float64), ("y", np.float64), ("z", np.float64)])
+    return np.ascontiguousarray(xyz, dtype=np.float64).view(dtype).reshape(-1)
+
+
+def _grid_buckets(xyz: np.ndarray, cell_size: float) -> dict[tuple[int, int, int], np.ndarray]:
+    if xyz.shape[0] == 0:
+        return {}
+    cells = np.floor(xyz / cell_size).astype(np.int64)
+    unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    order = np.argsort(inverse, kind="stable")
+    splits = np.split(order.astype(np.int64, copy=False), np.cumsum(np.bincount(inverse))[:-1])
+    return {tuple(int(value) for value in cell): members for cell, members in zip(unique_cells, splits)}
+
+
+def _budget_chunks(rows: np.ndarray, lengths: np.ndarray, budget: int):
+    """Split `rows` into consecutive chunks whose `lengths` sum to about `budget`."""
+
+    cumulative = np.cumsum(lengths)
+    start = 0
+    total = rows.size
+    while start < total:
+        offset = cumulative[start - 1] if start else 0
+        stop = int(np.searchsorted(cumulative, offset + budget, side="right"))
+        stop = min(max(stop, start + 1), start + _BALL_QUERY_CHUNK, total)
+        yield rows[start:stop]
+        start = stop
+
+
+def _union_roots(parent: np.ndarray, left: np.ndarray, right: np.ndarray) -> None:
+    """Union `left[i]` with `right[i]` in a parent forest (roots are component minima)."""
+
+    while left.size:
+        _compress(parent)
+        left_root = parent[left]
+        right_root = parent[right]
+        differ = left_root != right_root
+        if not differ.any():
+            return
+        left, right = left[differ], right[differ]
+        left_root, right_root = left_root[differ], right_root[differ]
+        # Hook the larger root under the smaller one; conflicting writes just
+        # leave some pairs for the next round.
+        parent[np.maximum(left_root, right_root)] = np.minimum(left_root, right_root)
+
+
+def _compress(parent: np.ndarray) -> None:
+    while True:
+        grand = parent[parent]
+        if np.array_equal(grand, parent):
+            return
+        parent[:] = grand
 
 
 def _knn_bruteforce(points_xyz: np.ndarray, query_xyz: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -848,13 +1118,22 @@ def verify_loop_closures(
 
     Registration always uses a gating distance so that `fitness` (the fraction
     of source points within it of the target after alignment) can reject
-    unrelated scans. When `max_correspondence_distance` is None it defaults to
-    `2 * voxel_size` if `voxel_size` is given, otherwise to 3x the median
-    nearest-neighbor spacing of the target cloud. For `method="multi_scale"`
-    levels with a positive voxel size gate at twice that size (see
-    `multi_scale_icp`) and voxel-size-0 levels use the same default. Pass an
-    explicit distance that covers the expected odometry drift for reliable
-    results.
+    unrelated scans. With an explicit `max_correspondence_distance` that one
+    distance gates both registration and scoring; choose it to cover the
+    expected odometry drift.
+
+    When it is None, the scoring gate defaults to `2 * voxel_size` if
+    `voxel_size` is given (`voxel_size=0` or None means no downsampling),
+    otherwise to 3x the median nearest-neighbor spacing of the target cloud.
+    That gate is too tight to pull in a seed that is off by typical drift, so
+    `point_to_point`/`point_to_plane` registration then runs coarse to fine:
+    ICP with gates of 5x, ~2.2x, and 1x the scoring gate (the coarse levels
+    on clouds voxel-downsampled to half their gate), and `fitness` /
+    `inlier_rmse` are scored with the tight gate. That recovers seeds off by
+    roughly 15x the point spacing; pass an explicit gate for larger drift. For `method="multi_scale"`
+    the levels are the caller's: levels with a positive voxel size gate at
+    twice that size (see `multi_scale_icp`) and voxel-size-0 levels use the
+    scoring gate.
     """
 
     clouds = _point_cloud_sequence(point_clouds)
@@ -901,16 +1180,20 @@ def verify_loop_closures(
                 if any(size == 0.0 for size in sizes):
                     distances = tuple(2.0 * size if size > 0.0 else default_gate() for size in sizes)
             registration_kwargs.setdefault("max_correspondence_distances", distances)
+        elif max_correspondence_distance is None and method in ("point_to_point", "point_to_plane"):
+            registration_kwargs = None
         else:
-            gate = max_correspondence_distance
-            registration_kwargs["max_correspondence_distance"] = default_gate() if gate is None else gate
-        result = odometry_seeded_icp(
-            source,
-            target,
-            odometry_transform=seed,
-            method=method,
-            **registration_kwargs,
-        )
+            registration_kwargs["max_correspondence_distance"] = max_correspondence_distance
+        if registration_kwargs is None:
+            result = _coarse_to_fine_icp(source, target, seed, method, default_gate(), icp_kwargs)
+        else:
+            result = odometry_seeded_icp(
+                source,
+                target,
+                odometry_transform=seed,
+                method=method,
+                **registration_kwargs,
+            )
         accepted = bool(result["fitness"] >= min_fitness)
         if max_inlier_rmse is not None:
             accepted = accepted and bool(result["inlier_rmse"] <= max_inlier_rmse)
@@ -936,7 +1219,14 @@ def connected_components(
     min_component_size: int = 1,
     return_counts: bool = False,
 ):
-    """Label radius-connected point components."""
+    """Label radius-connected point components.
+
+    Components are numbered in order of their lowest point index; components
+    smaller than `min_component_size` and rows with non-finite XYZ get -1.
+    Neighbor pairs are processed in bounded chunks over the distinct points
+    (identical points are one node), so memory stays bounded for dense or
+    heavily duplicated clouds.
+    """
 
     if radius < 0:
         raise ValueError("radius must be non-negative")
@@ -946,41 +1236,28 @@ def connected_components(
 
     arr = _as_points(points)
     labels = np.full(arr.shape[0], -1, dtype=np.int64)
-    if arr.shape[0] == 0:
+    index = _PointIndex(arr)
+    if index.finite_count == 0:
         counts = np.empty((0,), dtype=np.int64)
         return (labels, counts) if return_counts else labels
 
-    neighborhoods = _radius_neighbors(arr, arr[:, :3], radius)
-    raw_components: list[list[int]] = []
-    # Rows with non-finite XYZ belong to no component (label -1).
-    visited = ~np.isfinite(np.asarray(arr[:, :3], dtype=np.float64)).all(axis=1)
-    for point_index in range(arr.shape[0]):
-        if visited[point_index]:
-            continue
+    unique = index.unique()
+    parent = np.arange(unique.size, dtype=np.int64)
+    for rows, ids in index.iter_unique_pairs(unique.points, float(radius)):
+        linked = rows != ids
+        _union_roots(parent, rows[linked], ids[linked])
+    _compress(parent)
 
-        component = []
-        queue = deque([point_index])
-        visited[point_index] = True
-        while queue:
-            current = queue.popleft()
-            component.append(current)
-            for neighbor in neighborhoods[current]:
-                neighbor = int(neighbor)
-                if not visited[neighbor]:
-                    visited[neighbor] = True
-                    queue.append(neighbor)
-        raw_components.append(component)
-
-    component_id = 0
-    counts = []
-    for component in raw_components:
-        if len(component) < min_component_size:
-            continue
-        labels[np.asarray(component, dtype=np.int64)] = component_id
-        counts.append(len(component))
-        component_id += 1
-
-    counts_array = np.asarray(counts, dtype=np.int64)
+    sizes = np.bincount(parent, weights=unique.counts, minlength=unique.size).astype(np.int64)
+    first = np.full(unique.size, np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first, parent, index._original(unique.first_members))
+    roots = np.flatnonzero((parent == np.arange(unique.size)) & (sizes >= min_component_size))
+    roots = roots[np.argsort(first[roots], kind="stable")]
+    component = np.full(unique.size, -1, dtype=np.int64)
+    component[roots] = np.arange(roots.size, dtype=np.int64)
+    finite_rows = index._original(np.arange(index.finite_count, dtype=np.int64))
+    labels[finite_rows] = component[parent][unique.inverse]
+    counts_array = sizes[roots]
     return (labels, counts_array) if return_counts else labels
 
 
@@ -1212,46 +1489,72 @@ def statistical_outlier_filter(points: np.ndarray, k: int = 8, std_ratio: float 
 
 
 def radius_outlier_filter(points: np.ndarray, radius: float, min_neighbors: int, return_mask: bool = False):
+    """Keep points with at least `min_neighbors` other points within `radius`.
+
+    Rows with non-finite XYZ are removed. Neighbor counts are computed without
+    materializing neighbor lists, so duplicate-heavy clouds stay cheap.
+    """
+
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
     arr = _as_points(points)
-    neighborhoods = radius_search(arr, arr[:, :3], radius)
-    mask = np.asarray([neighbors.size - 1 >= min_neighbors for neighbors in neighborhoods], dtype=bool)
+    xyz = np.ascontiguousarray(arr[:, :3], dtype=np.float64)
+    counts = _PointIndex(arr).radius_counts(xyz, float(radius))
+    mask = np.isfinite(xyz).all(axis=1) & (counts - 1 >= min_neighbors)
     filtered = arr[mask].copy()
     return (filtered, mask) if return_mask else filtered
 
 
 def cluster_dbscan(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
+    """DBSCAN clustering; labels are cluster ids in discovery order, -1 for noise.
+
+    A point is core when at least `min_points` points (itself included) lie
+    within `eps`. Clusters are numbered in order of their lowest-index core
+    point, and a border point joins the lowest-numbered cluster that reaches
+    it -- the result of the classic sequential algorithm. Work is done on the
+    distinct points in bounded chunks, so memory stays bounded for clouds
+    with many duplicate points.
+    """
+
     if eps <= 0:
         raise ValueError("eps must be positive")
     if min_points < 1:
         raise ValueError("min_points must be at least 1")
 
     arr = _as_points(points)
-    neighborhoods = radius_search(arr, arr[:, :3], eps)
     labels = np.full(arr.shape[0], -1, dtype=np.int64)
-    visited = np.zeros(arr.shape[0], dtype=bool)
-    cluster_id = 0
+    index = _PointIndex(arr)
+    if index.finite_count == 0:
+        return labels
 
-    for point_index in range(arr.shape[0]):
-        if visited[point_index]:
-            continue
-        visited[point_index] = True
-        neighbors = neighborhoods[point_index]
-        if neighbors.size < min_points:
-            continue
+    eps = float(eps)
+    unique = index.unique()
+    core = index.radius_counts(unique.points, eps) >= min_points
+    parent = np.arange(unique.size, dtype=np.int64)
+    for rows, ids in index.iter_unique_pairs(unique.points, eps):
+        linked = core[rows] & core[ids] & (rows != ids)
+        _union_roots(parent, rows[linked], ids[linked])
+    _compress(parent)
 
-        labels[point_index] = cluster_id
-        queue = deque(int(i) for i in neighbors if i != point_index)
-        while queue:
-            neighbor = queue.popleft()
-            if not visited[neighbor]:
-                visited[neighbor] = True
-                neighbor_neighbors = neighborhoods[neighbor]
-                if neighbor_neighbors.size >= min_points:
-                    queue.extend(int(i) for i in neighbor_neighbors if labels[i] < 0)
-            if labels[neighbor] < 0:
-                labels[neighbor] = cluster_id
-        cluster_id += 1
+    first = np.full(unique.size, np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first, parent[core], index._original(unique.first_members)[core])
+    roots = np.flatnonzero(core & (parent == np.arange(unique.size)))
+    roots = roots[np.argsort(first[roots], kind="stable")]
+    cluster = np.full(unique.size, -1, dtype=np.int64)
+    cluster[roots] = np.arange(roots.size, dtype=np.int64)
+    unique_labels = np.where(core, cluster[parent], -1)
 
+    # Border points join the lowest-numbered cluster with a core point in reach.
+    no_cluster = np.iinfo(np.int64).max
+    border = np.full(unique.size, no_cluster, dtype=np.int64)
+    for rows, ids in index.iter_unique_pairs(unique.points, eps):
+        reach = ~core[rows] & core[ids]
+        np.minimum.at(border, rows[reach], unique_labels[ids[reach]])
+    attached = ~core & (border != no_cluster)
+    unique_labels[attached] = border[attached]
+
+    finite_rows = index._original(np.arange(index.finite_count, dtype=np.int64))
+    labels[finite_rows] = unique_labels[unique.inverse]
     return labels
 
 
@@ -1433,6 +1736,8 @@ def point_to_point_icp(
     source point is matched to its nearest target point, so `fitness` is 1.0
     by construction; pass a gating distance whenever fitness must separate
     good from bad alignments. Rows with non-finite XYZ are ignored.
+    `iterations` counts the transform updates actually made (0 when there are
+    never enough correspondences).
     """
 
     source_arr, target_arr, transform = _registration_inputs(source, target, initial_transform)
@@ -1448,7 +1753,7 @@ def point_to_point_icp(
     if max_iterations:
         correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
 
-    for iteration in range(1, max_iterations + 1):
+    for step in range(1, max_iterations + 1):
         if correspondences["source_indices"].size < min_correspondences:
             break
 
@@ -1456,6 +1761,7 @@ def point_to_point_icp(
         target_matches = target_arr[correspondences["target_indices"], :3]
         delta = _best_fit_transform(source_matches, target_matches)
         transform = delta @ transform
+        iteration = step
 
         # These correspondences also seed the next iteration, so each
         # iteration performs a single nearest-neighbor search.
@@ -1519,7 +1825,7 @@ def point_to_plane_icp(
     if max_iterations:
         correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
 
-    for iteration in range(1, max_iterations + 1):
+    for step in range(1, max_iterations + 1):
         if correspondences["source_indices"].size < min_correspondences:
             break
 
@@ -1528,6 +1834,7 @@ def point_to_plane_icp(
         normal_matches = normals[correspondences["target_indices"]]
         delta = _point_to_plane_delta(source_matches, target_matches, normal_matches)
         transform = delta @ transform
+        iteration = step
 
         transformed = _transform_points_xyz(source_arr[:, :3], transform)
         correspondences = _nearest_correspondences(transformed, target_index, max_correspondence_distance)
@@ -2194,9 +2501,32 @@ def _loop_closure_cell(position: np.ndarray, cell_size: float) -> tuple[int, int
 
 def _loop_closure_cloud(points, voxel_size: float | None) -> np.ndarray:
     cloud = np.asarray(_as_points(points), dtype=np.float64)
-    if voxel_size is None:
+    if voxel_size is None or voxel_size == 0:
         return cloud
+    if voxel_size < 0:
+        raise ValueError("voxel_size must be non-negative")
     return voxel_downsample(cloud, voxel_size)
+
+
+def _coarse_to_fine_icp(source, target, seed, method: str, gate: float, icp_kwargs: dict) -> dict:
+    """ICP with gates shrinking to `gate`; metrics are scored at `gate`."""
+
+    gates = tuple(float(gate) * factor for factor in _LOOP_CLOSURE_GATE_FACTORS) if gate > 0 else (0.0,)
+    # Coarse levels run on clouds voxelized to half their gate (fast, and
+    # robust to the seed error); the last level uses the full clouds.
+    full_resolution = "target_normals" in icp_kwargs
+    voxels = tuple(0.0 if full_resolution else level / 2.0 for level in gates[:-1]) + (0.0,)
+    result = multi_scale_icp(
+        source,
+        target,
+        voxel_sizes=voxels,
+        method=method,
+        initial_transform=seed,
+        max_correspondence_distances=gates,
+        **icp_kwargs,
+    )
+    result["odometry_seed"] = _as_transform_matrix(seed)
+    return result
 
 
 def _default_loop_closure_gate(target: np.ndarray, voxel_size: float | None) -> float:

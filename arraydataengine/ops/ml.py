@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from itertools import islice
 from typing import Any
 
 import numpy as np
 
-from .core import DatasetQuery, TopicPipeline, TopicView, dataset_query, topic_view
+from .core import DatasetQuery, TopicPipeline, TopicView, dataset_query, topic_lengths, topic_view
 
 
 class IteratorDataset:
@@ -41,15 +41,42 @@ class NumpyDataset:
 
 
 def to_iterator_dataset(samples, transform: Callable | None = None) -> IteratorDataset:
-    """Wrap a sample iterable or factory as a plain Python dataset."""
+    """Wrap a sample iterable or factory as a plain Python dataset.
+
+    Pass a re-iterable (list, tuple, pipeline, ...) or a zero-argument
+    factory returning a fresh iterator for a dataset that can be iterated
+    more than once. One-shot iterators (generators, `map`, ...) can only be
+    consumed once: iterating the dataset a second time raises a
+    `RuntimeError` instead of silently yielding nothing.
+    """
 
     if isinstance(samples, IteratorDataset):
         if transform is None:
             return samples
         return IteratorDataset(lambda: iter(samples), transform=transform)
-    if callable(samples):
+    if callable(samples) and not isinstance(samples, Iterator):
         return IteratorDataset(samples, transform=transform)
-    return IteratorDataset(lambda: iter(samples), transform=transform)
+    return IteratorDataset(_sample_factory(samples), transform=transform)
+
+
+def _sample_factory(samples) -> Callable[[], Iterable[Mapping[str, Any]]]:
+    if not isinstance(samples, Iterator):
+        return lambda: iter(samples)
+
+    consumed = False
+
+    def one_shot():
+        nonlocal consumed
+        if consumed:
+            raise RuntimeError(
+                "this dataset wraps a one-shot iterator (e.g. a generator) that was already "
+                "consumed; pass a list or a zero-argument factory such as `lambda: make_samples()` "
+                "to iterate it more than once (e.g. for several epochs)"
+            )
+        consumed = True
+        return samples
+
+    return one_shot
 
 
 def to_numpy_dataset(samples, transform: Callable | None = None, copy: bool = True) -> NumpyDataset:
@@ -64,7 +91,9 @@ def to_torch_dataset(samples, transform: Callable | None = None, iterable: bool 
 
     The iterable dataset shards samples across `DataLoader` workers
     (worker `i` of `n` yields samples `i, i + n, ...`), so multi-worker
-    loading yields every sample exactly once.
+    loading yields every sample exactly once, and `transform` runs only on
+    each worker's own share. A one-shot iterator (generator) source supports
+    a single pass per process; see `to_iterator_dataset`.
     """
 
     try:
@@ -73,15 +102,29 @@ def to_torch_dataset(samples, transform: Callable | None = None, iterable: bool 
         raise ImportError("to_torch_dataset requires the optional `ml` dependencies, including torch") from exc
 
     if iterable:
-        source = to_iterator_dataset(samples, transform=transform)
+        # Shard the raw samples first and transform afterwards, so each worker
+        # only pays for the samples it yields.
+        transforms = []
+        if isinstance(samples, IteratorDataset):
+            factory = samples._factory
+            if samples.transform is not None:
+                transforms.append(samples.transform)
+        elif callable(samples) and not isinstance(samples, Iterator):
+            factory = samples
+        else:
+            factory = _sample_factory(samples)
+        if transform is not None:
+            transforms.append(transform)
 
         class _TorchIterableDataset(torch.utils.data.IterableDataset):
             def __iter__(self):
-                samples_iter = iter(source)
+                samples_iter = iter(factory())
                 worker = torch.utils.data.get_worker_info()
                 if worker is not None and worker.num_workers > 1:
                     samples_iter = islice(samples_iter, worker.id, None, worker.num_workers)
                 for sample in samples_iter:
+                    for fn in transforms:
+                        sample = fn(sample)
                     yield _to_torch_sample(sample, torch)
 
         return _TorchIterableDataset()
@@ -107,7 +150,14 @@ def iter_ml_windows(
     copy: bool = True,
     transform: Callable | None = None,
 ) -> IteratorDataset:
-    """Return a lazy iterator of topic windows for ML input pipelines."""
+    """Return a lazy iterator of topic windows for ML input pipelines.
+
+    Each sample holds the window's `topic`, `id`/`name`, `ts`, `data`, and
+    `metadata`. Windows of variable-size (ragged) topics also carry
+    `lengths` (the true row count of each padded message; trim with
+    `data[i, :lengths[i]]`), and windows with per-message frames carry
+    `frame_ids`.
+    """
 
     query = _as_dataset_query(dataset)
     if topics is not None:
@@ -124,6 +174,11 @@ def iter_ml_windows(
                     "data": window.data.copy() if copy else window.data,
                     "metadata": window.metadata,
                 }
+                lengths = topic_lengths(window)
+                if lengths is not None:
+                    sample["lengths"] = np.asarray(lengths, dtype=np.int64).copy()
+                if window.frame_ids is not None:
+                    sample["frame_ids"] = window.frame_ids.copy()
                 yield sample
 
     return IteratorDataset(factory, transform=transform)
@@ -200,7 +255,9 @@ def split_topic(
     `by="time"` orders rows by timestamp (stable for ties) before splitting,
     so earlier samples land in the first split even when the topic is not
     time-sorted; `by="index"` uses row order. Each split keeps the original
-    row order. See `deterministic_split_indices` for `seed`/`shuffle`.
+    row order, and the selected rows' ids, per-message `frame_ids`, and (for
+    variable-size topics) `lengths`. See `deterministic_split_indices` for
+    `seed`/`shuffle`.
     """
 
     view = topic_view(topic_data, copy=False)
@@ -501,8 +558,20 @@ def _split_groups(topic_data, view: TopicView, by: str, geography_columns, geogr
 
 
 def _select_view_indices(view: TopicView, indices: np.ndarray) -> TopicView:
-    ids = None if view.ids is None else view.ids[indices]
-    return TopicView(ids, view.timestamps[indices], view.data[indices], metadata=view.metadata, copy=True)
+    """Rows `indices` of a view, keeping ids, per-row frames, and ragged lengths."""
+
+    def take(values):
+        return None if values is None else np.asarray(values)[indices]
+
+    return TopicView(
+        take(view.ids),
+        view.timestamps[indices],
+        view.data[indices],
+        metadata=view.metadata,
+        copy=True,
+        frame_ids=take(view.frame_ids),
+        lengths=take(topic_lengths(view)),
+    )
 
 
 def _spatial_axes(arr: np.ndarray, channel_axis="auto") -> tuple[int, int]:

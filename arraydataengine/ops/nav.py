@@ -23,22 +23,17 @@ def normalize_quaternion(quaternion: np.ndarray) -> np.ndarray:
 
 
 def slerp(q0: np.ndarray, q1: np.ndarray, fraction: float) -> np.ndarray:
+    """Spherical linear interpolation between two XYZW quaternions.
+
+    Takes the shorter arc and stays accurate for arbitrarily small angles
+    (no linear-interpolation shortcut).
+    """
+
     q0 = normalize_quaternion(q0)
     q1 = normalize_quaternion(q1)
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:
-        q1 = -q1
-        dot = -dot
-    dot = np.clip(dot, -1.0, 1.0)
-
-    if dot > 0.9995:
-        return normalize_quaternion(q0 + fraction * (q1 - q0))
-
-    theta_0 = np.arccos(dot)
-    theta = theta_0 * fraction
-    sin_theta = np.sin(theta)
-    sin_theta_0 = np.sin(theta_0)
-    return np.cos(theta) * q0 + sin_theta * (q1 - q0 * dot) / sin_theta_0
+    if q0.shape != (4,) or q1.shape != (4,):
+        raise ValueError("q0 and q1 must have shape (4,)")
+    return _slerp_rows(q0[None, :], q1[None, :], np.array([float(fraction)]))[0]
 
 
 def euler_to_quaternion(roll, pitch=None, yaw=None, degrees: bool = False) -> np.ndarray:
@@ -996,8 +991,54 @@ def navsat_to_trajectory(
     return trajectory
 
 
+def pose_to_trajectory(
+    pose_data,
+    timestamps: np.ndarray | None = None,
+    compute_velocity: bool = False,
+) -> dict:
+    """Convert pose samples `[x, y, z, qx, qy, qz, qw]` into a common trajectory dict.
+
+    This is the layout of `geometry_msgs/PoseStamped` (and `Pose`) topics.
+    Accepts a `(7,)` or `(N, 7+)` array, a topic dict, a buffered structured
+    topic array (a `DataBuffer.get_buffer()` value), or a TopicView. Samples
+    without an orientation (an all-zero or non-finite quaternion) get NaN
+    orientations. Poses carry no twist or covariance, so those fields are NaN;
+    with `compute_velocity=True` the linear velocity is the finite-difference
+    derivative of the positions (NaN unless timestamps strictly increase).
+    """
+
+    values, ts, metadata = _topic_data_and_timestamps(pose_data, timestamps, message_ndim=1)
+    poses = np.asarray(values, dtype=np.float64)
+    if poses.ndim == 1:
+        poses = poses.reshape((1, -1))
+    if poses.ndim != 2 or poses.shape[1] < 7:
+        raise ValueError("pose data must have shape (7,) or (N, 7+) with XYZ + XYZW quaternion")
+    position = poses[:, :3]
+    linear_velocity = (
+        _velocity_from_positions(ts, position) if compute_velocity else _filled_vectors(ts.size, np.nan)
+    )
+    return _trajectory_dict(
+        ts=ts,
+        position=position,
+        orientation=poses[:, 3:7],
+        linear_velocity=linear_velocity,
+        angular_velocity=_filled_vectors(ts.size, np.nan),
+        linear_acceleration=_filled_vectors(ts.size, np.nan),
+        position_covariance=_filled_vectors(ts.size, np.nan),
+        orientation_covariance=_filled_vectors(ts.size, np.nan),
+        linear_velocity_covariance=_filled_vectors(ts.size, np.nan),
+        angular_velocity_covariance=_filled_vectors(ts.size, np.nan),
+        linear_acceleration_covariance=_filled_vectors(ts.size, np.nan),
+        source="pose",
+        metadata=metadata,
+    )
+
+
 def sensor_to_trajectory(sensor_data, kind: str, timestamps: np.ndarray | None = None, **kwargs) -> dict:
-    """Convert a named ADE sensor stream into the common trajectory representation."""
+    """Convert a named ADE sensor stream into the common trajectory representation.
+
+    `kind` is `"imu"`, `"odometry"`, `"navsat"`, or `"pose"` (PoseStamped).
+    """
 
     normalized = kind.lower().replace("-", "_")
     if normalized in {"imu", "imudata"}:
@@ -1006,7 +1047,9 @@ def sensor_to_trajectory(sensor_data, kind: str, timestamps: np.ndarray | None =
         return odometry_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
     if normalized in {"navsat", "navsatfix", "gps"}:
         return navsat_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
-    raise ValueError("kind must be 'imu', 'odometry', or 'navsat'")
+    if normalized in {"pose", "posestamped", "pose_stamped"}:
+        return pose_to_trajectory(sensor_data, timestamps=timestamps, **kwargs)
+    raise ValueError("kind must be 'imu', 'odometry', 'navsat', or 'pose'")
 
 
 def navsat_to_enu(lat, lon, alt, ref_lat: float, ref_lon: float, ref_alt: float = 0.0) -> np.ndarray:
@@ -1404,22 +1447,31 @@ def _strict_timestamps(timestamps: np.ndarray) -> np.ndarray:
 
 
 def _smooth_quaternions(orientations: np.ndarray, window_size: int) -> np.ndarray:
-    quaternions = normalize_quaternion(orientations)
+    """Moving-average XYZW quaternions after making their signs continuous.
+
+    Each finite row is sign-aligned with the previous *finite* row, so a gap
+    (NaN row, e.g. a sample without an orientation estimate) does not break
+    the alignment. Rows without a usable orientation stay NaN.
+    """
+
+    quaternions = _normalize_orientations(orientations)
     if quaternions.ndim != 2 or quaternions.shape[1] != 4:
         raise ValueError("orientations must have shape (N, 4)")
     if window_size <= 1 or quaternions.shape[0] <= 1:
         return quaternions.copy()
 
     aligned = quaternions.copy()
-    for index in range(1, aligned.shape[0]):
-        if np.dot(aligned[index - 1], aligned[index]) < 0.0:
-            aligned[index] = -aligned[index]
+    finite = np.flatnonzero(np.isfinite(quaternions).all(axis=1))
+    if finite.size > 1:
+        rows = quaternions[finite]
+        steps = np.where(np.sum(rows[:-1] * rows[1:], axis=1) < 0.0, -1.0, 1.0)
+        signs = np.concatenate(([1.0], np.cumprod(steps)))
+        aligned[finite] = rows * signs[:, None]
 
     smoothed = smooth_timeseries(aligned, window_size=window_size, axis=0)
-    for index in range(smoothed.shape[0]):
-        if np.dot(smoothed[index], aligned[index]) < 0.0:
-            smoothed[index] = -smoothed[index]
-    return normalize_quaternion(smoothed)
+    smoothed = np.where(np.sum(smoothed * aligned, axis=1, keepdims=True) < 0.0, -smoothed, smoothed)
+    smoothed[~np.isfinite(aligned).all(axis=1)] = np.nan
+    return _normalize_orientations(smoothed)
 
 
 def _quaternion_conjugate(quaternion: np.ndarray) -> np.ndarray:
@@ -1493,23 +1545,29 @@ def _normalize_orientations(orientations: np.ndarray, orientation_covariance: np
 
 
 def _slerp_rows(q0: np.ndarray, q1: np.ndarray, fraction: np.ndarray) -> np.ndarray:
-    """Row-wise `slerp` for `(M, 4)` quaternion pairs and `(M,)` fractions."""
+    """Row-wise `slerp` for `(M, 4)` quaternion pairs and `(M,)` fractions.
+
+    The angle comes from `2 atan2(|q1 - q0|, |q1 + q0|)` and the weights
+    `sin(t theta) / sin(theta)` are evaluated through `np.sinc`, so the result
+    stays accurate (to rounding) down to zero angle instead of switching to
+    normalized linear interpolation.
+    """
 
     q0 = _normalize_orientations(q0)
     q1 = _normalize_orientations(q1)
     fraction = np.asarray(fraction, dtype=np.float64)[:, None]
-    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
-    flip = dot < 0.0
+    flip = np.sum(q0 * q1, axis=-1, keepdims=True) < 0.0
     q1 = np.where(flip, -q1, q1)
-    dot = np.clip(np.where(flip, -dot, dot), -1.0, 1.0)
-    linear = dot > 0.9995
+    theta = 2.0 * np.arctan2(
+        np.linalg.norm(q1 - q0, axis=-1, keepdims=True),
+        np.linalg.norm(q1 + q0, axis=-1, keepdims=True),
+    )
+    scale = np.sinc(theta / np.pi)
+    weight0 = (1.0 - fraction) * np.sinc((1.0 - fraction) * theta / np.pi) / scale
+    weight1 = fraction * np.sinc(fraction * theta / np.pi) / scale
+    result = weight0 * q0 + weight1 * q1
     with np.errstate(invalid="ignore", divide="ignore"):
-        lerp = q0 + fraction * (q1 - q0)
-        lerp = lerp / np.linalg.norm(lerp, axis=-1, keepdims=True)
-        theta_0 = np.arccos(dot)
-        theta = theta_0 * fraction
-        spherical = np.cos(theta) * q0 + np.sin(theta) * (q1 - q0 * dot) / np.sin(theta_0)
-    return np.where(linear, lerp, spherical)
+        return result / np.linalg.norm(result, axis=-1, keepdims=True)
 
 
 def _rotation_vectors_from_quaternions(quaternions: np.ndarray) -> np.ndarray:

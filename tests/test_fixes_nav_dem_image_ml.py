@@ -459,7 +459,8 @@ def test_convert_image_dtype_signed_round_trips():
     assert image.convert_image_dtype(int8, np.uint8).tolist() == [0, 0, 129, 255]
     assert image.convert_image_dtype(image.convert_image_dtype(int8, np.uint8), np.int8).tolist() == [0, 0, 64, 127]
     widened = image.convert_image_dtype(values, np.int32)
-    assert widened[2] == 0 and widened[0] == np.iinfo(np.int32).min
+    # Full-range signed widening, like skimage (zero maps to 32768).
+    assert widened[-1] == np.iinfo(np.int32).max and widened[0] == np.iinfo(np.int32).min
     assert np.array_equal(image.convert_image_dtype(widened, np.int16), values)
     assert image.convert_image_dtype(np.array([-1.0, 0.0, 1.0]), np.uint8).tolist() == [0, 0, 255]
 

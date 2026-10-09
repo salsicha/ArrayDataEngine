@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import functools
 import inspect
+import numbers
+import threading
 import types
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy as _shallow_copy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -107,7 +109,14 @@ class CancellationToken:
 
 
 class TopicView:
-    """Common operation interface for buffered topic arrays."""
+    """Common operation interface for buffered topic arrays.
+
+    Ragged topics (variable-size point clouds) keep `data` zero-padded to a
+    common row size and carry the true size of each message in `lengths`
+    (None for regular topics). Row-level operations (`map`, `filter`,
+    `reduce`, row iteration) always see the trimmed row
+    ``data[i, :lengths[i]]``; `rows()` returns those trimmed rows.
+    """
 
     def __init__(
         self,
@@ -120,6 +129,7 @@ class TopicView:
         frame_id: str | None = None,
         copy: bool = False,
         frame_ids: np.ndarray | None = None,
+        lengths: np.ndarray | None = None,
     ):
         ts = np.atleast_1d(np.asarray(timestamps, dtype=np.float64))
         values = np.asarray(data)
@@ -129,10 +139,12 @@ class TopicView:
             raise ValueError("timestamps and data must have the same leading dimension")
 
         normalized_ids = _normalize_ids(ids, ts.size)
+        normalized_lengths = _normalize_lengths(lengths, ts.size, values)
         if copy:
             ts = ts.copy()
             values = values.copy()
             normalized_ids = None if normalized_ids is None else normalized_ids.copy()
+            normalized_lengths = None if normalized_lengths is None else normalized_lengths.copy()
 
         self.frame_ids = _normalize_ids(frame_ids, ts.size)
         if copy and self.frame_ids is not None:
@@ -140,6 +152,8 @@ class TopicView:
         self.ids = normalized_ids
         self.timestamps = ts
         self.data = values
+        self.lengths = normalized_lengths
+        self._sorted_cache: tuple[np.ndarray, bool] | None = None
         self._metadata = TopicMetadata.from_arrays(
             self.timestamps,
             self.data,
@@ -187,11 +201,45 @@ class TopicView:
     def __len__(self) -> int:
         return int(self.timestamps.shape[0])
 
+    def row(self, index: int) -> Any:
+        """Data of row `index`, trimmed to its length for ragged topics."""
+
+        value = self.data[index]
+        if self.lengths is not None:
+            value = value[: int(self.lengths[index])]
+        return value
+
+    def rows(self) -> list:
+        """Every row's data as a list, ragged rows trimmed to their length
+        (``data[i, :lengths[i]]``). Rows are views of `data`."""
+
+        if self.lengths is None:
+            return [self.data[index] for index in range(len(self))]
+        return [self.data[index, : int(length)] for index, length in enumerate(self.lengths)]
+
+    def is_time_sorted(self) -> bool:
+        """Whether timestamps are non-decreasing and NaN-free (cached per
+        timestamps array; in-place edits of `timestamps` are not detected)."""
+
+        ts = self.timestamps
+        if self._sorted_cache is None or self._sorted_cache[0] is not ts:
+            self._sorted_cache = (ts, bool(_is_non_decreasing(ts) and not np.isnan(ts).any()))
+        return self._sorted_cache[1]
+
+    def nearest_time_index(self, query_time: float, tolerance: float | None = None) -> int | None:
+        """`nearest_time_index()` over this view's timestamps, validating
+        their order once instead of on every call."""
+
+        return nearest_time_index(self.timestamps, query_time, tolerance=tolerance,
+                                  assume_sorted=self.is_time_sorted())
+
     def as_dict(self, copy: bool = False, include_metadata: bool = True) -> dict:
         result = {
             "ts": self.timestamps.copy() if copy else self.timestamps,
             "data": self.data.copy() if copy else self.data,
         }
+        if self.lengths is not None:
+            result["lengths"] = self.lengths.copy() if copy else self.lengths
         if self.frame_ids is not None:
             result["frame_ids"] = self.frame_ids.copy() if copy else self.frame_ids
         if self.ids is not None:
@@ -240,10 +288,24 @@ class TopicView:
     ) -> "TopicView":
         """Apply `fn` to every row and return a new view of the results.
 
-        `fn` receives `(data)`, `(data, ts)` or `(data, ts, id)` depending on
-        how many positional parameters it requires (optional parameters are
-        left at their defaults). Rows whose results differ in shape are
-        returned as a 1-D object array.
+        `fn` is called as ``fn(data)``; the timestamp and message id are
+        added positionally (``fn(data, ts)``, ``fn(data, ts, id)``) only
+        when `fn` clearly asks for them: its second/third parameters are
+        required and named like a timestamp (``ts``, ``t``, ``time``,
+        ``timestamp``, ``timestamps``, ``stamp``) / an id (``id``, ``name``,
+        ``message_id``, ``msg_id``, ``idx``, ``index``, ``i``), or `fn` is a
+        plain function or lambda (not from `arraydataengine`) with exactly
+        two or three required positional parameters. Optional parameters
+        keep their defaults, and callables without an introspectable
+        signature or with only ``*args`` (ufunc partials,
+        ``operator.itemgetter``, ``np.vectorize``) get the data only. A
+        callable that requires more arguments than that (e.g.
+        ``voxel_downsample(points, voxel_size)``) raises TypeError: bind them
+        with ``functools.partial`` or a lambda.
+
+        Ragged rows are passed trimmed (``data[i, :lengths[i]]``). Results
+        that are not all arrays/NumPy scalars/numbers, or that differ in
+        shape, are returned as a 1-D object array.
         """
 
         chunk_size = _validated_chunk_size(chunk_size) if chunk_size is not None else None
@@ -270,7 +332,8 @@ class TopicView:
         return TopicView(ids, ts, _stack_values(mapped_values), metadata=self.metadata, frame_ids=self.frame_ids)
 
     def filter(self, predicate: Callable, copy: bool = True, chunk_size: int | None = None) -> "TopicView":
-        """Keep rows where `predicate` is truthy (called like `map`'s `fn`)."""
+        """Keep rows where `predicate` is truthy (called like `map`'s `fn`,
+        with ragged rows trimmed); kept rows keep their padding and lengths."""
 
         chunk_size = _validated_chunk_size(chunk_size) if chunk_size is not None else None
         call = _metadata_caller(predicate)
@@ -292,9 +355,10 @@ class TopicView:
         copy: bool = True,
         chunk_size: int | None = None,
     ) -> Any:
-        """Fold rows with `fn(acc, data)`, `fn(acc, data, ts)` or
-        `fn(acc, data, ts, id)`, chosen by its required positional
-        parameters."""
+        """Fold rows with ``fn(acc, data)``; ``ts`` and ``id`` are appended
+        (``fn(acc, data, ts[, id])``) under the same rule as `map` (named
+        third/fourth parameters, or a plain function/lambda with three or
+        four required positional parameters). Ragged rows are trimmed."""
 
         chunk_size = _validated_chunk_size(chunk_size) if chunk_size is not None else None
         call = _reduce_caller(fn)
@@ -359,18 +423,19 @@ class TopicView:
         # Mask/index selections already produce new arrays.
         copy = copy and isinstance(selection, slice)
         return TopicView(ids, ts, data, metadata=self.metadata, copy=copy,
-                         frame_ids=None if self.frame_ids is None else self.frame_ids[selection])
+                         frame_ids=None if self.frame_ids is None else self.frame_ids[selection],
+                         lengths=None if self.lengths is None else self.lengths[selection])
 
     def _iter_rows(self, chunk_size: int | None = None):
-        if chunk_size is None:
-            for index, (timestamp, value) in enumerate(zip(self.timestamps, self.data)):
-                yield index, timestamp, value, None if self.ids is None else self.ids[index]
-            return
+        """Yield ``(index, ts, data, id)`` per row, ragged rows trimmed.
+        `chunk_size` is accepted for API symmetry; rows are views."""
 
-        for chunk_start in range(0, len(self), chunk_size):
-            chunk_stop = min(chunk_start + chunk_size, len(self))
-            for index in range(chunk_start, chunk_stop):
-                yield index, self.timestamps[index], self.data[index], None if self.ids is None else self.ids[index]
+        ids = self.ids
+        lengths = self.lengths
+        for index, (timestamp, value) in enumerate(zip(self.timestamps, self.data)):
+            if lengths is not None:
+                value = value[: int(lengths[index])]
+            yield index, timestamp, value, None if ids is None else ids[index]
 
 
 @dataclass(frozen=True)
@@ -382,7 +447,7 @@ class _PipelineOperation:
 
 @dataclass(frozen=True)
 class _ProcessedChunk:
-    rows: tuple[tuple[Any, float, np.ndarray, str | None], ...]
+    rows: tuple[tuple[Any, float, np.ndarray, str | None, int | None], ...]
     processed: int
     emitted: int
     skipped: int
@@ -421,9 +486,22 @@ class TopicPipeline:
             )
 
     def map(self, fn: Callable, copy: bool = True) -> "TopicPipeline":
+        """Lazily apply `fn` to every row.
+
+        Dispatch follows `TopicView.map`: ``fn(data)``, with ``ts``/``id``
+        appended only when the callable clearly asks for them (named
+        parameters, or a plain function/lambda with 2-3 required positional
+        parameters). Callables needing more arguments (e.g.
+        ``voxel_downsample``) raise TypeError here. Ragged rows are trimmed.
+        """
+
+        _metadata_caller(fn)  # reject unsatisfiable signatures up front
         return self._with_operation("map", fn, copy=copy)
 
     def filter(self, predicate: Callable, copy: bool = True) -> "TopicPipeline":
+        """Lazily keep rows where `predicate` (dispatched like `map`) is truthy."""
+
+        _metadata_caller(predicate)
         return self._with_operation("filter", predicate, copy=copy)
 
     def time_range(self, start: float, end: float, inclusive: bool = True) -> "TopicPipeline":
@@ -479,11 +557,13 @@ class TopicPipeline:
         progress_interval: int = 1,
         max_workers: int | None = 1,
     ) -> Iterable[dict]:
-        """Yield processed rows as dicts.
+        """Yield processed rows as dicts (ragged rows trimmed).
 
         A `checkpoint` always covers exactly the rows yielded so far, so
         stopping early (break, exception, cancellation) and resuming with the
-        same checkpoint neither repeats nor skips rows.
+        same checkpoint neither repeats nor skips rows. A progress callback
+        runs before its row is yielded; if it raises, the checkpoint is
+        rolled back so that row is processed again on resume.
         """
 
         if _validated_max_workers(max_workers) > 1:
@@ -495,6 +575,7 @@ class TopicPipeline:
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
                 max_workers=max_workers,
+                trim_output=True,
             )
         else:
             rows = self._iter_processed_rows(
@@ -504,9 +585,10 @@ class TopicPipeline:
                 cancel_token=cancel_token,
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
+                trim_output=True,
             )
 
-        for message_id, timestamp, value, frame_id in rows:
+        for message_id, timestamp, value, frame_id, _ in rows:
             yield {
                 "id": message_id,
                 "name": message_id,
@@ -527,12 +609,20 @@ class TopicPipeline:
     ) -> Iterable[TopicView]:
         """Yield processed rows as `TopicView` chunks of `chunk_size` rows.
 
-        Chunks never alias the source arrays. A `checkpoint` covers exactly
+        Chunks never alias the source arrays. Ragged topics keep their
+        padded `data` plus `lengths` unless a map produced new rows.
+        A `checkpoint` covers exactly
         the rows of the chunks yielded so far: rows still being gathered for
         the next chunk are rolled back out of it when an exception (or
         closing the iterator) interrupts iteration, and are flushed as a
         final short chunk before `PipelineCancelled` propagates, so resuming
         neither repeats nor skips rows.
+
+        Progress callbacks report per row when row operations run and per
+        chunk otherwise (whenever `progress_interval` is crossed). The
+        ``progress.checkpoint`` they receive covers only chunks already
+        handed to the caller (it can lag ``progress.processed``), so it is
+        always safe to persist; the final ``done`` report covers everything.
         """
 
         yield from self._iter_output_chunks(
@@ -557,9 +647,9 @@ class TopicPipeline:
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
     ) -> Any:
-        """Fold processed rows with `fn(acc, data)`, `fn(acc, data, ts)` or
-        `fn(acc, data, ts, id)`, chosen by its required positional
-        parameters. Cannot resume from a checkpoint."""
+        """Fold processed rows with ``fn(acc, data)``; ``ts``/``id`` are
+        appended only when `fn` asks for them (see `TopicView.reduce`).
+        Ragged rows are trimmed. Cannot resume from a checkpoint."""
 
         if _checkpoint_processed(checkpoint) > 0:
             raise ValueError(
@@ -575,10 +665,11 @@ class TopicPipeline:
             cancel_token=cancel_token,
             checkpoint=checkpoint,
             progress_interval=progress_interval,
+            trim_output=True,
         )
         if initial is None:
             try:
-                _, _, value, _ = next(iterator)
+                _, _, value, _, _ = next(iterator)
             except StopIteration as exc:
                 raise ValueError("cannot reduce an empty topic without an initial value") from exc
             acc = value
@@ -586,7 +677,7 @@ class TopicPipeline:
             acc = initial
 
         # Rows are already copied by the iterator when copy=True.
-        for message_id, timestamp, value, _ in iterator:
+        for message_id, timestamp, value, _, _ in iterator:
             acc = call(acc, value, float(timestamp), message_id)
         return acc
 
@@ -606,8 +697,11 @@ class TopicPipeline:
     ) -> dict:
         """Materialize the pipeline as a topic dict.
 
-        The result never aliases the source arrays. Rows whose mapped data
-        differ in shape are returned as a 1-D object array.
+        The result never aliases the source arrays (or a live in-memory
+        ring that keeps receiving messages). Ragged topics come back padded
+        with a ``"lengths"`` array unless a map produced new rows. Mapped
+        rows that differ in shape, or are not arrays/NumPy scalars/numbers,
+        are returned as a 1-D object array.
 
         Checkpoints: when `cancel_token` stops the run, the raised
         `PipelineCancelled` carries the rows collected so far in `.partial`
@@ -615,7 +709,9 @@ class TopicPipeline:
         `collect()` resumed from the checkpoint equals an uninterrupted run.
         When any other exception escapes (including the `max_rows` /
         `max_bytes` MemoryError), no rows were returned, so the checkpoint is
-        rolled back to its state when `collect()` started.
+        rolled back to its state when `collect()` started. For the same
+        reason ``progress.checkpoint`` seen by progress callbacks stays at
+        the starting checkpoint until the final ``done`` report.
         """
 
         return self._collect(
@@ -631,6 +727,13 @@ class TopicPipeline:
             progress_interval=progress_interval,
             max_workers=max_workers,
         )
+
+    def rows(self, chunk_size: int = 1024, **collect_kwargs) -> list:
+        """`collect()` the pipeline and return each row's data as a list,
+        ragged rows trimmed to their length. Accepts `collect()`'s keyword
+        arguments (limits, checkpoints, workers)."""
+
+        return topic_rows(self.collect(chunk_size=chunk_size, **collect_kwargs))
 
     def window(
         self,
@@ -649,7 +752,16 @@ class TopicPipeline:
 
     def _source_chunks(self, chunk_size: int, copy: bool) -> Iterable[TopicView]:
         pushdown_operations, _ = self._split_pushdown_operations()
-        yield from self._chunk_source(chunk_size, copy, pushdown_operations)
+        chunks = self._chunk_source(chunk_size, copy, pushdown_operations)
+        if copy or getattr(self._chunk_source, "_ade_static", False):
+            yield from chunks
+            return
+        # Chunks of other sources (e.g. a live in-memory ring buffer that
+        # keeps receiving messages) may be views their owner overwrites
+        # while the pipeline still holds them: detach them on arrival.
+        # topic_pipeline() sources are static and are passed through.
+        for chunk in chunks:
+            yield _detach_chunk(chunk)
 
     def _collect(
         self,
@@ -666,12 +778,16 @@ class TopicPipeline:
         max_workers: int | None = 1,
         rows_before: int = 0,
         bytes_before: int = 0,
+        budget: "_CollectBudget | None" = None,
     ) -> dict:
-        # `rows_before` / `bytes_before` let DatasetQuery enforce one
-        # collect budget across topics.
+        # `rows_before` / `bytes_before` (sequential) or a shared `budget`
+        # (concurrent topics) let DatasetQuery enforce one collect budget
+        # across topics.
         chunk_size = _validated_chunk_size(chunk_size)
         ids_parts = []
         frame_parts = []
+        length_parts = []
+        row_sizes = []
         chunk_lengths = []
         ts_parts = []
         data_parts = []
@@ -685,16 +801,20 @@ class TopicPipeline:
             # source even though chunk arrays are gathered without copying.
             ids = _concat_chunk_ids(ids_parts, chunk_lengths)
             timestamps = np.concatenate(ts_parts) if ts_parts else np.array([], dtype=np.float64)
+            lengths = _concat_lengths(length_parts, chunk_lengths, row_sizes)
             if output is None:
                 if data_parts:
                     data = _concat_data_parts(data_parts)
                 else:
-                    template = self._empty_data_template()
+                    template, ragged = self._empty_data_template()
                     data = np.array([]) if template is None else template
+                    if ragged:
+                        lengths = np.zeros(0, dtype=np.int64)
             else:
                 data = output if offset == output.shape[0] else output[:offset]
             return TopicView(ids, timestamps, data, metadata=self.metadata,
-                             frame_ids=_concat_chunk_ids(frame_parts, chunk_lengths)).as_dict(copy=False)
+                             frame_ids=_concat_chunk_ids(frame_parts, chunk_lengths),
+                             lengths=lengths).as_dict(copy=False)
 
         try:
             # `copy` keeps callables off the source and copies objects held
@@ -708,21 +828,31 @@ class TopicPipeline:
                 progress_interval=progress_interval,
                 max_workers=max_workers,
                 own_data=False,
+                hold_checkpoint=True,
             ):
-                offset += len(chunk)
-                collected_bytes += _topic_view_nbytes(chunk, include_data=output is None)
-                _check_collect_limits(rows_before + offset, collected_bytes, max_rows, max_bytes, allow_large)
+                count = len(chunk)
+                offset += count
+                chunk_bytes = _topic_view_nbytes(chunk, include_data=output is None)
+                collected_bytes += chunk_bytes
+                if budget is not None:
+                    budget.charge(count, chunk_bytes)
+                else:
+                    _check_collect_limits(rows_before + offset, collected_bytes, max_rows, max_bytes, allow_large)
 
+                # Source chunks are detached from live buffers on arrival
+                # (`_source_chunks`), so gathering views here is safe.
                 frame_parts.append(chunk.frame_ids)
-                chunk_lengths.append(len(chunk))
+                chunk_lengths.append(count)
                 ids_parts.append(chunk.ids)
                 ts_parts.append(chunk.timestamps)
+                length_parts.append(chunk.lengths)
+                row_sizes.append(_padded_row_size(chunk.data))
                 if output is None:
                     data_parts.append(chunk.data)
                 else:
                     if offset > output.shape[0]:
                         raise ValueError("out is too small for collected pipeline output")
-                    output[offset - len(chunk):offset] = chunk.data
+                    output[offset - count:offset] = chunk.data
         except PipelineCancelled as exc:
             # The checkpoint covers every row gathered so far; hand them to
             # the caller instead of discarding them.
@@ -743,76 +873,117 @@ class TopicPipeline:
         progress_interval: int,
         max_workers: int | None,
         own_data: bool,
+        hold_checkpoint: bool = False,
     ) -> Iterable[TopicView]:
         chunk_size = _validated_chunk_size(chunk_size)
         max_workers = _validated_max_workers(max_workers)
         _, operations = self._split_pushdown_operations()
-        # Without row operations whole chunks can pass through. Progress
-        # callbacks keep the row-by-row path so they still see every
-        # `progress_interval` boundary exactly.
-        if not operations and progress_callback is None:
-            yield from self._iter_passthrough_chunks(
+
+        # Checkpoint state covering the chunks already handed to the caller
+        # (restored when an interruption drops rows gathered for the next
+        # chunk), and the state progress callbacks may see: the delivered
+        # state, or the starting state for collect(), which delivers nothing
+        # before it returns.
+        delivered = _checkpoint_snapshot(checkpoint)
+        exposed = delivered
+        done_reports: list[PipelineProgress] = []
+        callback = None
+        if progress_callback is not None:
+            def callback(progress: PipelineProgress) -> None:
+                if progress.done:
+                    # Reported once the final chunk has been handed over.
+                    done_reports.append(progress)
+                    return
+                if checkpoint is not None:
+                    progress = replace(progress, checkpoint=_checkpoint_snapshot(exposed))
+                progress_callback(progress)
+
+        def report_done() -> None:
+            if done_reports:
+                progress_callback(replace(done_reports[-1], checkpoint=_checkpoint_snapshot(checkpoint)))
+
+        # Without row operations whole chunks pass through; progress is
+        # reported per chunk whenever `progress_interval` is crossed.
+        if not operations:
+            for chunk in self._iter_passthrough_chunks(
                 chunk_size=chunk_size,
                 copy=copy,
                 own_data=own_data,
-                progress_callback=progress_callback,
+                progress_callback=callback,
                 cancel_token=cancel_token,
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
-            )
+            ):
+                if callback is not None and checkpoint is not None and not hold_checkpoint:
+                    exposed = _checkpoint_snapshot(checkpoint)
+                yield chunk
+            report_done()
             return
 
         # Stacking rows into a chunk allocates new arrays, so rows need no
         # output copy here; `copy` still keeps callables off the source.
+        info = _RowSourceInfo()
+        stack_source = None if any(operation.kind == "map" for operation in operations) else info
         if max_workers == 1:
             processed_rows = self._iter_processed_rows(
                 chunk_size=chunk_size,
                 copy=copy,
-                progress_callback=progress_callback,
+                progress_callback=callback,
                 cancel_token=cancel_token,
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
                 copy_output=False,
+                info=info,
             )
         else:
             processed_rows = self._iter_processed_rows_parallel(
                 chunk_size=chunk_size,
                 copy=copy,
-                progress_callback=progress_callback,
+                progress_callback=callback,
                 cancel_token=cancel_token,
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
                 max_workers=max_workers,
                 copy_output=False,
+                info=info,
             )
 
         ids: list[Any] = []
         timestamps: list[float] = []
         values: list[Any] = []
         frame_ids: list[str | None] = []
-        # Checkpoint state matching the rows actually handed to the caller.
-        delivered = _checkpoint_snapshot(checkpoint)
+        lengths: list[int | None] = []
+
+        def make_chunk() -> TopicView:
+            return self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids,
+                                    lengths=lengths, source=stack_source)
+
         try:
-            for message_id, timestamp, value, frame_id in processed_rows:
+            for message_id, timestamp, value, frame_id, length in processed_rows:
                 frame_ids.append(frame_id)
                 ids.append(message_id)
                 timestamps.append(timestamp)
                 values.append(value)
+                lengths.append(length)
                 if len(values) == chunk_size:
-                    chunk = self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
-                    ids, timestamps, values, frame_ids = [], [], [], []
+                    chunk = make_chunk()
+                    ids, timestamps, values, frame_ids, lengths = [], [], [], [], []
                     delivered = _checkpoint_snapshot(checkpoint)
+                    if not hold_checkpoint:
+                        exposed = delivered
                     yield chunk
             if values:
-                chunk = self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
-                ids, timestamps, values, frame_ids = [], [], [], []
+                chunk = make_chunk()
+                ids, timestamps, values, frame_ids, lengths = [], [], [], [], []
                 delivered = _checkpoint_snapshot(checkpoint)
+                if not hold_checkpoint:
+                    exposed = delivered
                 yield chunk
         except PipelineCancelled:
             # Rows buffered here are already recorded in the checkpoint;
             # flush them so cancel + resume does not silently lose them.
             if values:
-                yield self._make_chunk(ids, timestamps, values, copy=copy, frame_ids=frame_ids)
+                yield make_chunk()
             raise
         except BaseException:
             # Any other interruption: rows buffered here never reached the
@@ -820,6 +991,7 @@ class TopicPipeline:
             processed_rows.close()
             _restore_checkpoint(checkpoint, delivered)
             raise
+        report_done()
 
     def _iter_passthrough_chunks(
         self,
@@ -837,6 +1009,7 @@ class TopicPipeline:
         re-chunked to `chunk_size` and passed through whole instead of being
         unpacked and restacked row by row. With `own_data`, yielded chunks
         never alias the source; otherwise they may (collect() concatenates).
+        Progress is reported once per chunk that crosses `progress_interval`.
         """
 
         progress_interval = _validated_progress_interval(progress_interval)
@@ -852,6 +1025,7 @@ class TopicPipeline:
         pending_rows = 0
         last_id = None
         last_timestamp = None
+        track_progress = checkpoint is not None or progress_callback is not None
 
         def deliver(parts: list[tuple]) -> TopicView:
             nonlocal processed, emitted, last_id, last_timestamp
@@ -868,20 +1042,13 @@ class TopicPipeline:
             emitted += len(chunk)
             last_id = None if chunk.ids is None else chunk.ids[-1]
             last_timestamp = float(chunk.timestamps[-1])
-            if checkpoint is not None or progress_callback is not None:
-                progress = _record_progress(
-                    checkpoint,
-                    PipelineProgress(
-                        processed=processed,
-                        emitted=emitted,
-                        skipped=skipped,
-                        topic=topic,
-                        message_id=last_id,
-                        timestamp=last_timestamp,
-                    ),
+            if track_progress:
+                _report_progress(
+                    checkpoint, progress_callback, progress_interval,
+                    processed, emitted, skipped, topic, last_id, last_timestamp,
                     operation_counters=operation_counters,
+                    previous=previous,
                 )
-                _notify_progress(progress_callback, progress, progress_interval, previous=previous)
             return chunk
 
         for chunk in self._source_chunks(chunk_size=chunk_size, copy=False):
@@ -905,33 +1072,28 @@ class TopicPipeline:
         if pending_rows:
             yield deliver(pending)
 
-        done_progress = _record_progress(
-            checkpoint,
-            PipelineProgress(
-                processed=max(processed, resume_processed),
-                emitted=emitted,
-                skipped=skipped,
-                topic=topic,
-                message_id=last_id,
-                timestamp=last_timestamp,
-                done=True,
-            ),
+        _report_progress(
+            checkpoint, progress_callback, progress_interval,
+            max(processed, resume_processed), emitted, skipped, topic, last_id, last_timestamp,
+            done=True,
             operation_counters=operation_counters,
         )
-        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def _assemble_passthrough_chunk(self, parts: list[tuple], copy: bool, own_data: bool) -> TopicView:
-        lengths = [part[1].shape[0] for part in parts]
+        sizes = [part[1].shape[0] for part in parts]
         if len(parts) == 1:
-            ids, timestamps, data, frames = parts[0]
+            ids, timestamps, data, frames, lengths = parts[0]
             if own_data:
                 timestamps = timestamps.copy()
                 data = data.copy()
+                lengths = None if lengths is None else lengths.copy()
         else:
-            ids = _concat_chunk_ids([part[0] for part in parts], lengths)
+            ids = _concat_chunk_ids([part[0] for part in parts], sizes)
             timestamps = np.concatenate([part[1] for part in parts])
             data = _concat_data_parts([part[2] for part in parts])
-            frames = _concat_chunk_ids([part[3] for part in parts], lengths)
+            frames = _concat_chunk_ids([part[3] for part in parts], sizes)
+            lengths = _concat_lengths([part[4] for part in parts], sizes,
+                                      [_padded_row_size(part[2]) for part in parts])
 
         # Match the row-by-row path: object ids, None when no row has one.
         if ids is not None:
@@ -947,7 +1109,7 @@ class TopicPipeline:
             elif not has_missing:
                 # The row path stacks frame lists with np.asarray -> unicode.
                 frames = frames.astype(str)
-        return TopicView(ids, timestamps, data, metadata=self.metadata, frame_ids=frames)
+        return TopicView(ids, timestamps, data, metadata=self.metadata, frame_ids=frames, lengths=lengths)
 
     def _iter_processed_rows(
         self,
@@ -958,18 +1120,25 @@ class TopicPipeline:
         checkpoint: dict[str, Any] | None = None,
         progress_interval: int = 1,
         copy_output: bool | None = None,
+        trim_output: bool = False,
+        info: "_RowSourceInfo | None" = None,
     ):
-        """Yield `(id, ts, data, frame_id)` for every row that survives the
-        row-level operations.
+        """Yield ``(id, ts, data, frame_id, length)`` for every row that
+        survives the row-level operations.
 
-        With `copy`, callables never see source memory. With `copy_output`
-        (defaults to `copy`), yielded data never aliases the source either.
+        Row operations see ragged rows trimmed to their length. A ragged row
+        that no map replaced is yielded padded together with its `length`
+        (or trimmed, with `length` None, when `trim_output`); `length` is
+        None otherwise. With `copy`, callables never see source memory. With
+        `copy_output` (defaults to `copy`), yielded data never aliases the
+        source either. `info` records the source data schema.
         """
 
         chunk_size = _validated_chunk_size(chunk_size)
         copy_output = copy if copy_output is None else copy_output
         _, operations = self._split_pushdown_operations()
         callers = _operation_callers(operations)
+        keep_padding = not trim_output and not any(operation.kind == "map" for operation in operations)
         index_counters = _checkpoint_operation_counters(checkpoint, len(operations), kind="topic")
         resume_processed = _checkpoint_processed(checkpoint)
         processed = 0
@@ -988,11 +1157,14 @@ class TopicPipeline:
                 # Skip whole chunks already covered by the checkpoint.
                 processed += length
                 continue
+            if info is not None:
+                info.observe(chunk.data)
             first_row = max(0, resume_processed - processed)
             processed += first_row
             chunk_ids = chunk.ids
             chunk_timestamps = chunk.timestamps
             chunk_data = chunk.data
+            chunk_lengths = chunk.lengths
 
             for row_index in range(first_row, length):
                 processed += 1
@@ -1013,19 +1185,24 @@ class TopicPipeline:
                     current_frame_id = fallback_frame_id
                 current_id = None if chunk_ids is None else chunk_ids[row_index]
                 current_timestamp = float(chunk_timestamps[row_index])
+                source_row = chunk_data[row_index]
+                row_length = None if chunk_lengths is None else int(chunk_lengths[row_index])
 
                 keep, current_value, aliases_source = _apply_row_operations(
                     operations,
                     callers,
-                    chunk_data[row_index],
+                    source_row if row_length is None else source_row[:row_length],
                     current_timestamp,
                     current_id,
                     current_frame_id,
                     index_counters=index_counters,
                     protect_source=copy,
                 )
+                output_length = None
                 if keep:
                     emitted += 1
+                    if row_length is not None and keep_padding:
+                        current_value, output_length, aliases_source = source_row, row_length, True
                     if copy_output and aliases_source:
                         current_value = _copy_value(current_value)
                 else:
@@ -1034,37 +1211,21 @@ class TopicPipeline:
                 last_id = current_id
                 last_timestamp = current_timestamp
                 if track_progress:
-                    progress = _record_progress(
-                        checkpoint,
-                        PipelineProgress(
-                            processed=processed,
-                            emitted=emitted,
-                            skipped=skipped,
-                            topic=topic,
-                            message_id=current_id,
-                            timestamp=current_timestamp,
-                        ),
+                    _report_progress(
+                        checkpoint, progress_callback, progress_interval,
+                        processed, emitted, skipped, topic, current_id, current_timestamp,
                         operation_counters=index_counters,
                     )
-                    _notify_progress(progress_callback, progress, progress_interval)
 
                 if keep:
-                    yield current_id, current_timestamp, current_value, current_frame_id
+                    yield current_id, current_timestamp, current_value, current_frame_id, output_length
 
-        done_progress = _record_progress(
-            checkpoint,
-            PipelineProgress(
-                processed=max(processed, resume_processed),
-                emitted=emitted,
-                skipped=skipped,
-                topic=topic,
-                message_id=last_id,
-                timestamp=last_timestamp,
-                done=True,
-            ),
+        _report_progress(
+            checkpoint, progress_callback, progress_interval,
+            max(processed, resume_processed), emitted, skipped, topic, last_id, last_timestamp,
+            done=True,
             operation_counters=index_counters,
         )
-        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def _iter_processed_rows_parallel(
         self,
@@ -1076,6 +1237,8 @@ class TopicPipeline:
         progress_interval: int = 1,
         max_workers: int | None = 1,
         copy_output: bool | None = None,
+        trim_output: bool = False,
+        info: "_RowSourceInfo | None" = None,
     ):
         chunk_size = _validated_chunk_size(chunk_size)
         max_workers = _validated_max_workers(max_workers)
@@ -1083,12 +1246,14 @@ class TopicPipeline:
         _, operations = self._split_pushdown_operations()
         _validate_parallel_operations(operations)
         callers = _operation_callers(operations)
+        keep_padding = not trim_output and not any(operation.kind == "map" for operation in operations)
 
         resume_processed = _checkpoint_processed(checkpoint)
         processed = resume_processed
         emitted = _checkpoint_emitted(checkpoint)
         skipped = _checkpoint_skipped(checkpoint)
         progress_interval = _validated_progress_interval(progress_interval)
+        track_progress = checkpoint is not None or progress_callback is not None
         operation_counters = _checkpoint_operation_counters(checkpoint, len(operations), kind="topic")
         topic = self.metadata.topic
         source_seen = 0
@@ -1124,6 +1289,8 @@ class TopicPipeline:
                     chunk = chunk._select(slice(resume_processed - source_seen, None), copy=False)
                     source_seen = resume_processed
 
+                if info is not None:
+                    info.observe(chunk.data)
                 source_seen += len(chunk)
                 pending[next_sequence] = executor.submit(
                     _process_pipeline_chunk,
@@ -1133,10 +1300,12 @@ class TopicPipeline:
                     copy,
                     callers,
                     copy_output,
+                    keep_padding,
                 )
                 next_sequence += 1
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             source_iter = iter(self._source_chunks(chunk_size=chunk_size, copy=False))
             submit_ready(executor, source_iter)
             while pending:
@@ -1154,16 +1323,14 @@ class TopicPipeline:
                     if checkpoint is not None:
                         # Advance per delivered row: a consumer that stops
                         # mid-chunk must resume right after its last row.
-                        _update_checkpoint(
+                        _write_checkpoint(
                             checkpoint,
-                            PipelineProgress(
-                                processed=chunk_start + offset + 1,
-                                emitted=emitted_start + kept + 1,
-                                skipped=skipped_start + offset - kept,
-                                topic=topic,
-                                message_id=row[0],
-                                timestamp=row[1],
-                            ),
+                            chunk_start + offset + 1,
+                            emitted_start + kept + 1,
+                            skipped_start + offset - kept,
+                            topic,
+                            row[0],
+                            row[1],
                             operation_counters=operation_counters,
                         )
                     yield row
@@ -1174,37 +1341,28 @@ class TopicPipeline:
                 if result.processed:
                     last_id = result.message_id
                     last_timestamp = result.timestamp
-                if checkpoint is not None or progress_callback is not None:
-                    progress = _record_progress(
-                        checkpoint,
-                        PipelineProgress(
-                            processed=processed,
-                            emitted=emitted,
-                            skipped=skipped,
-                            topic=topic,
-                            message_id=result.message_id,
-                            timestamp=result.timestamp,
-                        ),
+                if track_progress:
+                    _report_progress(
+                        checkpoint, progress_callback, progress_interval,
+                        processed, emitted, skipped, topic, result.message_id, result.timestamp,
                         operation_counters=operation_counters,
+                        previous=chunk_start,
                     )
-                    _notify_progress(progress_callback, progress, progress_interval, previous=chunk_start)
 
                 submit_ready(executor, source_iter)
+        finally:
+            # Stopping early (break, cancellation, errors) must not wait for
+            # chunks nobody will consume.
+            for future in pending.values():
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
-        done_progress = _record_progress(
-            checkpoint,
-            PipelineProgress(
-                processed=processed,
-                emitted=emitted,
-                skipped=skipped,
-                topic=topic,
-                message_id=last_id,
-                timestamp=last_timestamp,
-                done=True,
-            ),
+        _report_progress(
+            checkpoint, progress_callback, progress_interval,
+            processed, emitted, skipped, topic, last_id, last_timestamp,
+            done=True,
             operation_counters=operation_counters,
         )
-        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def _split_pushdown_operations(self) -> tuple[tuple[_PipelineOperation, ...], tuple[_PipelineOperation, ...]]:
         pushdown_operations = []
@@ -1222,33 +1380,48 @@ class TopicPipeline:
 
         return tuple(pushdown_operations), tuple(remaining_operations)
 
-    def _empty_data_template(self) -> np.ndarray | None:
-        """Schema-correct empty data array for no-match collects, or None when
-        the output schema is unknowable (a map operation may change it)."""
+    def _empty_data_template(self) -> tuple[np.ndarray | None, bool]:
+        """Schema-correct empty data array for no-match collects (None when
+        the output schema is unknowable because a map may change it), and
+        whether the topic is ragged."""
 
         _, remaining = self._split_pushdown_operations()
         if any(operation.kind == "map" for operation in remaining):
-            return None
+            return None, False
         try:
             for chunk in self._chunk_source(1, False, ()):
-                return np.asarray(chunk.data)[:0].copy()
+                return np.asarray(chunk.data)[:0].copy(), chunk.lengths is not None
         except Exception:
-            return None
-        return None
+            return None, False
+        return None, False
 
-    def _make_chunk(self, ids: list[Any], timestamps: list[float], values: list[np.ndarray], copy: bool, frame_ids=None) -> TopicView:
+    def _make_chunk(
+        self,
+        ids: list[Any],
+        timestamps: list[float],
+        values: list[np.ndarray],
+        copy: bool,
+        frame_ids=None,
+        lengths: list[int | None] | None = None,
+        source: "_RowSourceInfo | None" = None,
+    ) -> TopicView:
         # Preserve "no ids" instead of fabricating a column of Nones so the
         # lazy path returns the same schema as the eager path.
         ids_array = None if all(i is None for i in ids) else _object_vector(ids)
         ts_array = np.asarray(timestamps, dtype=np.float64)
         # Stacking allocates, so numeric chunks never alias their rows; object
         # chunks hold references, which copy=True replaces with copies.
-        data_array = _stack_values(values)
+        # Unmapped rows (`source` given) stack exactly like the pass-through
+        # path keeps them.
+        data_array = _stack_values(values, source)
         if copy and data_array.dtype == object:
             data_array = _copy_object_elements(data_array)
+        lengths_array = None
+        if lengths and lengths[0] is not None:
+            lengths_array = np.asarray(lengths, dtype=np.int64)
         return TopicView(ids_array, ts_array, data_array, metadata=self.metadata,
-                         frame_ids=frame_ids if frame_ids and (self.metadata.frame_id is not None or
-                                                             any(f is not None for f in frame_ids)) else None)
+                         frame_ids=frame_ids if _has_row_frames(frame_ids, self.metadata) else None,
+                         lengths=lengths_array)
 
 
 class TopicWindowPipeline:
@@ -1292,20 +1465,27 @@ class TopicWindowPipeline:
         timestamps = deque()
         values = deque()
         frame_ids = deque()
+        lengths = deque()
+        info = _RowSourceInfo()
+        _, operations = self.pipeline._split_pushdown_operations()
+        stack_source = None if any(operation.kind == "map" for operation in operations) else info
+        metadata = self.pipeline.metadata
 
-        for message_id, timestamp, value, frame_id in self.pipeline._iter_processed_rows(
+        for message_id, timestamp, value, frame_id, length in self.pipeline._iter_processed_rows(
             chunk_size=chunk_size,
             copy=self.copy,
             progress_callback=progress_callback,
             cancel_token=cancel_token,
             checkpoint=checkpoint,
             progress_interval=progress_interval,
+            info=info,
         ):
             ids.append(message_id)
             frame_ids.append(frame_id)
             timestamps.append(timestamp)
             # Rows are already copied by the iterator when self.copy is set.
             values.append(value)
+            lengths.append(length)
 
             if self.seconds is not None:
                 cutoff = timestamp - self.seconds
@@ -1314,6 +1494,7 @@ class TopicWindowPipeline:
                     timestamps.popleft()
                     values.popleft()
                     frame_ids.popleft()
+                    lengths.popleft()
 
             if self.size is not None:
                 while len(values) > self.size:
@@ -1321,16 +1502,19 @@ class TopicWindowPipeline:
                     timestamps.popleft()
                     values.popleft()
                     frame_ids.popleft()
+                    lengths.popleft()
 
             window_ids = None if all(i is None for i in ids) else _object_vector(ids)
             # Stacking allocates new arrays, so windows never share memory
-            # with each other or with the source.
+            # with each other or with the source. Frame ids follow the
+            # chunk rule, so all-missing frames keep the topic's frame.
             yield TopicView(
                 window_ids,
                 np.asarray(timestamps, dtype=np.float64),
-                _stack_values(values),
-                metadata=self.pipeline.metadata,
-                frame_ids=_object_vector(frame_ids),
+                _stack_values(list(values), stack_source),
+                metadata=metadata,
+                frame_ids=_object_vector(frame_ids) if _has_row_frames(frame_ids, metadata) else None,
+                lengths=None if lengths[0] is None else np.asarray(lengths, dtype=np.int64),
             )
 
     def collect(
@@ -1434,7 +1618,7 @@ class DatasetQuery:
         if min_lon > max_lon:
             raise ValueError("min_lon must be less than or equal to max_lon")
         return self.filter(
-            lambda data, ts, name: _geographic_value_in_bounds(
+            lambda data: _geographic_value_in_bounds(
                 data,
                 min_lat=min_lat,
                 min_lon=min_lon,
@@ -1557,32 +1741,45 @@ class DatasetQuery:
         topic_workers: int,
     ) -> dict[str, dict]:
         collected = {}
-        total_rows = 0
-        total_bytes = 0
         items = list(self._pipelines.items())
+        # One row/byte budget shared by every topic as its chunks arrive, so
+        # concurrent topics cannot each materialize a full budget first.
+        budget = _CollectBudget(max_rows, max_bytes, allow_large)
 
         def collect_topic(item):
             topic, pipeline = item
-            return topic, pipeline.collect(
+            return topic, pipeline._collect(
                 chunk_size=chunk_size,
                 copy=copy,
                 max_rows=max_rows,
                 max_bytes=max_bytes,
                 allow_large=allow_large,
                 max_workers=max_workers,
+                budget=budget,
             )
 
-        with ThreadPoolExecutor(max_workers=topic_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=topic_workers)
+        futures = []
+        try:
             futures = [executor.submit(collect_topic, item) for item in items]
-            for future in futures:
+            # React to the first failure instead of waiting for earlier
+            # topics; the others stop at their next chunk.
+            for future in as_completed(futures):
                 topic, result = future.result()
-                rows = int(np.asarray(result["ts"]).shape[0])
-                total_rows += rows
-                total_bytes += _topic_result_nbytes(result)
-                _check_collect_limits(total_rows, total_bytes, max_rows, max_bytes, allow_large)
                 collected[topic] = result
+        except BaseException:
+            budget.stop()
+            if budget.error is not None:
+                # Report the topic that exceeded the budget, not a sibling
+                # that stopped because of it.
+                raise budget.error
+            raise
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
-        return collected
+        return {topic: collected[topic] for topic, _ in items}
 
 
 class SourcePipeline:
@@ -1613,23 +1810,37 @@ class SourcePipeline:
 
         Unlike topic pipelines, a callable taking one positional parameter
         receives the whole message dict (``topic``, ``timestamp``, ``name``,
-        ``data``, ...), not just its data. Callables that require two or
-        more positional parameters are called as ``fn(data, ts)`` or
-        ``fn(data, ts, name)``. `fn` returns either a replacement message
-        mapping or replacement data. With `copy`, `fn` gets a private copy
-        of the message and its data.
+        ``data``, ...). Callables that ask for metadata the way topic
+        pipelines define it (second/third parameters required and named like
+        a timestamp/id, or a plain function/lambda with 2-3 required
+        positional parameters) are called as ``fn(data, ts)`` or
+        ``fn(data, ts, name)``. Array functions (from `arraydataengine`,
+        NumPy or SciPy, e.g. ``valid_point_cloud_points``) get ``data``
+        directly. For other one-parameter callables (including ``*args``
+        callables such as ``operator.itemgetter``) the first message decides:
+        if calling with the message dict raises TypeError, ValueError,
+        KeyError, IndexError or AttributeError, the callable is retried with
+        ``data`` and, when that works, gets ``data`` from then on. A callable
+        requiring more arguments (e.g. ``voxel_downsample``) raises
+        TypeError here.
+
+        `fn` returns either a replacement message mapping or replacement
+        data. Point-cloud messages keep ``point_count`` equal to the number
+        of rows of their (unpadded) data. With `copy`, `fn` gets a private
+        copy of the message and its data.
         """
 
+        _metadata_arity(fn, leading=1)  # reject unsatisfiable signatures up front
         return self._with_operation("source_map", fn, copy=copy)
 
     def filter(self, predicate: Callable, copy: bool = True) -> "SourcePipeline":
         """Keep messages for which `predicate` is truthy.
 
-        As with `map()`, a one-parameter `predicate` receives the whole
-        message dict; callables requiring two or more positional parameters
-        get ``(data, ts)`` or ``(data, ts, name)``.
+        `predicate` is dispatched exactly like `map()`'s `fn` (message dict,
+        ``data``, or ``(data, ts[, name])``).
         """
 
+        _metadata_arity(predicate, leading=1)
         return self._with_operation("source_filter", predicate, copy=copy)
 
     def time_range(self, start: float, end: float, inclusive: bool = True) -> "SourcePipeline":
@@ -1675,7 +1886,11 @@ class SourcePipeline:
         With `copy`, message data is copied once up front, so neither the
         callables nor the consumer can alias the source's arrays. A
         `checkpoint` covers exactly the messages processed so far (it also
-        records per-topic emitted counts under ``"topic_emitted"``).
+        records per-topic emitted counts under ``"topic_emitted"``). A
+        progress callback runs before its message is yielded; if it raises,
+        the checkpoint is rolled back so that message is processed again on
+        resume. Messages whose ``point_count`` is smaller than their data's
+        first axis (zero-padded clouds) are trimmed to ``point_count`` rows.
         """
 
         index_counters = _checkpoint_operation_counters(checkpoint, len(self._operations), kind="source")
@@ -1708,42 +1923,57 @@ class SourcePipeline:
                     ),
                     operation_counters=index_counters,
                 )
+            # The checkpoint holds the live counters, so the state to roll
+            # back to when this message's progress callback raises is
+            # captured before the operations advance them.
+            before = None
+            if progress_callback is not None and checkpoint is not None and processed % progress_interval == 0:
+                before = _checkpoint_snapshot(checkpoint)
             # The one copy: after it, nothing below aliases the source.
             message = _normalize_source_message(raw_message, copy=copy)
             keep = True
+            counted = []
 
-            for operation_index, operation in enumerate(self._operations):
-                if operation.kind == "source_topics":
-                    keep = message["topic"] in operation.args[0]
-                elif operation.kind == "source_map":
-                    mapped = callers[operation_index](
-                        _copy_source_message(message) if operation.kwargs.get("copy", True) else message,
-                    )
-                    message = _mapped_source_message(message, mapped, copy=False)
-                elif operation.kind == "source_filter":
-                    keep = bool(
-                        callers[operation_index](
+            try:
+                for operation_index, operation in enumerate(self._operations):
+                    if operation.kind == "source_topics":
+                        keep = message["topic"] in operation.args[0]
+                    elif operation.kind == "source_map":
+                        mapped = callers[operation_index](
                             _copy_source_message(message) if operation.kwargs.get("copy", True) else message,
                         )
-                    )
-                elif operation.kind == "source_time_range":
-                    start, end = operation.args
-                    timestamp = float(message["timestamp"])
-                    if operation.kwargs.get("inclusive", True):
-                        keep = timestamp >= start and timestamp <= end
+                        message = _mapped_source_message(message, mapped, copy=False)
+                    elif operation.kind == "source_filter":
+                        keep = bool(
+                            callers[operation_index](
+                                _copy_source_message(message) if operation.kwargs.get("copy", True) else message,
+                            )
+                        )
+                    elif operation.kind == "source_time_range":
+                        start, end = operation.args
+                        timestamp = float(message["timestamp"])
+                        if operation.kwargs.get("inclusive", True):
+                            keep = timestamp >= start and timestamp <= end
+                        else:
+                            keep = timestamp > start and timestamp < end
+                    elif operation.kind == "source_index_range":
+                        topic = message["topic"]
+                        counters = index_counters[operation_index]
+                        current_index = counters.get(topic, 0)
+                        counters[topic] = current_index + 1
+                        counted.append((counters, topic))
+                        keep = _slice_contains(current_index, *operation.args)
                     else:
-                        keep = timestamp > start and timestamp < end
-                elif operation.kind == "source_index_range":
-                    topic = message["topic"]
-                    counters = index_counters[operation_index]
-                    current_index = counters.get(topic, 0)
-                    counters[topic] = current_index + 1
-                    keep = _slice_contains(current_index, *operation.args)
-                else:
-                    raise ValueError(f"unsupported source pipeline operation: {operation.kind}")
+                        raise ValueError(f"unsupported source pipeline operation: {operation.kind}")
 
-                if not keep:
-                    break
+                    if not keep:
+                        break
+            except BaseException:
+                # This message is not processed: undo its counter updates so
+                # the (live) checkpoint still matches `processed`.
+                for counters, topic in counted:
+                    counters[topic] -= 1
+                raise
 
             if keep:
                 emitted += 1
@@ -1756,39 +1986,25 @@ class SourcePipeline:
             last_id = message.get("name")
             last_timestamp = float(message["timestamp"])
             if track_progress:
-                progress = _record_progress(
-                    checkpoint,
-                    PipelineProgress(
-                        processed=processed,
-                        emitted=emitted,
-                        skipped=skipped,
-                        topic=last_topic,
-                        message_id=last_id,
-                        timestamp=last_timestamp,
-                    ),
+                _report_progress(
+                    checkpoint, progress_callback, progress_interval,
+                    processed, emitted, skipped, last_topic, last_id, last_timestamp,
                     operation_counters=index_counters,
                     topic_emitted=topic_emitted,
+                    live=True,
+                    before=before,
                 )
-                _notify_progress(progress_callback, progress, progress_interval)
 
             if keep:
                 yield message
 
-        done_progress = _record_progress(
-            checkpoint,
-            PipelineProgress(
-                processed=max(processed, resume_processed),
-                emitted=emitted,
-                skipped=skipped,
-                topic=last_topic,
-                message_id=last_id,
-                timestamp=last_timestamp,
-                done=True,
-            ),
+        _report_progress(
+            checkpoint, progress_callback, progress_interval,
+            max(processed, resume_processed), emitted, skipped, last_topic, last_id, last_timestamp,
+            done=True,
             operation_counters=index_counters,
             topic_emitted=topic_emitted,
         )
-        _notify_progress(progress_callback, done_progress, progress_interval, force=True)
 
     def nearest_topic_pairs(
         self,
@@ -1867,16 +2083,24 @@ class SourcePipeline:
         stored; rows the store holds beyond the checkpoint are not appended
         twice. When the checkpoint is ahead of the store (e.g. the process
         died before staged rows were flushed), it is reset and the source is
-        replayed from the start, skipping the rows already stored.
+        replayed from the start, skipping the rows already stored. This also
+        applies when an existing persistent `buffer` is passed in.
+
+        Point-cloud messages are written trimmed to their real points with
+        ``point_count`` set, so buffers store them as ragged rows.
         """
 
         if buffer is not None:
+            skip_counts = None
+            if getattr(buffer, "use_db", False) and _checkpoint_processed(checkpoint) > 0:
+                skip_counts = self._reconcile_checkpoint_with_store(buffer, checkpoint)
             return self._append_to_buffer(
                 buffer,
                 progress_callback=progress_callback,
                 cancel_token=cancel_token,
                 checkpoint=checkpoint,
                 progress_interval=progress_interval,
+                skip_counts=skip_counts,
             )
 
         if not self.topics:
@@ -2071,6 +2295,8 @@ class _PipelineSource:
         self.cancel_token = cancel_token
         self.checkpoint = checkpoint
         self.progress_interval = progress_interval
+        # Buffers size ragged (point-cloud) storage from the source's limit.
+        self.max_points = getattr(pipeline.data_source, "max_points", None)
 
     def get_topics(self):
         return list(self.pipeline.topics)
@@ -2115,6 +2341,7 @@ def topic_view(
             source_uri=source_uri,
             frame_id=frame_id,
             copy=copy,
+            lengths=topic_data.lengths,
         )
 
     inferred_metadata = None
@@ -2142,6 +2369,7 @@ def topic_view(
         source_uri=source_uri,
         frame_id=frame_id,
         copy=copy,
+        lengths=topic_lengths(topic_data),
     )
 
 
@@ -2167,6 +2395,9 @@ def topic_pipeline(
         selected = _apply_pushdown_to_view(view, operations)
         yield from selected.iter_chunks(chunk_size=chunk_size, copy=copy)
 
+    # Chunks are views of arrays nothing else appends to (unlike a live
+    # in-memory ring), so collect() need not detach them.
+    source._ade_static = True
     return TopicPipeline(source, metadata=view.metadata)
 
 
@@ -2194,23 +2425,17 @@ def _apply_pushdown_to_view(view: TopicView, operations: Iterable[_PipelineOpera
                 if metadata_frame_id not in targets:
                     selected = selected._select(np.zeros(len(selected), dtype=bool), copy=False)
             else:
-                selected = selected.filter(
-                    lambda data, ts, name, targets=targets: _row_frame_id(data, name) in targets,
-                    copy=False,
-                )
+                selected = selected._select(np.array([
+                    _row_frame_id(value, name) in targets for _, _, value, name in selected._iter_rows()
+                ], dtype=bool), copy=False)
         elif operation.kind == "spatial_bounds":
             min_bound, max_bound = operation.args
-            selected = selected.filter(
-                lambda data, ts, name, min_bound=min_bound, max_bound=max_bound, operation=operation: (
-                    _spatial_value_in_bounds(
-                        data,
-                        min_bound=min_bound,
-                        max_bound=max_bound,
-                        columns=operation.kwargs["columns"],
-                    )
-                ),
-                copy=False,
-            )
+            columns = operation.kwargs["columns"]
+            # Ragged rows are tested trimmed, so padding never matches.
+            selected = selected._select(np.array([
+                _spatial_value_in_bounds(value, min_bound=min_bound, max_bound=max_bound, columns=columns)
+                for _, _, value, _ in selected._iter_rows()
+            ], dtype=bool), copy=False)
         else:
             raise ValueError(f"unsupported pushdown operation: {operation.kind}")
     return selected
@@ -2223,10 +2448,19 @@ def _process_pipeline_chunk(
     copy: bool,
     callers: list | None = None,
     copy_output: bool | None = None,
+    keep_padding: bool = False,
 ) -> _ProcessedChunk:
+    """Run the row operations over one chunk (on a worker thread).
+
+    Rows are ``(id, ts, data, frame_id, length)`` like
+    `TopicPipeline._iter_processed_rows`: operations see ragged rows trimmed,
+    and with `keep_padding` kept ragged rows are returned padded with their
+    length."""
+
     callers = _operation_callers(operations) if callers is None else callers
     copy_output = copy if copy_output is None else copy_output
     fallback_frame_id = _decode_text(metadata.frame_id)
+    lengths = chunk.lengths
     rows = []
     offsets = []
     processed = 0
@@ -2243,11 +2477,13 @@ def _process_pipeline_chunk(
         current_timestamp = float(chunk.timestamps[row_index])
         last_id = current_id
         last_timestamp = current_timestamp
+        source_row = chunk.data[row_index]
+        row_length = None if lengths is None else int(lengths[row_index])
 
         keep, value, aliases_source = _apply_row_operations(
             operations,
             callers,
-            chunk.data[row_index],
+            source_row if row_length is None else source_row[:row_length],
             current_timestamp,
             current_id,
             frame_id,
@@ -2256,9 +2492,12 @@ def _process_pipeline_chunk(
         )
         if keep:
             emitted += 1
+            output_length = None
+            if row_length is not None and keep_padding:
+                value, output_length, aliases_source = source_row, row_length, True
             if copy_output and aliases_source:
                 value = _copy_value(value)
-            rows.append((current_id, current_timestamp, value, frame_id))
+            rows.append((current_id, current_timestamp, value, frame_id, output_length))
             offsets.append(row_index)
         else:
             skipped += 1
@@ -2412,8 +2651,25 @@ def _normalize_source_message(message: Mapping[str, Any], copy: bool = True) -> 
 
     result["timestamp"] = float(result["timestamp"])
     data = np.asarray(result["data"])
+    if "point_count" in result and data.ndim >= 1:
+        # `point_count` is the number of real points: drop zero padding so
+        # callables and buffers only ever see real rows.
+        count = _point_count(result["point_count"], data.shape[0])
+        if count is not None:
+            data = data[:count]
+            result["point_count"] = count
     result["data"] = data.copy() if copy else data
     return result
+
+
+def _point_count(value: Any, rows: int) -> int | None:
+    """`value` as a row count clamped to `rows`, or None when unusable."""
+
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(count, 0), rows)
 
 
 def _copy_source_message(message: Mapping[str, Any]) -> dict:
@@ -2424,31 +2680,52 @@ def _copy_source_message(message: Mapping[str, Any]) -> dict:
     return result
 
 
+_DISPATCH_ERRORS = (TypeError, ValueError, KeyError, IndexError, AttributeError)
+
+
 def _source_caller(fn: Callable) -> Callable[[Mapping[str, Any]], Any]:
     """Dispatch for source-pipeline callables, resolved once per run.
 
-    Callables requiring two or more positional parameters get
-    ``(data, ts[, name])``; everything else gets the message dict first,
-    falling back to data-style dispatch when that call cannot bind.
+    Callables that ask for metadata (see `_metadata_arity`) get
+    ``(data, ts[, name])``; array functions (arraydataengine, NumPy, SciPy)
+    get ``data``. Everything else gets the message dict, except that when
+    the first call with a message raises one of `_DISPATCH_ERRORS`, the
+    callable is retried with ``data`` and, if that works, gets ``data``
+    from then on.
     """
 
-    required = _required_positional_count(fn)
-    if required is not None and required >= 2:
+    arity = _metadata_arity(fn, leading=1)
+    if arity:
         data_call = _metadata_caller(fn)
         return lambda message: data_call(message["data"], float(message["timestamp"]), message.get("name"))
+    if _is_array_library_callable(fn):
+        return lambda message: fn(message["data"])
 
-    data_call = None
+    mode = None
 
     def call(message: Mapping[str, Any]):
-        nonlocal data_call
-        try:
+        nonlocal mode
+        if mode == "data":
+            return fn(message["data"])
+        if mode == "message":
             return fn(message)
-        except TypeError as exc:
-            if _type_error_from_inside(exc, fn):
-                raise
-        if data_call is None:
-            data_call = _metadata_caller(fn)
-        return data_call(message["data"], float(message["timestamp"]), message.get("name"))
+        try:
+            result = fn(message)
+        except _DISPATCH_ERRORS as exc:
+            binding_error = isinstance(exc, TypeError) and not _type_error_from_inside(exc, fn)
+            try:
+                result = fn(message["data"])
+            except Exception as data_exc:
+                if binding_error:
+                    raise
+                exc.add_note(
+                    f"calling it with the message data instead also failed: {type(data_exc).__name__}: {data_exc}"
+                )
+                raise exc from None
+            mode = "data"
+            return result
+        mode = "message"
+        return result
 
     return call
 
@@ -2457,11 +2734,30 @@ def _mapped_source_message(previous: Mapping[str, Any], mapped, copy: bool) -> d
     if mapped is None:
         raise ValueError("source map functions must return a message mapping or replacement data")
     if isinstance(mapped, Mapping):
+        if (
+            "point_count" in mapped
+            and "point_count" in previous
+            and mapped["point_count"] == previous["point_count"]
+            and "data" in mapped
+        ):
+            # A point count carried over unchanged (``{**message, "data":
+            # new}``) describes the old data; recount the new rows.
+            mapped = dict(mapped)
+            new_data = np.asarray(mapped["data"])
+            if new_data.ndim >= 1:
+                mapped["point_count"] = int(new_data.shape[0])
         return _normalize_source_message(mapped, copy=copy)
 
     result = dict(previous)
     data = np.asarray(mapped)
     result["data"] = data.copy() if copy else data
+    if "point_count" in result:
+        previous_data = previous.get("data")
+        if data.ndim >= 1 and data.ndim == np.ndim(previous_data):
+            result["point_count"] = int(data.shape[0])
+        else:
+            # The map no longer returns rows of points.
+            del result["point_count"]
     return result
 
 
@@ -2526,6 +2822,9 @@ def _checkpoint_operation_counters(
 
 
 def _checkpoint_snapshot(checkpoint: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Independent copy of a checkpoint (its counter containers included,
+    since running pipelines keep updating them in place)."""
+
     if checkpoint is None:
         return None
     snapshot = dict(checkpoint)
@@ -2535,7 +2834,74 @@ def _checkpoint_snapshot(checkpoint: Mapping[str, Any] | None) -> dict[str, Any]
             dict(counter) if isinstance(counter, Mapping) else counter
             for counter in operation_counters
         ]
+    topic_emitted = snapshot.get("topic_emitted")
+    if isinstance(topic_emitted, Mapping):
+        snapshot["topic_emitted"] = dict(topic_emitted)
     return snapshot
+
+
+def _json_safe(value: Any) -> Any:
+    """`value` as plain JSON-serializable Python data (NumPy scalars via
+    ``.item()``, bytes decoded), so checkpoints survive ``json.dumps``."""
+
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    if isinstance(value, np.ndarray):
+        value = value.item() if value.ndim == 0 else value.tolist()
+    elif isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _write_checkpoint(
+    checkpoint: dict[str, Any],
+    processed: int,
+    emitted: int,
+    skipped: int,
+    topic: str | None,
+    message_id: Any,
+    timestamp: float | None,
+    done: bool = False,
+    cancelled: bool = False,
+    operation_counters=None,
+    topic_emitted: dict[str, int] | None = None,
+    live: bool = False,
+) -> None:
+    """Record progress in `checkpoint`.
+
+    With `live`, the counter containers are stored by reference (the
+    pipeline keeps them consistent with `processed`), which avoids copying
+    per-topic state for every message; otherwise counters are copied.
+    """
+
+    checkpoint["processed"] = int(processed)
+    checkpoint["emitted"] = int(emitted)
+    checkpoint["skipped"] = int(skipped)
+    checkpoint["topic"] = topic
+    checkpoint["message_id"] = _json_safe(message_id)
+    checkpoint["timestamp"] = None if timestamp is None else float(timestamp)
+    checkpoint["done"] = bool(done)
+    checkpoint["cancelled"] = bool(cancelled)
+    if operation_counters is not None:
+        checkpoint["operation_counters"] = (
+            operation_counters if live else _operation_counters_snapshot(operation_counters)
+        )
+    if topic_emitted is not None:
+        checkpoint["topic_emitted"] = topic_emitted if live else dict(topic_emitted)
 
 
 def _operation_counters_snapshot(operation_counters):
@@ -2553,36 +2919,82 @@ def _update_checkpoint(
 ) -> None:
     if checkpoint is None:
         return
-    checkpoint.update({
-        "processed": int(progress.processed),
-        "emitted": int(progress.emitted),
-        "skipped": int(progress.skipped),
-        "topic": progress.topic,
-        "message_id": progress.message_id,
-        "timestamp": progress.timestamp,
-        "done": bool(progress.done),
-        "cancelled": bool(progress.cancelled),
-    })
-    if operation_counters is not None:
-        checkpoint["operation_counters"] = _operation_counters_snapshot(operation_counters)
-    if topic_emitted is not None:
-        checkpoint["topic_emitted"] = dict(topic_emitted)
+    _write_checkpoint(
+        checkpoint,
+        progress.processed,
+        progress.emitted,
+        progress.skipped,
+        progress.topic,
+        progress.message_id,
+        progress.timestamp,
+        done=progress.done,
+        cancelled=progress.cancelled,
+        operation_counters=operation_counters,
+        topic_emitted=None if topic_emitted is None else dict(topic_emitted),
+    )
 
 
-def _record_progress(
+def _report_progress(
     checkpoint: dict[str, Any] | None,
-    progress: PipelineProgress,
+    progress_callback: Callable[[PipelineProgress], Any] | None,
+    progress_interval: int,
+    processed: int,
+    emitted: int,
+    skipped: int,
+    topic: str | None = None,
+    message_id: Any = None,
+    timestamp: float | None = None,
+    done: bool = False,
     operation_counters=None,
-    topic_emitted: Mapping[str, int] | None = None,
-) -> PipelineProgress:
-    """Write `progress` into `checkpoint`, then return it carrying the
-    updated checkpoint snapshot (so ``progress.checkpoint`` matches
-    ``progress`` itself, including ``done``)."""
+    topic_emitted: dict[str, int] | None = None,
+    previous: int | None = None,
+    live: bool = False,
+    before: Mapping[str, Any] | None = None,
+) -> None:
+    """Record progress in `checkpoint` and call `progress_callback` when due.
 
-    if checkpoint is None:
-        return progress
-    _update_checkpoint(checkpoint, progress, operation_counters=operation_counters, topic_emitted=topic_emitted)
-    return replace(progress, checkpoint=_checkpoint_snapshot(checkpoint))
+    The callback is due for every `done` report and whenever `processed`
+    crosses a multiple of `progress_interval` since `previous` (default: the
+    row before), so chunked execution that advances many rows at once still
+    reports. Only due callbacks get a checkpoint snapshot (copying state for
+    every row would dominate fast pipelines). The callback runs before the
+    row it reports is delivered, so if it raises, the checkpoint is rolled
+    back (to `before` when the caller captured it, otherwise to its state
+    before this report) and the row is processed again on resume.
+    """
+
+    due = progress_callback is not None and (
+        done
+        or processed // progress_interval
+        > ((processed - 1) if previous is None else previous) // progress_interval
+    )
+    if checkpoint is None and not due:
+        return
+    if due and before is None:
+        before = _checkpoint_snapshot(checkpoint)
+    if checkpoint is not None:
+        _write_checkpoint(
+            checkpoint, processed, emitted, skipped, topic, message_id, timestamp,
+            done=done, operation_counters=operation_counters, topic_emitted=topic_emitted, live=live,
+        )
+    if not due:
+        return
+    progress = PipelineProgress(
+        processed=processed,
+        emitted=emitted,
+        skipped=skipped,
+        topic=topic,
+        message_id=message_id,
+        timestamp=timestamp,
+        done=done,
+        checkpoint=_checkpoint_snapshot(checkpoint),
+    )
+    try:
+        progress_callback(progress)
+    except BaseException:
+        if not done:
+            _restore_checkpoint(checkpoint, before)
+        raise
 
 
 def _restore_checkpoint(checkpoint: dict[str, Any] | None, snapshot: Mapping[str, Any] | None) -> None:
@@ -2604,27 +3016,6 @@ def _close_after_failure(buffer) -> None:
         buffer.close(closed=False)
     except Exception:
         pass
-
-
-def _notify_progress(
-    progress_callback: Callable[[PipelineProgress], Any] | None,
-    progress: PipelineProgress,
-    progress_interval: int,
-    force: bool = False,
-    previous: int | None = None,
-) -> None:
-    """Call `progress_callback` whenever `processed` crosses a multiple of
-    `progress_interval` since `previous` (default: the row before), so
-    chunked execution that advances many rows at once still reports."""
-
-    if progress_callback is None:
-        return
-    if force or progress.done or progress.cancelled:
-        progress_callback(progress)
-        return
-    previous = progress.processed - 1 if previous is None else previous
-    if progress.processed // progress_interval > previous // progress_interval:
-        progress_callback(progress)
 
 
 def _cancel_requested(cancel_token: Any | None) -> bool:
@@ -2871,6 +3262,54 @@ def _coordinates_in_bounds(coordinates: np.ndarray | None, min_bound: np.ndarray
     return bool(np.any(mask))
 
 
+def _normalize_lengths(lengths: Any, count: int, data: np.ndarray) -> np.ndarray | None:
+    """Validated per-row ragged lengths (int64), or None."""
+
+    if lengths is None:
+        return None
+    array = np.asarray(lengths)
+    if array.shape != (count,):
+        raise ValueError(f"lengths must hold one entry per row ({count}), got shape {array.shape}")
+    if array.dtype.kind not in "iub":
+        if array.dtype.kind != "f" or not np.all(np.isfinite(array) & (array == np.round(array))):
+            raise ValueError("lengths must be integers")
+    array = array.astype(np.int64, copy=False)
+    if count:
+        if array.min() < 0:
+            raise ValueError("lengths must be non-negative")
+        if data.dtype != object:
+            if data.ndim < 2:
+                raise ValueError("lengths need data with a padded row axis, shaped (rows, max_points, ...)")
+            if array.max() > data.shape[1]:
+                raise ValueError(
+                    f"lengths exceed the padded row size {data.shape[1]} (max length {int(array.max())})"
+                )
+    return array
+
+
+def topic_lengths(topic_data: dict | np.ndarray | TopicView) -> np.ndarray | None:
+    """Per-row ragged lengths of ADE topic data: a TopicView's `lengths`, a
+    dict's ``"lengths"``, or a structured array's ``length`` field; None
+    for regular (non-ragged) topics."""
+
+    if isinstance(topic_data, TopicView):
+        return topic_data.lengths
+    if isinstance(topic_data, np.ndarray) and topic_data.dtype.names:
+        return np.asarray(topic_data["length"]) if "length" in topic_data.dtype.names else None
+    if isinstance(topic_data, Mapping):
+        lengths = topic_data.get("lengths")
+        return None if lengths is None else np.asarray(lengths)
+    return None
+
+
+def topic_rows(topic_data: dict | np.ndarray | TopicView) -> list:
+    """Each row's data as a list, ragged rows trimmed to their length
+    (``data[i, :lengths[i]]``). Works on topic dicts (including
+    `collect()` results), structured arrays and TopicViews."""
+
+    return topic_view(topic_data).rows()
+
+
 def _normalize_ids(ids: Any, count: int) -> np.ndarray | None:
     if ids is None:
         return None
@@ -2901,7 +3340,8 @@ def _topic_view_nbytes(view: TopicView, include_data: bool = True) -> int:
     ids_nbytes = 0 if view.ids is None else view.ids.nbytes
     data_nbytes = view.data.nbytes if include_data else 0
     frames_nbytes = 0 if view.frame_ids is None else view.frame_ids.nbytes
-    return int(data_nbytes + view.timestamps.nbytes + ids_nbytes + frames_nbytes)
+    lengths_nbytes = 0 if view.lengths is None else view.lengths.nbytes
+    return int(data_nbytes + view.timestamps.nbytes + ids_nbytes + frames_nbytes + lengths_nbytes)
 
 
 def _topic_result_nbytes(topic: Mapping[str, Any]) -> int:
@@ -2996,25 +3436,87 @@ def _concat_chunk_ids(ids_parts: list, chunk_lengths: list[int]):
     ])
 
 
-_BUILTIN_CALLABLE_TYPES = (
-    types.BuiltinFunctionType,
-    types.BuiltinMethodType,
-    types.MethodDescriptorType,
-    types.WrapperDescriptorType,
-    types.MethodWrapperType,
-    types.ClassMethodDescriptorType,
-    type,
-)
-_VARIADIC = 1 << 30
+_TIMESTAMP_PARAMETER_NAMES = frozenset({"ts", "t", "timestamp", "time", "stamp", "timestamps"})
+_ID_PARAMETER_NAMES = frozenset({"id", "message_id", "msg_id", "name", "idx", "index", "i"})
+_POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+_ARRAY_LIBRARY_MODULES = ("arraydataengine", "numpy", "scipy")
 
 
-def _required_positional_count(fn: Callable) -> int | None:
-    """How many positional arguments `fn` requires.
+def _unwrap_callable(fn: Callable) -> Any:
+    """The callable behind partials and ``functools.wraps`` wrappers."""
 
-    Parameters with defaults do not count (so ``def scale(d, factor=2.0)``
-    requires one); ``*args`` counts as unbounded. NumPy ufuncs and builtins
-    without an introspectable signature (``max``, ``np.asarray``) count as
-    data-only (0). None means the signature is unknown.
+    seen = set()
+    while id(fn) not in seen:
+        seen.add(id(fn))
+        if isinstance(fn, functools.partial):
+            fn = fn.func
+            continue
+        wrapped = getattr(fn, "__wrapped__", None)
+        if wrapped is not None and callable(wrapped):
+            fn = wrapped
+            continue
+        break
+    return fn
+
+
+def _callable_module(fn: Callable) -> str:
+    target = _unwrap_callable(fn)
+    if isinstance(target, np.ufunc):
+        return "numpy"
+    module = getattr(target, "__module__", None)
+    if not isinstance(module, str):
+        module = getattr(type(target), "__module__", None)
+    return module if isinstance(module, str) else ""
+
+
+def _in_package(module: str, packages: tuple[str, ...]) -> bool:
+    return any(module == package or module.startswith(package + ".") for package in packages)
+
+
+def _is_package_function(fn: Callable) -> bool:
+    """A named public callable of `arraydataengine` (an array op such as
+    `voxel_downsample`), as opposed to a lambda or local helper."""
+
+    target = _unwrap_callable(fn)
+    if isinstance(target, types.MethodType):
+        target = target.__func__
+    qualname = getattr(target, "__qualname__", "") or ""
+    return _in_package(_callable_module(target), ("arraydataengine",)) and "<" not in qualname
+
+
+def _is_plain_user_function(fn: Callable) -> bool:
+    """A plain Python function or lambda (also behind partials/wrappers)
+    defined outside `arraydataengine`."""
+
+    target = _unwrap_callable(fn)
+    return isinstance(target, types.FunctionType) and not _in_package(
+        _callable_module(target), ("arraydataengine",)
+    )
+
+
+def _is_array_library_callable(fn: Callable) -> bool:
+    """Callables from arraydataengine, NumPy or SciPy: they operate on
+    arrays and never expect a source message dict."""
+
+    return _in_package(_callable_module(fn), _ARRAY_LIBRARY_MODULES)
+
+
+def _metadata_arity(fn: Callable, leading: int) -> int | None:
+    """How many metadata arguments (ts, then id) `fn` gets after its
+    `leading` data arguments (1 for map/filter, 2 for reduce).
+
+    Returns None when the signature is unknown or only ``*args`` (such
+    callables get the data only), else 0, 1 or 2:
+
+    * a second/third parameter gets ts/id only when it is required and
+      named like a timestamp (``ts``, ``t``, ``time``...) / an id (``id``,
+      ``name``, ``index``...), or when `fn` is a plain function/lambda from
+      outside `arraydataengine` with `leading` + 1 or 2 required positional
+      parameters;
+    * named `arraydataengine` functions never get ts/id positionally.
+
+    Raises TypeError when `fn` requires positional arguments that are not
+    passed under these rules (e.g. ``voxel_downsample(points, voxel_size)``).
     """
 
     if isinstance(fn, np.ufunc):
@@ -3022,36 +3524,60 @@ def _required_positional_count(fn: Callable) -> int | None:
     try:
         signature = inspect.signature(fn)
     except (TypeError, ValueError):
-        return 0 if isinstance(fn, _BUILTIN_CALLABLE_TYPES) else None
+        return None
+    positional = [parameter for parameter in signature.parameters.values() if parameter.kind in _POSITIONAL_KINDS]
+    if not positional:
+        has_variadic = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()
+        )
+        return None if has_variadic else 0
+    required = [parameter for parameter in positional if parameter.default is inspect.Parameter.empty]
+    extra = len(required) - leading
+    if extra <= 0:
+        return 0
 
-    required = 0
-    for parameter in signature.parameters.values():
-        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
-            return _VARIADIC
-        if (
-            parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            and parameter.default is inspect.Parameter.empty
-        ):
-            required += 1
-    return required
+    package_function = _is_package_function(fn)
+    if not package_function and extra <= 2 and _is_plain_user_function(fn):
+        return extra
+    granted = 0
+    if not package_function:
+        metadata = positional[leading:leading + 2]
+        names = (_TIMESTAMP_PARAMETER_NAMES, _ID_PARAMETER_NAMES)
+        for parameter, allowed in zip(metadata, names):
+            if parameter.default is not inspect.Parameter.empty or parameter.name.lower() not in allowed:
+                break
+            granted += 1
+    if granted >= extra:
+        return extra
+    raise TypeError(_unsatisfiable_message(fn, required, leading, leading + granted))
+
+
+def _unsatisfiable_message(fn: Callable, required: list, leading: int, passed: int) -> str:
+    name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None) or type(fn).__name__
+    names = [parameter.name for parameter in required]
+    missing = names[passed:]
+    rows = "row data" if leading == 1 else "accumulator and row data"
+    return (
+        f"{name}() requires {len(names)} positional arguments ({', '.join(names)}) but would only receive "
+        f"{passed} ({', '.join(names[:passed])}): callables get the {rows}, plus the timestamp and "
+        "message id only when the next parameters are named like a timestamp (ts, t, time, ...) and an "
+        "id (id, name, index, ...), or when they are plain functions/lambdas with "
+        f"{leading + 1}-{leading + 2} positional parameters. Bind the rest first, e.g. "
+        f"functools.partial({name}, " + ", ".join(f"{missing_name}=..." for missing_name in missing) + ")."
+    )
 
 
 def _metadata_caller(fn: Callable) -> Callable[[Any, float, Any], Any]:
-    """Return ``call(data, ts, message_id)`` passing `fn` only the leading
-    arguments it requires: ``fn(data)``, ``fn(data, ts)`` or
-    ``fn(data, ts, id)``.
+    """Return ``call(data, ts, message_id)`` passing `fn` ``data`` plus the
+    metadata arguments `_metadata_arity` grants it: ``fn(data)``,
+    ``fn(data, ts)`` or ``fn(data, ts, id)``. Feeding metadata into
+    optional parameters (``np.linalg.norm(data, ord=ts)``) or into
+    ``*args`` callables (``partial(np.multiply, 2)``) never happens."""
 
-    Probing by calling ``fn(data, ts, id)`` first would feed metadata into
-    optional parameters (``np.linalg.norm(data, ord=ts)``), so the signature
-    decides; probing remains only for callables without one.
-    """
-
-    required = _required_positional_count(fn)
-    if required is None:
-        return functools.partial(_probe_call_with_metadata, fn)
-    if required <= 1:
+    arity = _metadata_arity(fn, leading=1)
+    if not arity:
         return lambda data, ts, message_id: fn(data)
-    if required == 2:
+    if arity == 1:
         return lambda data, ts, message_id: fn(data, ts)
     return fn
 
@@ -3060,37 +3586,12 @@ def _reduce_caller(fn: Callable) -> Callable[[Any, Any, float, Any], Any]:
     """Like `_metadata_caller` for reducers: ``fn(acc, data)``,
     ``fn(acc, data, ts)`` or ``fn(acc, data, ts, id)``."""
 
-    required = _required_positional_count(fn)
-    if required is None:
-        return functools.partial(_probe_reduce_call, fn)
-    if required <= 2:
+    arity = _metadata_arity(fn, leading=2)
+    if not arity:
         return lambda acc, data, ts, message_id: fn(acc, data)
-    if required == 3:
+    if arity == 1:
         return lambda acc, data, ts, message_id: fn(acc, data, ts)
     return fn
-
-
-def _probe_call_with_metadata(fn: Callable, data: Any, ts: float, message_id: Any) -> Any:
-    try:
-        return fn(data, ts, message_id)
-    except TypeError as exc:
-        if _type_error_from_inside(exc, fn):
-            raise
-    try:
-        return fn(data, ts)
-    except TypeError as exc:
-        if _type_error_from_inside(exc, fn):
-            raise
-    return fn(data)
-
-
-def _probe_reduce_call(fn: Callable, acc: Any, data: Any, ts: float, message_id: Any) -> Any:
-    try:
-        return fn(acc, data, ts, message_id)
-    except TypeError as exc:
-        if _type_error_from_inside(exc, fn):
-            raise
-    return fn(acc, data)
 
 
 def _copy_value(value: Any) -> Any:
@@ -3112,13 +3613,134 @@ def _object_vector(items: list) -> np.ndarray:
     return result
 
 
-def _stack_values(values: list) -> np.ndarray:
-    """Stack row values; rows of differing shape become a 1-D object array."""
+class _RowSourceInfo:
+    """Schema of the source chunks a row-by-row run read, so rows that pass
+    through unmapped are stacked exactly as the pass-through path keeps
+    them (object rows stay objects, string widths are kept)."""
 
+    __slots__ = ("dtype", "ndim", "mixed")
+
+    def __init__(self):
+        self.dtype = None
+        self.ndim = None
+        self.mixed = False
+
+    def observe(self, data: np.ndarray) -> None:
+        if self.dtype is None:
+            self.dtype = data.dtype
+            self.ndim = data.ndim
+        elif data.dtype != self.dtype or data.ndim != self.ndim:
+            self.mixed = True
+
+
+def _stack_values(values: list, source: _RowSourceInfo | None = None) -> np.ndarray:
+    """Stack row values into one array without changing them.
+
+    With `source` (rows taken unmapped from source chunks), rows keep the
+    source dtype, and rows of a 1-D object source stay a 1-D object array.
+    Otherwise values that are not all arrays/NumPy scalars/numbers, that mix
+    text with other kinds, or that differ in shape become a 1-D object
+    array (np.asarray would turn bytes into NUL-stripped ``S`` strings,
+    numbers into strings, or equal-shape object rows into float blocks).
+    """
+
+    if source is not None and source.dtype is not None and not source.mixed:
+        if source.dtype == object and source.ndim == 1:
+            return _object_vector(values)
+        try:
+            return np.asarray(values, dtype=source.dtype)
+        except (TypeError, ValueError):
+            return _object_vector(values)
+
+    for value_type in set(map(type, values)):
+        if not (value_type is np.ndarray or issubclass(value_type, (np.generic, numbers.Number))):
+            return _object_vector(values)
     try:
-        return np.asarray(values)
+        stacked = np.asarray(values)
     except ValueError:
         return _object_vector(values)
+    if stacked.dtype.kind in "US" and len({np.asarray(value).dtype.kind for value in values}) > 1:
+        # Numbers mixed with NumPy strings would all be turned into text.
+        return _object_vector(values)
+    return stacked
+
+
+def _has_row_frames(frame_ids, metadata: TopicMetadata) -> bool:
+    """Whether per-row frame ids are worth keeping on a stacked chunk or
+    window: some row has one, or the topic has a frame they override."""
+
+    return bool(frame_ids) and (
+        metadata.frame_id is not None or any(frame is not None for frame in frame_ids)
+    )
+
+
+def _padded_row_size(data: np.ndarray) -> int:
+    return int(data.shape[1]) if data.ndim >= 2 else 0
+
+
+def _concat_lengths(parts: list, sizes: list[int], row_sizes: list[int]) -> np.ndarray | None:
+    """Concatenate per-chunk ragged lengths (None when no chunk has any;
+    chunks without lengths count every padded row as real)."""
+
+    if not parts or all(part is None for part in parts):
+        return None
+    return np.concatenate([
+        np.asarray(part, dtype=np.int64) if part is not None else np.full(size, row_size, dtype=np.int64)
+        for part, size, row_size in zip(parts, sizes, row_sizes)
+    ])
+
+
+def _detached(array):
+    """`array`, copied when it is a writeable view that its owner (e.g. a
+    live in-memory ring buffer) may still overwrite."""
+
+    if isinstance(array, np.ndarray) and array.base is not None and array.flags.writeable:
+        return array.copy()
+    return array
+
+
+def _detach_chunk(chunk: TopicView) -> TopicView:
+    """A shallow copy of a freshly received source chunk whose array views
+    are replaced with private copies."""
+
+    detached = _shallow_copy(chunk)
+    detached.ids = _detached(chunk.ids)
+    detached.timestamps = _detached(chunk.timestamps)
+    detached.data = _detached(chunk.data)
+    detached.frame_ids = _detached(chunk.frame_ids)
+    detached.lengths = _detached(chunk.lengths)
+    return detached
+
+
+class _CollectBudget:
+    """Row/byte limits shared by topics collected concurrently."""
+
+    def __init__(self, max_rows: int | None, max_bytes: int | None, allow_large: bool):
+        self.max_rows = max_rows
+        self.max_bytes = max_bytes
+        self.allow_large = allow_large
+        self.rows = 0
+        self.nbytes = 0
+        self.error: BaseException | None = None
+        self.stopped = False
+        self._lock = threading.Lock()
+
+    def charge(self, rows: int, nbytes: int) -> None:
+        with self._lock:
+            if self.stopped:
+                raise MemoryError("collect() stopped: another topic exceeded the shared collect budget")
+            self.rows += int(rows)
+            self.nbytes += int(nbytes)
+            try:
+                _check_collect_limits(self.rows, self.nbytes, self.max_rows, self.max_bytes, self.allow_large)
+            except MemoryError as exc:
+                self.error = exc
+                self.stopped = True
+                raise
+
+    def stop(self) -> None:
+        with self._lock:
+            self.stopped = True
 
 
 def _concat_data_parts(parts: list[np.ndarray]) -> np.ndarray:
@@ -3203,11 +3825,11 @@ def _chunk_frame_ids(chunk: TopicView, fallback: str | None) -> np.ndarray | Non
 
 
 def _passthrough_parts(chunk: TopicView, fallback_frame_id: str | None) -> tuple:
-    return (chunk.ids, chunk.timestamps, chunk.data, _chunk_frame_ids(chunk, fallback_frame_id))
+    return (chunk.ids, chunk.timestamps, chunk.data, _chunk_frame_ids(chunk, fallback_frame_id), chunk.lengths)
 
 
 def _split_parts(parts: list[tuple], count: int) -> tuple[list[tuple], list[tuple]]:
-    """Split pending `(ids, ts, data, frames)` parts after `count` rows."""
+    """Split pending `(ids, ts, data, frames, lengths)` parts after `count` rows."""
 
     taken: list[tuple] = []
     rest: list[tuple] = []
@@ -3277,14 +3899,46 @@ def iter_chunks(topic_data: dict | np.ndarray | TopicView, chunk_size: int, copy
     yield from topic_view(topic_data).iter_chunks(chunk_size, copy=copy)
 
 
-def nearest_time_index(timestamps: np.ndarray, query_time: float, tolerance: float | None = None) -> int | None:
+def nearest_time_index(
+    timestamps: np.ndarray | TopicView,
+    query_time: float,
+    tolerance: float | None = None,
+    assume_sorted: bool = False,
+) -> int | None:
     """Index of the timestamp nearest `query_time` (ties prefer the later
-    sample), or None when empty or farther than `tolerance`. `timestamps`
-    need not be sorted."""
+    sample), or None when empty or farther than `tolerance`.
 
+    `timestamps` need not be sorted; validating that costs O(n) per call,
+    so pass ``assume_sorted=True`` when calling repeatedly on timestamps
+    known to be non-decreasing (NaNs only at the end) for an O(log n)
+    lookup, or pass a `TopicView`, which validates its timestamps once.
+    """
+
+    if isinstance(timestamps, TopicView):
+        view = timestamps
+        timestamps = view.timestamps
+        assume_sorted = assume_sorted or view.is_time_sorted()
     ts = np.atleast_1d(np.asarray(timestamps, dtype=np.float64))
-    index = int(_nearest_indices(np.array([query_time], dtype=np.float64), ts, tolerance)[0])
-    return None if index < 0 else index
+    if not assume_sorted:
+        index = int(_nearest_indices(np.array([query_time], dtype=np.float64), ts, tolerance)[0])
+        return None if index < 0 else index
+
+    query = float(query_time)
+    # NaNs sort last, so the searchable prefix ends at the first NaN.
+    count = int(np.searchsorted(ts, np.nan, side="left")) if ts.size and np.isnan(ts[-1]) else int(ts.size)
+    if count == 0 or np.isnan(query):
+        return None
+    insert = int(np.searchsorted(ts[:count], query, side="left"))
+    if insert >= count:
+        index = count - 1
+    elif insert == 0:
+        index = 0
+    else:
+        index = insert if abs(ts[insert] - query) <= abs(query - ts[insert - 1]) else insert - 1
+    distance = abs(ts[index] - query)
+    if np.isnan(distance) or (tolerance is not None and distance > tolerance):
+        return None
+    return index
 
 
 def align_topic(
@@ -3401,11 +4055,14 @@ def resample_topic(
 
     Source rows need not be time-ordered (they are stably sorted first;
     rows with non-finite timestamps are ignored), and ``target_index``
-    always refers to the caller's original rows. `tolerance` bounds the
-    distance to the nearest source sample for ``method="nearest"``; for
-    ``method="linear"`` it is the largest source gap that may be
-    interpolated across. Samples outside the source time range, or inside a
-    larger gap, are marked invalid and their data is NaN.
+    always refers to the caller's original rows. Invalid samples are
+    marked in ``valid`` and their data is NaN (None for non-numeric data).
+
+    ``method="linear"``: samples outside the source time range, or inside a
+    source gap larger than `tolerance`, are invalid. ``method="nearest"``:
+    with `tolerance`, a sample is valid when its nearest source sample is at
+    most `tolerance` away (this may reach just outside the source range);
+    without it, samples outside the source time range are invalid.
     """
 
     if tolerance is not None and tolerance < 0:
@@ -3417,6 +4074,9 @@ def resample_topic(
 
     if normalized_method in {"nearest", "nearest_neighbor"}:
         indices = _nearest_alignment_indices(sample_ts, view.timestamps, tolerance=tolerance)
+        if tolerance is None and view.timestamps.size:
+            outside = (sample_ts < view.timestamps[0]) | (sample_ts > view.timestamps[-1])
+            indices = np.where(outside, -1, indices)
         result = _aligned_topic_arrays(sample_ts, view, indices)
         if positions is not None:
             result["target_index"] = np.where(indices >= 0, positions[np.maximum(indices, 0)], -1).astype(np.int64)
@@ -3427,6 +4087,10 @@ def resample_topic(
 
     if normalized_method != "linear":
         raise ValueError("method must be 'linear' or 'nearest'")
+    if view.lengths is not None:
+        raise ValueError(
+            "linear resampling cannot interpolate ragged (variable-size) rows; use method='nearest'"
+        )
 
     if sample_ts.size == 0:
         data = np.empty((0,) + view.data.shape[1:], dtype=view.data.dtype)
@@ -3498,7 +4162,8 @@ def rolling_window_join(
         ts = target.timestamps[left:right]
         data = target.data[left:right]
         frames = None if target.frame_ids is None else target.frame_ids[left:right]
-        window = TopicView(ids, ts, data, metadata=target.metadata, copy=copy, frame_ids=frames)
+        lengths = None if target.lengths is None else target.lengths[left:right]
+        window = TopicView(ids, ts, data, metadata=target.metadata, copy=copy, frame_ids=frames, lengths=lengths)
         windows.append(window)
         counts.append(len(window))
 
@@ -3632,6 +4297,10 @@ def _aligned_topic_arrays(reference_ts: np.ndarray, target: TopicView, indices: 
         "data": aligned_data,
         "metadata": target.metadata,
     }
+    if target.lengths is not None:
+        # Ragged targets stay padded; unmatched rows hold no points.
+        aligned["lengths"] = np.where(valid, target.lengths[safe_indices], 0).astype(np.int64) \
+            if target.lengths.size else np.zeros(reference_ts.shape, dtype=np.int64)
     if target.metadata.topic is not None:
         aligned["topic"] = target.metadata.topic
     if target.ids is not None:

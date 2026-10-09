@@ -279,7 +279,8 @@ def test_collect_cancel_attaches_partial_and_resumes():
     checkpoint = {}
 
     def cancel(progress):
-        if progress.processed == 15:
+        # Pass-through pipelines report progress per chunk (10, 20, 30).
+        if progress.processed >= 15:
             token.cancel()
 
     with pytest.raises(PipelineCancelled) as info:

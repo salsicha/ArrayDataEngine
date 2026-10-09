@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
-from .nav import enu_to_navsat, navsat_to_enu
+from .core import TopicView, topic_parts
+from .dem import _grid_points
+from .nav import _normalize_orientations, _slerp_rows, enu_to_navsat, navsat_to_enu
 
 
 def _as_points(points: np.ndarray) -> np.ndarray:
@@ -245,7 +248,7 @@ def transform_poses(poses: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return result
 
 
-def transform_odometry(odometry: np.ndarray, transform: np.ndarray, twist_frame: str = "child") -> np.ndarray:
+def transform_odometry(odometry, transform: np.ndarray, twist_frame: str = "child"):
     """Apply an SE(3) transform to ADE odometry arrays shaped (..., 8, 4).
 
     The pose (rows 0-3) is re-expressed in the new parent frame. In
@@ -254,10 +257,22 @@ def transform_odometry(odometry: np.ndarray, transform: np.ndarray, twist_frame:
     default `twist_frame="child"` leaves it untouched. Use
     `twist_frame="parent"` for odometry whose twist is expressed in the parent
     frame; its linear/angular vectors and covariances are then rotated too.
+
+    Accepts raw arrays, topic dicts, structured topic arrays (the values of
+    `DataBuffer.get_buffer()`) and TopicViews, and returns the same form (a
+    TopicView comes back as a topic dict). Orientations without an estimate
+    (all-zero or non-finite quaternions) become NaN, as in
+    `odometry_to_trajectory`. Diagonal covariances are rotated as the diagonal
+    of `R diag(c) R^T`, skipping zero-weight terms so an unknown (NaN)
+    variance only reaches the axes it actually mixes into; rows flagged
+    unknown with a leading -1 (the ROS convention) are left unchanged.
     """
 
     if twist_frame not in ("child", "parent"):
         raise ValueError("twist_frame must be 'child' or 'parent'")
+    if _is_topic_payload(odometry):
+        data, rebuild = _topic_payload(odometry)
+        return rebuild(transform_odometry(data, transform, twist_frame=twist_frame))
     arr = np.asarray(odometry, dtype=np.float64)
     if arr.shape[-2:] != (8, 4):
         raise ValueError("odometry must have shape (..., 8, 4)")
@@ -266,7 +281,9 @@ def transform_odometry(odometry: np.ndarray, transform: np.ndarray, twist_frame:
     rotation = matrix[:3, :3]
     result = arr.copy()
     result[..., 0, :3] = _transform_xyz(arr[..., 0, :3], matrix)
-    result[..., 2, :4] = _transform_quaternions(arr[..., 2, :4], matrix)
+    rotation_q = _rotation_matrix_to_quaternion(rotation)
+    orientation = _normalize_orientations(arr[..., 2, :4])
+    result[..., 2, :4] = _normalize_orientations(_quaternion_multiply(rotation_q, orientation))
     covariance_rows = (1, 3)
     if twist_frame == "parent":
         result[..., 4, :3] = transform_vectors(arr[..., 4, :3], matrix)
@@ -304,37 +321,20 @@ def dem_grid_to_points(
     elevation: np.ndarray,
     x: np.ndarray | None = None,
     y: np.ndarray | None = None,
-    resolution: float = 1.0,
+    resolution: float | tuple[float, float] = 1.0,
     origin: tuple[float, float] = (0.0, 0.0),
+    north_up: bool = False,
 ) -> np.ndarray:
-    """Convert a DEM elevation grid to a `(rows, cols, 3)` XYZ point surface."""
+    """Convert a DEM elevation grid to a `(rows, cols, 3)` XYZ point surface.
 
-    z = np.asarray(elevation, dtype=np.float64)
-    if z.ndim != 2:
-        raise ValueError("elevation must be a two-dimensional DEM grid")
-    if resolution <= 0:
-        raise ValueError("resolution must be positive")
+    Uses the DEM helpers' grid convention (see `dem_to_point_cloud`):
+    without explicit `x`/`y`, `origin` is the XY of the south-west cell and
+    `resolution` a scalar cell size or `(dx, dy)`. Rows grow toward +y by
+    default; pass `north_up=True` for rasters whose row 0 is the northernmost
+    row (HGT tiles, `mosaic_dem_tiles` output) so they are not mirrored.
+    """
 
-    if x is None:
-        x_coords = origin[0] + np.arange(z.shape[1], dtype=np.float64) * resolution
-    else:
-        x_coords = np.asarray(x, dtype=np.float64)
-    if y is None:
-        y_coords = origin[1] + np.arange(z.shape[0], dtype=np.float64) * resolution
-    else:
-        y_coords = np.asarray(y, dtype=np.float64)
-
-    if x_coords.ndim == 1 and y_coords.ndim == 1:
-        if x_coords.size != z.shape[1] or y_coords.size != z.shape[0]:
-            raise ValueError("x and y coordinate vectors must match elevation columns and rows")
-        xx, yy = np.meshgrid(x_coords, y_coords)
-    else:
-        xx = np.asarray(x_coords, dtype=np.float64)
-        yy = np.asarray(y_coords, dtype=np.float64)
-        if xx.shape != z.shape or yy.shape != z.shape:
-            raise ValueError("x and y coordinate grids must match elevation shape")
-
-    return np.stack((xx, yy, z), axis=-1)
+    return _grid_points(elevation, x=x, y=y, resolution=resolution, origin=origin, north_up=north_up)
 
 
 def transform_dem_grid(
@@ -342,13 +342,17 @@ def transform_dem_grid(
     transform: np.ndarray,
     x: np.ndarray | None = None,
     y: np.ndarray | None = None,
-    resolution: float = 1.0,
+    resolution: float | tuple[float, float] = 1.0,
     origin: tuple[float, float] = (0.0, 0.0),
+    north_up: bool = False,
 ) -> np.ndarray:
-    """Apply an SE(3) transform to a DEM grid and return transformed XYZ grid points."""
+    """Apply an SE(3) transform to a DEM grid and return transformed XYZ grid points.
+
+    See `dem_grid_to_points` for `resolution`, `origin`, and `north_up`.
+    """
 
     return _transform_xyz(
-        dem_grid_to_points(elevation, x=x, y=y, resolution=resolution, origin=origin),
+        dem_grid_to_points(elevation, x=x, y=y, resolution=resolution, origin=origin, north_up=north_up),
         transform,
     )
 
@@ -549,18 +553,67 @@ def undistort_normalized_points(
 ) -> np.ndarray:
     """Invert Brown-Conrady / rational distortion of normalized coordinates.
 
-    Uses OpenCV's fixed-point scheme `x = (x_d - tangential(x)) / radial(x)`,
-    iterating each point until its update is at most `tolerance` (normalized
-    units; `None` always runs `iterations`) or `iterations` is reached.
-    Points whose radial factor becomes non-positive or non-finite during the
-    iteration lie outside the distortion model's valid domain and are
-    returned as NaN.
+    Starts with OpenCV's fixed-point scheme
+    `x = (x_d - tangential(x)) / radial(x)`, iterating each point until its
+    update is at most `tolerance` (normalized units) or `iterations` is
+    reached. That scheme can oscillate for strong distortion, so with a
+    `tolerance` every point it leaves unsolved -- not converged, a
+    non-positive radial factor, a result beyond the radius where the radial
+    model folds over, or a re-distortion residual above
+    `max(tolerance, 1e-9)` -- is re-solved with a damped Newton method started
+    from the exact radial-only solution on the model's monotonic branch.
+    Points that still have no solution there (outside the lens model's image
+    or beyond the fold) are NaN.
+
+    `tolerance=None` runs exactly `iterations` fixed-point steps (OpenCV's
+    count-only criterion) without the fallback; points whose radial factor
+    becomes non-positive, or that end beyond the fold radius, are NaN.
     """
 
     distorted, original_shape = _pixel_array(points)
     coefficients = _distortion_coefficients(distortion)
     if not np.any(coefficients):
         return distorted.copy().reshape(original_shape)
+
+    x, y, invalid, unconverged = _fixed_point_undistort(distorted, coefficients, iterations, tolerance)
+    estimate = np.column_stack((x, y))
+    limit = _radial_distortion_limit(coefficients)
+    finite = np.isfinite(distorted).all(axis=1)
+    if tolerance is None:
+        estimate[invalid] = np.nan
+    else:
+        residual_tolerance = max(float(tolerance), _UNDISTORT_RESIDUAL_FLOOR)
+        unsolved = finite & (
+            invalid
+            | unconverged
+            | ~(_undistortion_residual(estimate, distorted, coefficients) <= residual_tolerance)
+        )
+        if limit is not None:
+            with np.errstate(invalid="ignore"):
+                unsolved |= finite & ~(np.sum(estimate * estimate, axis=1) <= limit)
+        if unsolved.any():
+            rows = np.flatnonzero(unsolved)
+            solved = _newton_undistort(distorted[rows], coefficients, limit)
+            residual = _undistortion_residual(solved, distorted[rows], coefficients)
+            solved[~(residual <= residual_tolerance)] = np.nan
+            estimate[rows] = solved
+    if limit is not None:
+        # Past the fold the model is not one-to-one; such points are not
+        # undistortable (projection marks them invalid too).
+        with np.errstate(invalid="ignore"):
+            estimate[np.sum(estimate * estimate, axis=1) > limit] = np.nan
+    return estimate.reshape(original_shape)
+
+
+# A point whose re-distortion misses its input by more than this (normalized
+# units, or `tolerance` when larger) is treated as unsolved.
+_UNDISTORT_RESIDUAL_FLOOR = 1.0e-9
+_UNDISTORT_NEWTON_ITERATIONS = 60
+_UNDISTORT_DAMPING_STEPS = 30
+
+
+def _fixed_point_undistort(distorted: np.ndarray, coefficients: np.ndarray, iterations, tolerance):
+    """OpenCV's fixed-point undistortion; returns `(x, y, invalid, unconverged)`."""
 
     k1, k2, p1, p2, k3, k4, k5, k6 = coefficients
     x_distorted = distorted[:, 0]
@@ -575,16 +628,16 @@ def undistort_normalized_points(
             break
         x_current = x[rows]
         y_current = y[rows]
-        r2 = x_current * x_current + y_current * y_current
-        r4 = r2 * r2
-        r6 = r4 * r2
-        with np.errstate(divide="ignore", invalid="ignore"):
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            r2 = x_current * x_current + y_current * y_current
+            r4 = r2 * r2
+            r6 = r4 * r2
             inverse_radial = (1.0 + k4 * r2 + k5 * r4 + k6 * r6) / (1.0 + k1 * r2 + k2 * r4 + k3 * r6)
-        delta_x = 2.0 * p1 * x_current * y_current + p2 * (r2 + 2.0 * x_current * x_current)
-        delta_y = p1 * (r2 + 2.0 * y_current * y_current) + 2.0 * p2 * x_current * y_current
-        x_next = (x_distorted[rows] - delta_x) * inverse_radial
-        y_next = (y_distorted[rows] - delta_y) * inverse_radial
-        bad = ~np.isfinite(inverse_radial) | (inverse_radial <= 0.0)
+            delta_x = 2.0 * p1 * x_current * y_current + p2 * (r2 + 2.0 * x_current * x_current)
+            delta_y = p1 * (r2 + 2.0 * y_current * y_current) + 2.0 * p2 * x_current * y_current
+            x_next = (x_distorted[rows] - delta_x) * inverse_radial
+            y_next = (y_distorted[rows] - delta_y) * inverse_radial
+            bad = ~np.isfinite(inverse_radial) | (inverse_radial <= 0.0)
         x[rows] = x_next
         y[rows] = y_next
         invalid[rows[bad]] = True
@@ -595,9 +648,138 @@ def undistort_normalized_points(
             done = done | (step <= float(tolerance))
         active[rows[done]] = False
 
-    estimate = np.column_stack((x, y))
-    estimate[invalid] = np.nan
-    return estimate.reshape(original_shape)
+    unconverged = active if tolerance is not None else np.zeros_like(active)
+    return x, y, invalid, unconverged
+
+
+def _undistortion_residual(estimate: np.ndarray, distorted: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
+    redistorted = distort_normalized_points(estimate, coefficients).reshape(-1, 2)
+    with np.errstate(invalid="ignore"):
+        return np.abs(redistorted - distorted).max(axis=1)
+
+
+def _radial_terms(s: np.ndarray, coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Radial factor `R(s) = N(s) / D(s)` and its derivative `dR/ds` (`s = r^2`)."""
+
+    k1, k2, _, _, k3, k4, k5, k6 = coefficients
+    numerator = 1.0 + s * (k1 + s * (k2 + s * k3))
+    denominator = 1.0 + s * (k4 + s * (k5 + s * k6))
+    numerator_ds = k1 + s * (2.0 * k2 + s * 3.0 * k3)
+    denominator_ds = k4 + s * (2.0 * k5 + s * 3.0 * k6)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        radial = numerator / denominator
+        radial_ds = (numerator_ds * denominator - numerator * denominator_ds) / (denominator * denominator)
+    return radial, radial_ds
+
+
+def _solve_radial_undistortion(rho: np.ndarray, coefficients: np.ndarray, limit: float | None) -> np.ndarray:
+    """Solve `r R(r^2) = rho` on the monotonic branch `[0, r_fold)` (NaN if none).
+
+    Safeguarded Newton: steps leaving the current bracket fall back to bisection.
+    """
+
+    def radial_map(r):
+        radial, radial_ds = _radial_terms(r * r, coefficients)
+        return r * radial, radial + 2.0 * r * r * radial_ds
+
+    rho = np.asarray(rho, dtype=np.float64)
+    low = np.zeros_like(rho)
+    if limit is not None:
+        high = np.full_like(rho, np.sqrt(limit))
+        reachable = radial_map(high)[0] >= rho
+    else:
+        # Without a fold the map is increasing and unbounded: grow the bracket.
+        high = np.maximum(rho, 1.0)
+        for _ in range(64):
+            short = radial_map(high)[0] < rho
+            if not short.any():
+                break
+            high = np.where(short, 2.0 * high, high)
+        reachable = radial_map(high)[0] >= rho
+    reachable &= np.isfinite(rho) & (rho >= 0.0)
+
+    r = np.where(reachable, np.minimum(rho, high), np.nan)
+    low = np.where(reachable, low, np.nan)
+    high = np.where(reachable, high, np.nan)
+    for _ in range(200):
+        value, slope = radial_map(r)
+        below = value < rho
+        low = np.where(below, r, low)
+        high = np.where(below, high, r)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            candidate = r - (value - rho) / slope
+        bisect = ~(np.isfinite(candidate) & (candidate > low) & (candidate < high))
+        candidate = np.where(bisect, 0.5 * (low + high), candidate)
+        done = ~(np.abs(candidate - r) > 4.0 * np.finfo(np.float64).eps * np.maximum(r, 1.0))
+        r = candidate
+        if done.all():
+            break
+    return r
+
+
+def _distortion_and_jacobian(x: np.ndarray, y: np.ndarray, coefficients: np.ndarray):
+    _, _, p1, p2, _, _, _, _ = coefficients
+    s = x * x + y * y
+    radial, radial_ds = _radial_terms(s, coefficients)
+    fx = x * radial + 2.0 * p1 * x * y + p2 * (s + 2.0 * x * x)
+    fy = y * radial + p1 * (s + 2.0 * y * y) + 2.0 * p2 * x * y
+    cross = 2.0 * x * y * radial_ds + 2.0 * p1 * x + 2.0 * p2 * y
+    j11 = radial + 2.0 * x * x * radial_ds + 2.0 * p1 * y + 6.0 * p2 * x
+    j22 = radial + 2.0 * y * y * radial_ds + 6.0 * p1 * y + 2.0 * p2 * x
+    return fx, fy, j11, cross, cross, j22
+
+
+def _newton_undistort(distorted: np.ndarray, coefficients: np.ndarray, limit: float | None) -> np.ndarray:
+    """Damped Newton undistortion started from the radial-only solution."""
+
+    xd = distorted[:, 0]
+    yd = distorted[:, 1]
+    rho = np.hypot(xd, yd)
+    radius = _solve_radial_undistortion(rho, coefficients, limit)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = np.where(rho > 0.0, radius / rho, 1.0)
+    x = xd * scale
+    y = yd * scale
+
+    def residual_norm(px, py, tx, ty):
+        fx, fy = _distortion_and_jacobian(px, py, coefficients)[:2]
+        with np.errstate(invalid="ignore", over="ignore"):
+            norm = np.maximum(np.abs(fx - tx), np.abs(fy - ty))
+            if limit is not None:
+                norm = np.where(px * px + py * py <= limit, norm, np.inf)
+        return np.where(np.isfinite(norm), norm, np.inf)
+
+    current = residual_norm(x, y, xd, yd)
+    rows = np.flatnonzero(np.isfinite(current) & (current > 0.0))
+    for _ in range(_UNDISTORT_NEWTON_ITERATIONS):
+        if rows.size == 0:
+            break
+        px, py, tx, ty, norm = x[rows], y[rows], xd[rows], yd[rows], current[rows]
+        fx, fy, j11, j12, j21, j22 = _distortion_and_jacobian(px, py, coefficients)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            determinant = j11 * j22 - j12 * j21
+            step_x = -(j22 * (fx - tx) - j12 * (fy - ty)) / determinant
+            step_y = -(j11 * (fy - ty) - j21 * (fx - tx)) / determinant
+        pending = np.isfinite(step_x) & np.isfinite(step_y)
+        moved = np.zeros(rows.size, dtype=bool)
+        fraction = 1.0
+        for _ in range(_UNDISTORT_DAMPING_STEPS):
+            if not pending.any():
+                break
+            trial_x = px + fraction * step_x
+            trial_y = py + fraction * step_y
+            trial = residual_norm(trial_x, trial_y, tx, ty)
+            better = pending & (trial < norm)
+            px = np.where(better, trial_x, px)
+            py = np.where(better, trial_y, py)
+            norm = np.where(better, trial, norm)
+            moved |= better
+            pending &= ~better
+            fraction *= 0.5
+        x[rows], y[rows], current[rows] = px, py, norm
+        # Rows that can no longer improve (or are exact) are done.
+        rows = rows[moved & (norm > 0.0)]
+    return np.column_stack((x, y))
 
 
 def distort_pixels(
@@ -1063,16 +1245,20 @@ def project_dem_to_image(
     cy: float | None = None,
     x: np.ndarray | None = None,
     y: np.ndarray | None = None,
-    resolution: float = 1.0,
+    resolution: float | tuple[float, float] = 1.0,
     origin: tuple[float, float] = (0.0, 0.0),
     image_shape: tuple[int, int] | None = None,
     transform: np.ndarray | None = None,
     camera_matrix: np.ndarray | None = None,
     return_depth: bool = False,
+    north_up: bool = False,
 ):
-    """Project DEM grid points into image pixels, preserving the DEM grid shape."""
+    """Project DEM grid points into image pixels, preserving the DEM grid shape.
 
-    points = dem_grid_to_points(elevation, x=x, y=y, resolution=resolution, origin=origin)
+    See `dem_grid_to_points` for `resolution`, `origin`, and `north_up`.
+    """
+
+    points = dem_grid_to_points(elevation, x=x, y=y, resolution=resolution, origin=origin, north_up=north_up)
     pixels, depth, valid = project_points_to_image(
         points.reshape(-1, 3),
         fx=fx,
@@ -1194,13 +1380,19 @@ def geographic_bounds_mask(
     columns: tuple[int, int] = (0, 1),
     wrap_longitude: bool = True,
 ) -> np.ndarray:
-    """Return a mask for latitude/longitude coordinates inside a geographic box."""
+    """Return a mask for latitude/longitude coordinates inside a geographic box.
+
+    `coordinates` may also be a NavSat topic (dict, structured topic array, or
+    TopicView); the mask then has one entry per message.
+    """
 
     if min_lat > max_lat:
         raise ValueError("min_lat must be less than or equal to max_lat")
     if len(columns) != 2:
         raise ValueError("columns must contain latitude and longitude column indices")
 
+    if _is_topic_payload(coordinates):
+        coordinates = _topic_payload(coordinates)[0]
     coords = _last_axis_columns(coordinates, columns)
     lat = coords[..., 0]
     lon = coords[..., 1]
@@ -1224,7 +1416,28 @@ def crop_geographic_bounds(
     wrap_longitude: bool = True,
     return_mask: bool = False,
 ):
-    """Select latitude/longitude rows or grid cells inside a geographic bounding box."""
+    """Select latitude/longitude rows or grid cells inside a geographic bounding box.
+
+    NavSat topics (dicts, structured topic arrays such as
+    `DataBuffer.get_buffer()` values, or TopicViews) are filtered message by
+    message and returned in the same form, with timestamps, ids, and frame
+    ids kept aligned.
+    """
+
+    if _is_topic_payload(coordinates):
+        mask = geographic_bounds_mask(
+            coordinates,
+            min_lat=min_lat,
+            min_lon=min_lon,
+            max_lat=max_lat,
+            max_lon=max_lon,
+            columns=columns,
+            wrap_longitude=wrap_longitude,
+        )
+        if mask.ndim != 1:
+            raise ValueError("NavSat topic data must have shape (N, 2+)")
+        cropped = _select_topic_rows(coordinates, mask)
+        return (cropped, mask) if return_mask else cropped
 
     arr = np.asarray(coordinates)
     mask = geographic_bounds_mask(
@@ -1556,20 +1769,7 @@ def _quaternion_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 def _slerp_quaternion(q0: np.ndarray, q1: np.ndarray, fraction: float) -> np.ndarray:
     q0 = _normalize_quaternions(q0)
     q1 = _normalize_quaternions(q1)
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:
-        q1 = -q1
-        dot = -dot
-    dot = float(np.clip(dot, -1.0, 1.0))
-
-    if dot > 0.9995:
-        return _normalize_quaternions(q0 + fraction * (q1 - q0))
-
-    theta_0 = np.arccos(dot)
-    theta = theta_0 * fraction
-    sin_theta = np.sin(theta)
-    sin_theta_0 = np.sin(theta_0)
-    return np.cos(theta) * q0 + sin_theta * (q1 - q0 * dot) / sin_theta_0
+    return _slerp_rows(q0[None, :], q1[None, :], np.array([float(fraction)]))[0]
 
 
 def _quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
@@ -1627,4 +1827,66 @@ def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
 
 
 def _rotate_diagonal_covariances(covariances: np.ndarray, rotation: np.ndarray) -> np.ndarray:
-    return np.einsum("ij,...j->...i", np.asarray(rotation, dtype=np.float64) ** 2, covariances)
+    """Diagonal of `R diag(c) R^T`, skipping zero-weight terms (no 0 * NaN)."""
+
+    values = np.asarray(covariances, dtype=np.float64)
+    weights = np.asarray(rotation, dtype=np.float64) ** 2
+    with np.errstate(invalid="ignore"):
+        rotated = np.where(weights > 0.0, weights * values[..., None, :], 0.0).sum(axis=-1)
+    if not np.isfinite(weights).all():
+        rotated[...] = np.nan
+    # Leave ROS "unknown" (-1) covariance rows as they are.
+    return np.where(values[..., :1] == -1.0, values, rotated)
+
+
+def _is_topic_payload(value) -> bool:
+    return (
+        isinstance(value, TopicView)
+        or (isinstance(value, np.ndarray) and value.dtype.names is not None and "data" in value.dtype.names)
+        or (isinstance(value, Mapping) and "data" in value)
+    )
+
+
+def _topic_payload(value):
+    """Return `(data, rebuild)` for topic dicts, structured topic arrays, and TopicViews.
+
+    `rebuild(new_data)` returns the input's form with `data` replaced: a
+    structured array copy, a dict copy, or (for TopicViews) a topic dict.
+    """
+
+    if isinstance(value, np.ndarray):
+        def rebuild_structured(data):
+            result = value.copy()
+            result["data"] = data
+            return result
+
+        return np.asarray(value["data"]), rebuild_structured
+    if isinstance(value, TopicView):
+        def rebuild_view(data):
+            result = value.as_dict(copy=True, include_metadata=False)
+            result["data"] = data
+            return result
+
+        return value.data, rebuild_view
+
+    def rebuild_mapping(data):
+        result = dict(value)
+        result["data"] = data
+        return result
+
+    return value["data"], rebuild_mapping
+
+
+def _select_topic_rows(value, mask: np.ndarray):
+    """Select rows of a topic payload with a boolean row mask."""
+
+    if isinstance(value, np.ndarray):
+        return value[mask].copy()
+    if isinstance(value, TopicView):
+        return value._select(mask, copy=True)
+    count = int(mask.shape[0])
+    result = dict(value)
+    for key, item in value.items():
+        if isinstance(item, np.ndarray) and item.ndim >= 1 and item.shape[0] == count:
+            result[key] = item[mask].copy()
+    return result

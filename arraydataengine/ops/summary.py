@@ -17,6 +17,10 @@ def describe_topic(topic_data, name: str | None = None) -> dict:
     intervals. ``non_monotonic_count`` counts backwards steps between
     consecutive finite timestamps as recorded; ``nonfinite_ts_count``
     counts NaN/inf timestamps.
+
+    Ragged topics (zero-padded rows with ``lengths``) report ``shape`` as
+    the padded row shape plus ``length_min``/``length_max``, and their value
+    statistics cover real rows only, never the padding.
     """
 
     view = topic_view(topic_data, copy=False)
@@ -54,8 +58,17 @@ def describe_topic(topic_data, name: str | None = None) -> dict:
         if result["duration"] and result["duration"] > 0:
             result["rate_hz"] = float((finite_count - 1) / result["duration"])
 
+    lengths = view.lengths
+    if lengths is not None:
+        result["length_min"] = int(lengths.min()) if count else None
+        result["length_max"] = int(lengths.max()) if count else None
+
     if count and np.issubdtype(data.dtype, np.number):
-        values = data.astype(np.float64, copy=False)
+        if lengths is not None and data.ndim >= 2:
+            real = np.arange(data.shape[1]) < lengths[:, None]
+            values = data[real].astype(np.float64, copy=False)
+        else:
+            values = data.astype(np.float64, copy=False)
         finite = np.isfinite(values)
         finite_count = int(finite.sum())
         result["nan_fraction"] = float(1.0 - finite_count / values.size) if values.size else 0.0

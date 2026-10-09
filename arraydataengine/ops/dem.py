@@ -48,11 +48,19 @@ def mosaic_dem_tiles(
     `overlap` is the number of edge rows/columns adjacent tiles share. SRTM
     HGT tiles repeat their neighbour's edge (a 1-degree SRTM1 tile is
     3601 x 3601 samples, not 3600 x 3600), so their seams must be merged
-    rather than duplicated. The default (`None`) uses `overlap=1` for the
-    standard SRTM tile sizes (1201 and 3601 samples per side) and `0`
-    otherwise; pass an explicit value for other layouts. Samples equal to
-    `nodata` (SRTM voids are -32768) and NaNs are treated as missing, like
-    absent tiles, and become `fill_value`; pass `nodata=None` to keep them.
+    rather than duplicated. The default (`None`) uses `overlap=1` only when
+    every tile is identified as SRTM -- named exactly like an SRTM tile
+    (`N37W122`, optionally with `.hgt`/`.hgt.zip`) and of a standard SRTM
+    size (1201 or 3601 samples per side) -- and `0` otherwise (e.g. tiles
+    keyed by `(lat, lon)` tuples or with other names); pass an explicit value
+    for other layouts. Samples equal to `nodata` (SRTM voids are -32768) and
+    NaNs are treated as missing, like absent tiles, and become `fill_value`;
+    pass `nodata=None` to keep them.
+
+    With `return_index=True` the result is `(mosaic, latitudes, longitudes)`:
+    the integer south-west corner latitude of each tile row (north first)
+    and longitude of each tile column. `sample_elevation_at_latlon(...,
+    index=(latitudes, longitudes))` samples such a mosaic geographically.
     """
 
     named_tiles = _normalize_dem_tiles(tiles)
@@ -61,6 +69,7 @@ def mosaic_dem_tiles(
 
     keyed_tiles: dict[tuple[int, int], np.ndarray] = {}
     tile_shape: tuple[int, int] | None = None
+    all_srtm_named = all(_is_srtm_tile_name(name) for name, _ in named_tiles)
     for name, raster in named_tiles:
         lat, lon = _parse_dem_tile_name(name)
         arr = np.asarray(raster)
@@ -78,7 +87,7 @@ def mosaic_dem_tiles(
     assert tile_shape is not None
     tile_rows, tile_cols = tile_shape
     if overlap is None:
-        overlap = 1 if tile_rows == tile_cols and tile_rows in _SRTM_TILE_SIDES else 0
+        overlap = 1 if all_srtm_named and tile_rows == tile_cols and tile_rows in _SRTM_TILE_SIDES else 0
     overlap = int(overlap)
     if overlap < 0 or overlap >= min(tile_rows, tile_cols):
         raise ValueError("overlap must be non-negative and smaller than the tile size")
@@ -173,9 +182,7 @@ def reproject_raster(
 
     src_cols = (src_x - src[0]) / (src[2] - src[0]) * (arr.shape[1] - 1)
     src_rows = (src_y - src[1]) / (src[3] - src[1]) * (arr.shape[0] - 1)
-    if north_up:
-        src_rows = (arr.shape[0] - 1) - src_rows
-    sampled = sample_grid(arr, src_rows, src_cols, bilinear=_sampling_method(method))
+    sampled = _sample_native(arr, src_rows, src_cols, bilinear=_sampling_method(method), north_up=north_up)
     inside = (
         (src_cols >= 0.0)
         & (src_cols <= arr.shape[1] - 1)
@@ -280,7 +287,8 @@ def sample_grid(
 
     Positions that are non-finite or lie more than half a cell outside the
     grid return `fill_value` (NaN by default); positions within that half-cell
-    border are clamped to the edge. The output dtype is
+    border are clamped to the edge. Nearest sampling rounds half-cell ties up
+    (`floor(x + 0.5)`), so a tie always picks the higher row/column. The output dtype is
     `np.result_type(raster_dtype_or_float, fill_value)`, so nearest sampling of
     an integer raster returns floats unless an integer `fill_value` is given.
     Bilinear taps with zero weight are ignored, so a sample exactly on a valid
@@ -306,7 +314,7 @@ def sample_grid(
     channel_shape = (1,) * (arr.ndim - 2)
 
     if not bilinear:
-        sampled = arr[np.rint(row).astype(np.intp), np.rint(col).astype(np.intp)]
+        sampled = arr[np.floor(row + 0.5).astype(np.intp), np.floor(col + 0.5).astype(np.intp)]
     else:
         r0 = np.floor(row).astype(np.intp)
         c0 = np.floor(col).astype(np.intp)
@@ -471,34 +479,128 @@ def sample_elevation(
     arr = np.asarray(elevation)
     cols = (np.asarray(x, dtype=np.float64) - origin[0]) / dx
     rows = (np.asarray(y, dtype=np.float64) - origin[1]) / dy
-    if north_up:
-        if arr.ndim < 2:
-            raise ValueError("raster must have at least one row and one column")
-        rows = (arr.shape[0] - 1) - rows
-    return sample_grid(arr, rows, cols, bilinear=bilinear)
+    return _sample_native(arr, rows, cols, bilinear=bilinear, north_up=north_up)
+
+
+def sample_elevation_at_latlon(
+    elevation: np.ndarray,
+    lat,
+    lon,
+    bounds: tuple[float, float, float, float] | None = None,
+    index: tuple[np.ndarray, np.ndarray] | None = None,
+    north_up: bool | None = None,
+    method: str = "bilinear",
+) -> np.ndarray:
+    """Sample a geographic (latitude/longitude) DEM raster at WGS84 coordinates.
+
+    Rows and columns of a geographic raster are lines of constant latitude
+    and longitude, so points are located directly in degrees instead of via
+    a local ENU grid (which bends away from those lines over a tile's
+    extent). Describe the raster with exactly one of:
+
+    - `bounds=(west, south, east, north)`: the longitudes/latitudes of the
+      outermost sample nodes (pixel-is-point, the SRTM HGT convention: an
+      `N37W122` tile spans exactly `(-122, 37, -121, 38)`). `east < west`
+      means the raster crosses the antimeridian.
+    - `index=(latitudes, longitudes)` from
+      `mosaic_dem_tiles(..., return_index=True)`: 1-degree tiles whose edge
+      samples lie on whole degrees (SRTM layout), spanning
+      `[min(latitudes), max(latitudes) + 1]` x `[min(longitudes), max(longitudes) + 1]`.
+
+    `north_up` follows the module convention (row 0 = south when False);
+    `None` means True with `index` (mosaics are north-up) and False with
+    `bounds`. `method` is `"bilinear"` or `"nearest"`. Points that are
+    non-finite or more than half a cell outside the raster are NaN.
+    """
+
+    arr = np.asarray(elevation)
+    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 2:
+        raise ValueError("elevation must be a two-dimensional raster with at least 2 x 2 samples")
+    if (bounds is None) == (index is None):
+        raise ValueError("provide exactly one of bounds=(west, south, east, north) or index=(latitudes, longitudes)")
+    if index is not None:
+        latitudes, longitudes = (np.asarray(values, dtype=np.float64).reshape(-1) for values in index)
+        if latitudes.size == 0 or longitudes.size == 0:
+            raise ValueError("index must contain tile latitudes and longitudes")
+        west, south = float(longitudes.min()), float(latitudes.min())
+        east, north = float(longitudes.max()) + 1.0, float(latitudes.max()) + 1.0
+        if north_up is None:
+            north_up = True
+    else:
+        west, south, east, north = (float(value) for value in bounds)
+        if not np.isfinite([west, south, east, north]).all():
+            raise ValueError("bounds must be finite")
+        if north <= south:
+            raise ValueError("bounds must have north > south")
+        if north_up is None:
+            north_up = False
+    span = (east - west) % 360.0
+    if span == 0.0:
+        raise ValueError("bounds must span a non-zero longitude range")
+
+    lat_values, lon_values = np.broadcast_arrays(
+        np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64)
+    )
+    # Longitude offsets from the raster's west edge, wrapped onto the 360
+    # degrees centred on the raster so antimeridian crossings work.
+    with np.errstate(invalid="ignore"):
+        offset = np.mod(lon_values - (west + 0.5 * span) + 180.0, 360.0) - 180.0 + 0.5 * span
+    cols = offset / span * (arr.shape[1] - 1)
+    rows = (lat_values - south) / (north - south) * (arr.shape[0] - 1)
+    return _sample_native(arr, rows, cols, bilinear=_sampling_method(method), north_up=north_up)
 
 
 def sample_elevation_at_navsat(
     elevation: np.ndarray,
-    navsat: np.ndarray,
-    ref_lat: float,
-    ref_lon: float,
+    navsat,
+    ref_lat: float | None = None,
+    ref_lon: float | None = None,
     ref_alt: float = 0.0,
     resolution: float | tuple[float, float] = 1.0,
     origin: tuple[float, float] = (0.0, 0.0),
     bilinear: bool = True,
-    north_up: bool = False,
+    north_up: bool | None = None,
+    bounds: tuple[float, float, float, float] | None = None,
+    index: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Sample DEM elevations at WGS84 latitude/longitude/altitude points.
 
-    Points are converted to ENU relative to the reference; `origin` is the ENU
-    XY of the DEM's south-west cell. See `sample_elevation` for `north_up`.
-    NaN fixes (GPS dropouts) sample as NaN.
+    For geographic rasters (SRTM/HGT tiles, `mosaic_dem_tiles` output), pass
+    `bounds=(west, south, east, north)` or `index=(latitudes, longitudes)`
+    from `mosaic_dem_tiles(..., return_index=True)`: points are then located
+    by latitude/longitude (see `sample_elevation_at_latlon`) and the
+    reference, `resolution`, and `origin` are not used.
+
+    Otherwise the raster is a local metric ENU grid: points are converted to
+    ENU relative to `(ref_lat, ref_lon, ref_alt)` and `origin` is the ENU XY
+    of the DEM's south-west cell (see `sample_elevation`). An ENU grid only
+    approximates a latitude/longitude raster near the reference, so do not
+    use this mode for geographic tiles.
+
+    `north_up=None` means False, except True with `index`. `navsat` may be a
+    `(..., 3+)` array or a NavSat topic (dict, structured topic array, or
+    TopicView). NaN fixes (GPS dropouts) sample as NaN.
     """
 
+    if isinstance(navsat, dict):
+        navsat = navsat["data"]
+    elif isinstance(navsat, TopicView) or (isinstance(navsat, np.ndarray) and navsat.dtype.names is not None):
+        navsat = topic_parts(navsat)[2]
     samples = np.asarray(navsat, dtype=np.float64)
     if samples.ndim == 0 or samples.shape[-1] < 3:
         raise ValueError("navsat must have latitude, longitude, and altitude in the last dimension")
+    if bounds is not None or index is not None:
+        return sample_elevation_at_latlon(
+            elevation,
+            samples[..., 0],
+            samples[..., 1],
+            bounds=bounds,
+            index=index,
+            north_up=north_up,
+            method="bilinear" if bilinear else "nearest",
+        )
+    if ref_lat is None or ref_lon is None:
+        raise ValueError("provide ref_lat/ref_lon for a local ENU grid, or bounds/index for a geographic raster")
     enu = navsat_to_enu(samples[..., 0], samples[..., 1], samples[..., 2], ref_lat, ref_lon, ref_alt)
     return sample_elevation(
         elevation,
@@ -507,7 +609,7 @@ def sample_elevation_at_navsat(
         resolution=resolution,
         origin=origin,
         bilinear=bilinear,
-        north_up=north_up,
+        north_up=bool(north_up),
     )
 
 
@@ -536,8 +638,10 @@ def terrain_patch(
     xy = np.asarray(center, dtype=np.float64)
     if xy.shape != (2,):
         raise ValueError("center must have shape (2,)")
-    center_col = int(np.rint((xy[0] - origin[0]) / dx))
-    center_row = int(np.rint((xy[1] - origin[1]) / dy))
+    # Round half-cell ties up in native (south-origin) coordinates, like
+    # `sample_elevation`, so both row conventions pick the same cell.
+    center_col = int(np.floor((xy[0] - origin[0]) / dx + 0.5))
+    center_row = int(np.floor((xy[1] - origin[1]) / dy + 0.5))
     row_start = center_row - rows // 2
     col_start = center_col - cols // 2
 
@@ -681,6 +785,40 @@ def dem_to_mesh(
         "vertices": vertices[used],
         "faces": remap[faces],
     }
+
+
+def _nearest_index(coordinates: np.ndarray, size: int) -> np.ndarray:
+    """`floor(x + 0.5)` for positions within half a cell of the grid; others untouched."""
+
+    with np.errstate(invalid="ignore"):
+        inside = (coordinates >= -0.5) & (coordinates <= size - 0.5)
+    return np.where(inside, np.clip(np.floor(np.where(inside, coordinates, 0.0) + 0.5), 0, size - 1), coordinates)
+
+
+def _sample_native(arr: np.ndarray, rows, cols, bilinear: bool, north_up: bool) -> np.ndarray:
+    """Sample at `rows` counted from the south (native convention).
+
+    Nearest sampling rounds in native coordinates before any north-up flip,
+    so a half-cell tie picks the same (northern) cell in both conventions.
+    """
+
+    if arr.ndim < 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError("raster must have at least one row and one column")
+    rows = np.asarray(rows, dtype=np.float64)
+    cols = np.asarray(cols, dtype=np.float64)
+    if not bilinear:
+        rows = _nearest_index(rows, arr.shape[0])
+        cols = _nearest_index(cols, arr.shape[1])
+    if north_up:
+        rows = (arr.shape[0] - 1) - rows
+    return sample_grid(arr, rows, cols, bilinear=bilinear)
+
+
+def _is_srtm_tile_name(name) -> bool:
+    if not isinstance(name, (str, bytes, Path)):
+        return False
+    text = name.decode() if isinstance(name, bytes) else str(name)
+    return re.fullmatch(r"[NS]\d{2}[EW]\d{3}(\.HGT)?(\.ZIP)?", Path(text).name.upper()) is not None
 
 
 def _wind_counter_clockwise(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:

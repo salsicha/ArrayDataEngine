@@ -190,15 +190,24 @@ def convert_color(images: np.ndarray, mode: str, alpha=None) -> np.ndarray:
 def convert_image_dtype(image: np.ndarray, dtype, scale: bool = True, clip: bool = True) -> np.ndarray:
     """Convert image/depth arrays between common numeric dtypes.
 
-    With `scale=True` values follow scikit-image's conventions: unsigned
-    integers map to floats in `[0, 1]` (`x / max`) and signed integers to
-    `[-1, 1]` (`x / max`, clamped at -1). Floats map back by the inverse
-    scale with rounding, so integer -> float -> same integer round-trips
-    (except the most negative signed value, which shares -1.0 with `-max`).
-    Integer -> integer conversions preserve zero: same-signedness conversions
-    rescale full-range (unsigned, bit replication/rounding) or by bit shift
-    (signed), and signed <-> unsigned conversions map the non-negative range
-    onto the other type's non-negative range, clipping negatives to 0.
+    With `scale=True` values follow scikit-image's `img_as_*` conventions:
+
+    - integers -> floats: unsigned map to `[0, 1]` (`x / max`), signed to
+      `[-1, 1]` (`x / max`, clamped at -1);
+    - integers -> integers use exact integer bit scaling, as `img_as_*`:
+      unsigned <-> unsigned and signed -> unsigned (negatives clip to 0)
+      replicate/truncate bits so `max` maps to `max`; unsigned -> signed map
+      onto the non-negative range; signed -> signed rescale the full range
+      (e.g. int8 127 -> int16 32767, -128 -> -32768; widening maps zero to a
+      small positive value, exactly like scikit-image);
+    - floats -> integers multiply by the target `max` and round, so integer
+      -> float -> same integer round-trips (except the most negative signed
+      value, which shares -1.0 with `-max`; scikit-image's asymmetric
+      signed mapping does not round-trip). 64-bit targets saturate at their
+      exact limits;
+    - bool -> numbers gives 0 / `max` (1.0 for floats); numbers -> bool are
+      True above half the input's positive range (0.5 for floats).
+
     `clip=True` clips float inputs to the representable range before scaling.
     `scale=False` is a plain `astype`.
     """
@@ -209,6 +218,21 @@ def convert_image_dtype(image: np.ndarray, dtype, scale: bool = True, clip: bool
         return arr.astype(target)
     if arr.dtype == target:
         return arr.copy()
+
+    if target == np.bool_:
+        if arr.dtype.kind in "ui":
+            threshold = np.iinfo(arr.dtype).max / 2.0
+        elif arr.dtype.kind == "f":
+            threshold = 0.5
+        else:
+            return arr.astype(np.bool_)
+        return arr > threshold
+
+    if arr.dtype == np.bool_:
+        result = arr.astype(target)
+        if np.issubdtype(target, np.integer):
+            result *= target.type(np.iinfo(target).max)
+        return result
 
     if np.issubdtype(target, np.floating):
         converted = arr.astype(np.float64)
@@ -233,9 +257,49 @@ def convert_image_dtype(image: np.ndarray, dtype, scale: bool = True, clip: bool
             converted = np.clip(converted, -1.0 if target_signed else 0.0, 1.0)
         converted = converted * target_info.max
 
-    if clip:
-        converted = np.clip(converted, target_info.min, target_info.max)
-    return np.rint(converted).astype(target)
+    if not clip:
+        return np.rint(converted).astype(target)
+    # Floats in [-1, 1] map symmetrically onto [-max, max].
+    lowest = -target_info.max if target_signed and np.issubdtype(arr.dtype, np.floating) else target_info.min
+    return _saturating_cast(np.rint(converted), target, lowest)
+
+
+def _saturating_cast(values: np.ndarray, target: np.dtype, lowest: int) -> np.ndarray:
+    """Cast rounded floats to an integer dtype, saturating at `[lowest, max]`.
+
+    `float(iinfo(int64).max)` rounds up to 2**63, so clipping to it and
+    casting overflows; values at or beyond the float images of the limits
+    take the exact integer limits instead.
+    """
+
+    info = np.iinfo(target)
+    high = values >= float(info.max)
+    low = values <= float(lowest)
+    inner = np.clip(np.where(high | low, 0.0, values), lowest, np.nextafter(float(info.max), 0.0))
+    result = inner.astype(target)
+    result[high] = info.max
+    result[low] = lowest
+    return result
+
+
+def _replicate_bits(values: np.ndarray, source_bits: int, target_bits: int) -> np.ndarray:
+    """scikit-image's `_scale` for non-negative integers held in uint64.
+
+    Narrowing keeps the top bits; widening repeats the source bit pattern
+    (`x * (2**m - 1) // (2**n - 1)` truncated), exact for any widths <= 64.
+    """
+
+    if target_bits <= source_bits:
+        return values >> np.uint64(source_bits - target_bits)
+    result = np.zeros_like(values)
+    shift = target_bits - source_bits
+    while shift > -source_bits:
+        if shift >= 0:
+            result |= values << np.uint64(shift)
+        else:
+            result |= values >> np.uint64(-shift)
+        shift -= source_bits
+    return result
 
 
 def _convert_integer_image(arr: np.ndarray, target: np.dtype) -> np.ndarray:
@@ -243,20 +307,30 @@ def _convert_integer_image(arr: np.ndarray, target: np.dtype) -> np.ndarray:
     target_info = np.iinfo(target)
     source_signed = source_info.min < 0
     target_signed = target_info.min < 0
+    source_bits = source_info.bits
+    target_bits = target_info.bits
 
-    if source_signed and target_signed:
-        # Arithmetic bit shifts keep zero at zero and round-trip exactly.
-        shift = target_info.bits - source_info.bits
-        if shift >= 0:
-            return np.left_shift(arr.astype(target), shift)
-        return np.right_shift(arr, -shift).astype(target)
+    if not source_signed:
+        values = arr.astype(np.uint64)
+        if target_signed:
+            # unsigned -> signed: onto the non-negative range.
+            return _replicate_bits(values, source_bits, target_bits - 1).astype(target)
+        return _replicate_bits(values, source_bits, target_bits).astype(target)
 
-    values = arr.astype(np.float64)
-    if source_signed:
+    if not target_signed:
         # signed -> unsigned: negative values have no representation.
-        values = np.maximum(values, 0.0)
-    converted = np.rint(values / source_info.max * target_info.max)
-    return np.clip(converted, target_info.min, target_info.max).astype(target)
+        values = np.maximum(arr, 0).astype(np.uint64)
+        return _replicate_bits(values, source_bits - 1, target_bits).astype(target)
+
+    if target_bits < source_bits:
+        # Arithmetic shift == floor division, as scikit-image narrows.
+        return np.right_shift(arr, source_bits - target_bits).astype(target)
+    # Widening signed -> signed: offset to unsigned, replicate, offset back.
+    offset = (arr.astype(np.int64) - source_info.min).astype(np.uint64)
+    widened = _replicate_bits(offset, source_bits, target_bits)
+    if target_bits == 64:
+        return (widened ^ np.uint64(1 << 63)).view(np.int64).astype(target)
+    return (widened.astype(np.int64) + target_info.min).astype(target)
 
 
 def image_mask(
@@ -1058,29 +1132,43 @@ def _normalize_axis(axis, ndim: int, name: str) -> int:
 
 
 def _gradient_input(image: np.ndarray, spatial_axes=None, channel_axis="auto") -> tuple[np.ndarray, tuple[int, int]]:
-    """Return a gray float image and its spatial axes."""
+    """Return a gray float image and its spatial axes.
+
+    `spatial_axes` always refer to the axes of the input array; after a color
+    axis is converted away they are remapped onto the gray array.
+    """
 
     arr = np.asarray(image)
+    explicit = None
+    if spatial_axes is not None:
+        explicit = _infer_spatial_axes(arr, spatial_axes)
+
     if isinstance(channel_axis, str):
         if channel_axis != "auto":
             raise ValueError("channel_axis must be 'auto', None, or an integer axis")
         last = arr.ndim - 1
-        explicit_spatial = spatial_axes is not None and last in {
-            _normalize_axis(axis, arr.ndim, "spatial_axes") for axis in spatial_axes
-        }
-        if arr.ndim >= 3 and 3 <= arr.shape[-1] <= 4 and not explicit_spatial:
-            gray = rgb_to_gray(arr)
-            # The color axis is gone; the spatial axes are the last two left.
-            axes = _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
-            return gray, axes
+        color = arr.ndim >= 3 and 3 <= arr.shape[-1] <= 4 and (explicit is None or last not in explicit)
+        channel = last if color else None
+    elif channel_axis is None:
+        channel = None
+    else:
+        channel = _normalize_axis(channel_axis, arr.ndim, "channel_axis")
+
+    if channel is None:
         gray = arr.astype(np.float64, copy=False)
-        return gray, _infer_spatial_axes(gray, spatial_axes)
-    if channel_axis is None:
-        gray = arr.astype(np.float64, copy=False)
-        return gray, _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
-    channel = _normalize_axis(channel_axis, arr.ndim, "channel_axis")
+        if explicit is not None:
+            return gray, explicit
+        if isinstance(channel_axis, str):
+            return gray, _infer_spatial_axes(gray, None)
+        return gray, _infer_spatial_axes(gray, None, channel_axis=None)
+
+    if explicit is not None and channel in explicit:
+        raise ValueError("spatial_axes cannot include the channel axis")
     gray = rgb_to_gray(np.moveaxis(arr, channel, -1))
-    return gray, _infer_spatial_axes(gray, spatial_axes, channel_axis=None)
+    if explicit is None:
+        # The color axis is gone; the spatial axes are the last two left.
+        return gray, _infer_spatial_axes(gray, None, channel_axis=None)
+    return gray, tuple(axis - 1 if axis > channel else axis for axis in explicit)
 
 
 def _convolve_spatial(image: np.ndarray, kernel: np.ndarray, spatial_axes) -> np.ndarray:
