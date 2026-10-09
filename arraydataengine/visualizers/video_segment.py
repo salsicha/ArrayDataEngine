@@ -136,9 +136,10 @@ class VisTool:
         colors = matplotlib.colormaps[colormap](np.linspace(0, 1, n))
         # Randomly shuffle the colors
         np.random.shuffle(colors)
-        # Opencv expects bgr while cm returns rgb, so we swap to match the colormap (though it also works fine without)
-        # Also multiply by 255 since cm returns values in the range [0, 1]
-        colors = colors[:, (2, 1, 0)] * 255
+        # Frames are RGB (as every source yields them) and are displayed by
+        # matplotlib, and cv2 drawing writes channel values as given, so the
+        # colours stay RGB. Scale to [0, 255] since colormaps return [0, 1].
+        colors = colors[:, :3] * 255
         return colors
 
 
@@ -174,7 +175,8 @@ class VisTool:
         labels = results.get_field('labels').tolist()
 
         for i, entity_id in enumerate(ids):
-            color = self.colors[entity_id % self.num_colors]
+            # Channel order matches the frame's (RGB); cv2 needs a plain tuple.
+            color = tuple(float(value) for value in self.colors[entity_id % self.num_colors])
             label = labels[i]
             if 0 < label <= len(self.class_names):
                 class_name = self.class_names[label - 1]

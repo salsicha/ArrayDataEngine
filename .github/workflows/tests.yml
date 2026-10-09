@@ -31,6 +31,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          # The package's dependencies are declared in pyproject.toml;
+          # requirements.txt is the Docker environment.
+          cache-dependency-path: pyproject.toml
       - name: Install system libraries for opencv-python
         run: |
           sudo apt-get update
@@ -60,17 +63,30 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install the package without optional extras
+          cache-dependency-path: pyproject.toml
+      - name: Build the wheel and install it without optional extras
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir "$RUNNER_TEMP/dist"
+          wheels=("$RUNNER_TEMP"/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m pip install "${wheels[0]}" pytest
       - name: Import and CLI smoke test
+        # Outside the checkout, so the installed wheel is what gets imported.
+        working-directory: ${{ runner.temp }}
         run: |
-          python -c "import arraydataengine, ArrayDataEngine; assert ArrayDataEngine.__version__ == arraydataengine.__version__"
+          python - <<'PY'
+          import arraydataengine, ArrayDataEngine
+          assert "site-packages" in arraydataengine.__file__, arraydataengine.__file__
+          assert ArrayDataEngine.__version__ == arraydataengine.__version__
+          PY
           ade --help >/dev/null
           ade demo -o "$RUNNER_TEMP/ade_demo" --duration 1
-      - name: Run the tests that need no extras
-        run: python -m pytest -q --strict-config --strict-markers tests/test_fixes_cli.py
+      - name: Run the tests that need no extras against the installed wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m pytest -q --strict-config --strict-markers -p no:cacheprovider \
+            "$GITHUB_WORKSPACE/tests/test_fixes_cli.py" "$GITHUB_WORKSPACE/tests/test_fixes2_cli.py"
 
   dist:
     name: Build and check distributions
@@ -93,3 +109,30 @@ jobs:
         run: |
           python -m twine check --strict dist/*
           python scripts/check_dist.py dist
+      - name: Install the built wheel into a fresh virtual environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          wheels=("$GITHUB_WORKSPACE"/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m venv wheel-venv
+          wheel-venv/bin/python -m pip install --upgrade pip
+          wheel-venv/bin/python -m pip install --only-binary=:all: "${wheels[0]}"
+      - name: Smoke test the installed wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          wheel-venv/bin/python - <<'PY'
+          import importlib.metadata as metadata
+          import importlib.util
+          import arraydataengine
+          import ArrayDataEngine
+          assert "wheel-venv" in arraydataengine.__file__, arraydataengine.__file__
+          assert arraydataengine.__version__ == metadata.version("arraydataengine")
+          assert arraydataengine.DataBuffer is ArrayDataEngine.DataBuffer
+          assert arraydataengine.DataSources is ArrayDataEngine.DataSources
+          assert importlib.util.find_spec("ade") is None
+          scripts = [ep for ep in metadata.entry_points(group="console_scripts") if ep.name == "ade"]
+          assert [ep.value for ep in scripts] == ["arraydataengine.cli:main"], scripts
+          PY
+          wheel-venv/bin/ade --help >/dev/null
+          wheel-venv/bin/ade demo -o ade_demo --duration 1
+          test -s ade_demo/viewer.html

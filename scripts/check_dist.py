@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 from email.parser import BytesParser
 from email.policy import default
 import hashlib
@@ -16,6 +17,9 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Console scripts the wheel must declare in its entry_points.txt.
+CONSOLE_SCRIPTS = {"ade": "arraydataengine.cli:main"}
 
 
 def _metadata_errors(raw_metadata: bytes, version: str, artifact: str) -> list[str]:
@@ -31,6 +35,40 @@ def _metadata_errors(raw_metadata: bytes, version: str, artifact: str) -> list[s
             f"{artifact}: metadata Version is {metadata['Version']!r}, "
             f"not {version!r}"
         )
+    return errors
+
+
+def _entry_point_errors(raw_entry_points: bytes | None, artifact: str) -> list[str]:
+    """Check that the wheel installs the expected console scripts."""
+    if raw_entry_points is None:
+        return [
+            f"{artifact}: missing entry_points.txt; the console scripts "
+            f"{sorted(CONSOLE_SCRIPTS)!r} would not be installed"
+        ]
+    parser = configparser.ConfigParser(delimiters=("=",), interpolation=None)
+    parser.optionxform = str  # entry point names are case-sensitive
+    try:
+        parser.read_string(raw_entry_points.decode("utf-8"))
+    except (UnicodeDecodeError, configparser.Error) as exc:
+        return [f"{artifact}: unreadable entry_points.txt: {exc}"]
+    declared = (
+        dict(parser.items("console_scripts"))
+        if parser.has_section("console_scripts")
+        else {}
+    )
+    errors = []
+    for name, target in CONSOLE_SCRIPTS.items():
+        found = declared.get(name)
+        if found is None:
+            errors.append(
+                f"{artifact}: entry_points.txt does not declare the {name!r} "
+                "console script"
+            )
+        elif found.replace(" ", "") != target:
+            errors.append(
+                f"{artifact}: console script {name!r} points to {found!r}, "
+                f"not {target!r}"
+            )
     return errors
 
 
@@ -83,6 +121,15 @@ def _check_wheel(wheel: Path, version: str) -> list[str]:
                     archive.read(metadata_names[0]), version, wheel.name
                 )
             )
+            entry_points_name = (
+                metadata_names[0].rsplit("/", 1)[0] + "/entry_points.txt"
+            )
+            raw_entry_points = (
+                archive.read(entry_points_name)
+                if entry_points_name in names
+                else None
+            )
+            errors.extend(_entry_point_errors(raw_entry_points, wheel.name))
     return errors
 
 

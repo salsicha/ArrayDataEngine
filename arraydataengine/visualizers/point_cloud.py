@@ -4,6 +4,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,19 @@ draw = None
 HTML_MAX_POINTS = 100000
 
 
+def _in_ipython_kernel() -> bool:
+    """True inside a Jupyter/IPython kernel (not a plain script or terminal)."""
+
+    ipython = sys.modules.get("IPython")
+    if ipython is None:
+        return False
+    try:
+        shell = ipython.get_ipython()
+    except Exception:
+        return False
+    return shell is not None and getattr(shell, "kernel", None) is not None
+
+
 def _ensure_open3d():
     global o3d, draw
     if o3d is not None:
@@ -23,13 +37,40 @@ def _ensure_open3d():
         import open3d as imported_open3d
     except ImportError:
         return False
-    try:
-        from open3d.web_visualizer import draw as imported_draw
-    except ImportError:
-        imported_draw = None
+    imported_draw = None
+    # open3d.web_visualizer starts a non-daemon WebRTC server thread on
+    # import, which keeps a plain Python process from ever exiting; it is
+    # only usable from a notebook kernel anyway.
+    if _in_ipython_kernel():
+        try:
+            from open3d.web_visualizer import draw as imported_draw
+        except ImportError:
+            imported_draw = None
     o3d = imported_open3d
     draw = imported_draw
     return True
+
+
+def _valid_points(points, length=None, drop_zero_rows: bool = True) -> np.ndarray:
+    """Real points of a cloud as an ``(N, 3+)`` float64 array.
+
+    `length` (a message's ``point_count`` or a topic's ``lengths`` entry)
+    trims a zero-padded cloud to its real rows. Rows with non-finite XYZ are
+    dropped, and so are exact all-zero XYZ rows (padding) when
+    `drop_zero_rows` is set, so padded arrays never draw a blob of points at
+    the sensor origin.
+    """
+
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        raise ValueError(f"point clouds must have shape (N, 3+), got {arr.shape}")
+    if length is not None:
+        arr = arr[: max(0, int(length))]
+    xyz = arr[:, :3]
+    keep = np.isfinite(xyz).all(axis=1)
+    if drop_zero_rows:
+        keep &= np.any(xyz != 0.0, axis=1)
+    return arr[keep]
 
 
 def _configure_native_glfw_platform():
@@ -89,16 +130,16 @@ class VisTool:
             self.update = self._update_point_cloud_native
 
 
-    def _show_embedded(self, data=None):
+    def _show_embedded(self, data=None, length=None):
         if data is not None:
-            self._show_point_cloud_embedded(data)
+            self._show_point_cloud_embedded(data, length=length)
             return
         self._destroy_embedded()
 
 
-    def _show_native(self, data=None):
+    def _show_native(self, data=None, length=None):
         if data is not None:
-            self._show_point_cloud_native(data)
+            self._show_point_cloud_native(data, length=length)
             return
         self.vis.run()
         self._destroy_native()
@@ -116,13 +157,13 @@ class VisTool:
         self._html_kept = 0
 
 
-    def _add_point_cloud_html(self, points, colors=None):
+    def _add_point_cloud_html(self, points, colors=None, length=None, drop_zero_rows=True):
         arr = np.asarray(points, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] < 3 or arr.shape[0] == 0:
             return
-        xyz = arr[:, :3]
-        # NaN/Inf would serialize as invalid JSON and blank the viewer.
-        xyz = xyz[np.isfinite(xyz).all(axis=1)]
+        # NaN/Inf would serialize as invalid JSON and blank the viewer;
+        # zero padding would pile up at the origin.
+        xyz = _valid_points(arr, length, drop_zero_rows=drop_zero_rows)[:, :3]
         if xyz.shape[0] == 0:
             return
         start = (-self._html_seen) % self._html_stride
@@ -147,22 +188,24 @@ class VisTool:
         self.pose_segments.append((origin.copy(), end.copy()))
 
 
-    def _update_point_cloud_html(self, last_message, odom_transform):
-        points = np.asarray(last_message, dtype=np.float64)
+    def _update_point_cloud_html(self, last_message, odom_transform, length=None):
+        # Trim padding before transforming: zero rows would otherwise land
+        # exactly on the sensor pose.
+        points = _valid_points(last_message, length)
         transform = np.asarray(odom_transform, dtype=np.float64)
         transformed = points.copy()
         transformed[:, :3] = points[:, :3] @ transform[:3, :3].T + transform[:3, 3]
-        self._add_point_cloud_html(transformed)
+        self._add_point_cloud_html(transformed, drop_zero_rows=False)
 
 
-    def _show_point_cloud_html(self, data):
-        self._add_point_cloud_html(data)
+    def _show_point_cloud_html(self, data, length=None):
+        self._add_point_cloud_html(data, length=length)
         self._destroy_html()
 
 
-    def _show_html(self, data=None):
+    def _show_html(self, data=None, length=None):
         if data is not None:
-            self._add_point_cloud_html(data)
+            self._add_point_cloud_html(data, length=length)
         self._destroy_html()
 
 
@@ -200,7 +243,25 @@ class VisTool:
         self.shapes = []
 
 
-    def _add_point_cloud_embedded(self, points, colors=None):
+    @staticmethod
+    def _trimmed_with_colors(points, colors, length):
+        """Valid points plus the matching rows of per-point `colors`."""
+
+        arr = np.asarray(points, dtype=np.float64)
+        if colors is None:
+            return _valid_points(arr, length), None
+        if arr.ndim != 2 or arr.shape[1] < 3:
+            raise ValueError(f"point clouds must have shape (N, 3+), got {arr.shape}")
+        colors = np.asarray(colors, dtype=np.float64)
+        if length is not None:
+            arr, colors = arr[: max(0, int(length))], colors[: max(0, int(length))]
+        xyz = arr[:, :3]
+        keep = np.isfinite(xyz).all(axis=1) & np.any(xyz != 0.0, axis=1)
+        return arr[keep], colors[keep]
+
+
+    def _add_point_cloud_embedded(self, points, colors=None, length=None):
+        points, colors = self._trimmed_with_colors(points, colors, length)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points[:, :3])
         if colors is None:
@@ -209,7 +270,8 @@ class VisTool:
         self.shapes.append(pcd)
 
 
-    def _add_point_cloud_native(self, points, colors=None):
+    def _add_point_cloud_native(self, points, colors=None, length=None):
+        points, colors = self._trimmed_with_colors(points, colors, length)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points[:, :3])
         if colors is None:
@@ -220,19 +282,21 @@ class VisTool:
         self.vis.update_renderer()
 
 
-    def _show_point_cloud_embedded(self, data):
+    def _show_point_cloud_embedded(self, data, length=None):
         ## Embedded
+        data = _valid_points(data, length)
 
         new_pcd = o3d.geometry.PointCloud()
-        new_pcd.points = o3d.utility.Vector3dVector(data)
+        new_pcd.points = o3d.utility.Vector3dVector(data[:, :3])
         new_pcd.colors = o3d.utility.Vector3dVector(self.get_colors(data))
 
         draw(new_pcd)
 
 
-    def _show_point_cloud_native(self, data):
+    def _show_point_cloud_native(self, data, length=None):
         ## Pop out:
-        self.new_pcd.points = o3d.utility.Vector3dVector(data)
+        data = _valid_points(data, length)
+        self.new_pcd.points = o3d.utility.Vector3dVector(data[:, :3])
         self.new_pcd.colors = o3d.utility.Vector3dVector(self.get_colors(data))
 
         self.vis.add_geometry(self.new_pcd)
@@ -293,9 +357,9 @@ class VisTool:
         self.vis.update_renderer()
 
 
-    def _update_point_cloud_embedded(self, last_message, odom_transform):
+    def _update_point_cloud_embedded(self, last_message, odom_transform, length=None):
         ## Embedded
-        points = np.asarray(last_message)
+        points = _valid_points(last_message, length)
         new_pcd = o3d.geometry.PointCloud()
         new_pcd.points = o3d.utility.Vector3dVector(points[:, :3])
         new_pcd.colors = o3d.utility.Vector3dVector(self.get_colors(points))
@@ -319,11 +383,11 @@ class VisTool:
         return colors
 
 
-    def _update_point_cloud_native(self, last_message, odom_transform):
+    def _update_point_cloud_native(self, last_message, odom_transform, length=None):
         ## Pop out
         # A fresh geometry per update so successive scans accumulate into a
         # map; reusing one object made every call replace the previous scan.
-        points = np.asarray(last_message)
+        points = _valid_points(last_message, length)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points[:, :3])
         pcd.colors = o3d.utility.Vector3dVector(self.get_colors(points))

@@ -5,7 +5,38 @@ y_size = 40
 rate = 10
 duration = 2.0
 
-def align_images(images):
+# ITU-R BT.601 luma weights for R, G, B (what OpenCV's RGB2GRAY uses).
+_LUMA_RGB = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
+def to_gray(image, color_order="rgb"):
+    """Grayscale float32 copy of an ``(H, W)``, ``(H, W, 1)``, ``(H, W, 3)``
+    or ``(H, W, 4)`` image.
+
+    Colour images are RGB(A), as every ArrayDataEngine source yields them;
+    pass ``color_order="bgr"`` for arrays in OpenCV's BGR(A) order.
+    """
+
+    if color_order not in ("rgb", "bgr"):
+        raise ValueError(f"color_order must be 'rgb' or 'bgr', got {color_order!r}")
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        return arr[..., 0]
+    if arr.ndim == 3 and arr.shape[2] in (3, 4):
+        channels = arr[..., :3]
+        if color_order == "bgr":
+            channels = channels[..., ::-1]
+        return channels @ _LUMA_RGB
+    raise ValueError(f"expected a grayscale or colour image, got shape {arr.shape}")
+
+
+def align_images(images, color_order="rgb"):
+    """Align consecutive frames by their mean optical flow.
+
+    Colour frames are RGB(A) unless ``color_order="bgr"``.
+    """
     import cv2
 
     # TODO: alignment should shrink the final image, instead of padding with noise
@@ -14,7 +45,7 @@ def align_images(images):
 
     for i in range(images.shape[0] - 1):
     
-        x_vel, y_vel = dense_optical_flow(images[i], images[i + 1])
+        x_vel, y_vel = dense_optical_flow(images[i], images[i + 1], color_order=color_order)
 
         alignments.append([np.rint(x_vel), np.rint(y_vel)])
 
@@ -40,6 +71,9 @@ def align_images(images):
         if x_shift != 0:
             synth_background = make_background()
             img = cv2.resize(synth_background, out_shape)
+            if new_img.ndim == 3:
+                # The synthetic background is grayscale; fill every channel.
+                img = np.repeat(img[..., None], new_img.shape[2], axis=2)
             if x_shift > 0:
                 new_img[:, -x_shift:] = img[:, -x_shift:]
             else:
@@ -50,23 +84,24 @@ def align_images(images):
     return np.array(new_images)
 
 
-def dense_optical_flow(img0, img1):
+def dense_optical_flow(img0, img1, color_order="rgb"):
+    """Mean (x, y) optical flow from `img0` to `img1`.
+
+    Colour images are converted to grayscale first; they are RGB(A), as the
+    sources yield them, unless ``color_order="bgr"``.
+    """
+    prev = to_gray(img0, color_order)
+    nxt = to_gray(img1, color_order)
     try:
         from skimage.registration import optical_flow_ilk
     except ModuleNotFoundError:
         import cv2
 
-        prev = img0.astype(np.float32)
-        nxt = img1.astype(np.float32)
-        if prev.ndim == 3:
-            prev = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
-        if nxt.ndim == 3:
-            nxt = cv2.cvtColor(nxt, cv2.COLOR_BGR2GRAY)
         flow = cv2.calcOpticalFlowFarneback(prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         return np.mean(flow[..., 0]), np.mean(flow[..., 1])
 
     radius = 50
-    v, u = optical_flow_ilk(img0, img1, radius=radius)
+    v, u = optical_flow_ilk(prev, nxt, radius=radius)
 
     return np.mean(u), np.mean(v)
 

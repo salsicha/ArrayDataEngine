@@ -30,7 +30,7 @@ RUN apt update && apt install -q -y --no-install-recommends \
     ros-$ROS2_DISTRO-tf2-msgs software-properties-common build-essential gcc \
     x11-apps libpq-dev build-essential python3-tk python3-pandas unzip python3-opencv \
     ros-$ROS2_DISTRO-cv-bridge python3-numpy vim python3-sklearn python3-skimage \
-    python3-scipy python3-tqdm wget python3-dev ninja-build clang && \
+    python3-scipy python3-tqdm wget python3-dev ninja-build clang git cmake && \
     rm -rf /var/lib/apt/lists/* && \
     ln -s /usr/bin/python3 /usr/bin/python
 
@@ -48,17 +48,25 @@ RUN mkdir /dataengine
 COPY requirements.txt /dataengine/requirements.txt
 RUN pip3 install -r /dataengine/requirements.txt
 
-## ROS2_numpy
+## ros2_numpy
+# The arraydataengine package does not use it; it is kept for the notebooks
+# (notebooks/iterator_example.ipynb imports it). The source is pinned to the
+# commit of tag v2.0.12-jazzy and the checkout is verified against that hash,
+# so a moved tag or a tampered download fails the build.
+ARG ROS2_NUMPY_COMMIT=d5ebf723e1d2457d36fa89bf021b212e340c3c11
 RUN . /opt/ros/$ROS2_DISTRO/setup.bash && . /venv/bin/activate && \
-    wget https://github.com/Box-Robotics/ros2_numpy/archive/refs/tags/v2.0.12-jazzy.zip && \
-    unzip v2.0.12-jazzy.zip && rm v2.0.12-jazzy.zip && \
-    cd ros2_numpy-2.0.12-jazzy && mkdir build && cd build && cmake .. && make install
+    git init -q /tmp/ros2_numpy && cd /tmp/ros2_numpy && \
+    git fetch -q --depth 1 https://github.com/Box-Robotics/ros2_numpy.git "$ROS2_NUMPY_COMMIT" && \
+    git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$ROS2_NUMPY_COMMIT" && \
+    mkdir build && cd build && cmake .. && make install && \
+    cd / && rm -rf /tmp/ros2_numpy
 
 WORKDIR /dataengine
 
 COPY arraydataengine /dataengine/arraydataengine
 COPY ArrayDataEngine /dataengine/ArrayDataEngine
-COPY pyproject.toml README.md /dataengine/
+COPY pyproject.toml README.md LICENSE /dataengine/
 
 RUN . /venv/bin/activate && pip3 install -e .
 

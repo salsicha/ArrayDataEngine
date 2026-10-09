@@ -66,6 +66,10 @@ def _write_valid_artifacts(dist_dir: Path) -> None:
         archive.writestr(
             f"arraydataengine-{VERSION}.dist-info/METADATA", METADATA
         )
+        archive.writestr(
+            f"arraydataengine-{VERSION}.dist-info/entry_points.txt",
+            "[console_scripts]\nade = arraydataengine.cli:main\n",
+        )
 
     root = f"arraydataengine-{VERSION}"
     sdist = dist_dir / f"{root}.tar.gz"

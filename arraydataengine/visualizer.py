@@ -41,10 +41,14 @@ class Visualizer:
 
 
     def update(self, *args, **kwargs):
+        # Point clouds: update(points, transform, length=None). `length` (a
+        # message's point_count or a topic's lengths entry) trims zero
+        # padding; all-zero rows are dropped either way.
         self.vis_tool.update(*args, **kwargs)
 
 
     def add_point_cloud(self, *args, **kwargs):
+        # add_point_cloud(points, colors=None, length=None), see update().
         self.vis_tool.add_point_cloud(*args, **kwargs)
 
 
