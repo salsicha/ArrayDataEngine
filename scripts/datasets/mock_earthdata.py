@@ -123,7 +123,11 @@ def _make_tls(directory: Path) -> tuple[Path, Path, Path]:
             .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName(h) for h in HOSTS]), critical=False)
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                                         content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                         key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
             .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
             .sign(ca_key, hashes.SHA256()))
     ca_pem.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
@@ -136,13 +140,20 @@ def _make_tls(directory: Path) -> tuple[Path, Path, Path]:
 def _make_tls_openssl(directory: Path) -> tuple[Path, Path, Path]:
     ca_key, ca_pem = directory / "ca.key", directory / "ca.pem"
     key_pem, csr, cert_pem, ext = directory / "server.key", directory / "server.csr", directory / "server.pem", directory / "ext.cnf"
-    ext.write_text("basicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\nsubjectAltName="
-                   + ",".join(f"DNS:{h}" for h in HOSTS) + "\n")
-    run = partial_run = lambda *args: subprocess.run(["openssl", *args], check=True, capture_output=True)  # noqa: E731
+    # Python 3.13+ verifies X.509 strictly: the CA needs key usage, the leaf key identifiers.
+    ext.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                   "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+                   "subjectAltName=" + ",".join(f"DNS:{h}" for h in HOSTS) + "\n")
+
+    def run(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True)
+
     run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
-        "-subj", "/CN=ArrayDataEngine mock Earthdata CA", "-keyout", str(ca_key), "-out", str(ca_pem))
-    partial_run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
-                "-subj", f"/CN={TILE_HOST}", "-keyout", str(key_pem), "-out", str(csr))
+        "-subj", "/CN=ArrayDataEngine mock Earthdata CA", "-keyout", str(ca_key), "-out", str(ca_pem),
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash")
+    run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+        "-subj", f"/CN={TILE_HOST}", "-keyout", str(key_pem), "-out", str(csr))
     run("x509", "-req", "-in", str(csr), "-CA", str(ca_pem), "-CAkey", str(ca_key), "-CAcreateserial",
         "-days", "1", "-extfile", str(ext), "-out", str(cert_pem))
     return ca_pem, cert_pem, key_pem
