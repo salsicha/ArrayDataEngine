@@ -1,9 +1,11 @@
 """Check the authenticated NASA Earthdata SRTM download path with YOUR credentials.
 
-The notebooks and tests exercise DEMSource's download code against a local server
-holding real SRTM tiles, but the Earthdata login step itself needs an account, so
-this script is for you to run. It downloads tile N37W122 (San Francisco Bay Area,
-about 25 MB) through ``DataSources("DEM", ...)`` into a temporary cache and checks:
+The tests and the ``earthdata-mock`` notebook profile exercise the full download
+flow (Earthdata Login redirect, session cookie, pre-signed S3 hand-off) against
+the synthetic service in ``mock_earthdata.py``; this script checks the live NASA
+service, which needs an Earthdata account, so it is for you to run. It downloads
+tile N37W122 (San Francisco Bay Area, about 25 MB) through
+``DataSources("DEM", ...)`` into a temporary cache and checks:
 
 * the tile decodes as 3601 x 3601 samples (SRTMGL1, 1 arc-second);
 * the elevation at the Mount Diablo summit (1173 m) is within 30 m;
@@ -12,7 +14,7 @@ about 25 MB) through ``DataSources("DEM", ...)`` into a temporary cache and chec
 
 Credentials come from the ``earthdata_username`` / ``earthdata_password``
 environment variables and are never printed. Create a free account at
-https://urs.earthdata.nasa.gov and approve the "LP DAAC Data Pool" application.
+https://urs.earthdata.nasa.gov; approve the LP DAAC application if Earthdata Login asks.
 
 Usage::
 

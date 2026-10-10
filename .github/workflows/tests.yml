@@ -43,7 +43,7 @@ jobs:
           python -m pip install --upgrade pip
           # Install through the declared extras so a broken extra fails CI;
           # matplotlib and pillow are only needed by the tests.
-          python -m pip install -e ".[dev,arrow,tiledb,image,ros]" matplotlib pillow
+          python -m pip install -e ".[dev,arrow,tiledb,image,ros,dem]" matplotlib pillow
       - name: Validate release metadata
         run: python scripts/check_release.py
       - name: Run tests

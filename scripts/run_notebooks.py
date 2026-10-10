@@ -14,6 +14,9 @@ Profiles set the notebooks' ``ADE_*`` configuration variables:
   (the example recording's ``.bag`` copy is SQLite inside).
 * ``dem-download`` – the DEM download branch of ``dem.ipynb`` and ``demo.ipynb`` against a local HTTP server
   serving the real SRTM tiles (dummy credentials, never sent anywhere else).
+* ``earthdata-mock`` – the same notebooks' default NASA Earthdata download path
+  (login redirect, session cookie, pre-signed S3 hand-off) against the synthetic
+  Earthdata of ``scripts/datasets/mock_earthdata.py``, with synthetic credentials.
 
 Usage::
 
@@ -108,7 +111,31 @@ PROFILES: dict[str, dict[str, dict[str, str]]] = {
         }
         for name in ("dem.ipynb", "demo.ipynb")
     },
+    "earthdata-mock": {
+        name: {
+            "earthdata_username": "synthetic-user", "earthdata_password": "synthetic-password",
+            "ADE_MOCK_EARTHDATA": "1", "ADE_DEM_CACHE": "__dem_earthdata_cache",
+            "ADE_DEM_NORTH": "37,39", "ADE_DEM_WEST": "122,124", "ADE_DEM_AOI": "37.625,-121.625",
+            checks: "Synthetic Peak:37.625:-121.625:1450;Twin Summit:38.35:-122.45:980",
+        }
+        for name, checks in (("dem.ipynb", "ADE_DEM_CHECKS"), ("demo.ipynb", "ADE_DEM_CHECKPOINTS"))
+    },
 }
+
+
+@contextlib.contextmanager
+def earthdata_mock():
+    """Start the synthetic Earthdata; yield the environment that routes a kernel to it."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mock_earthdata", REPO / "scripts" / "datasets" / "mock_earthdata.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with tempfile.TemporaryDirectory(prefix="ade-earthdata-hook-") as hook_dir, \
+            module.MockEarthdata(intercept=False) as mock:
+        module.write_hook(hook_dir)
+        pythonpath = os.pathsep.join(filter(None, [hook_dir, os.environ.get("PYTHONPATH", "")]))
+        yield {**mock.environment(), "PYTHONPATH": pythonpath}
 
 
 @contextlib.contextmanager
@@ -210,9 +237,14 @@ def main() -> int:
         server = None
         if any("{srtm_server}" in v for env in profile.values() for v in env.values()):
             server = stack.enter_context(srtm_server(args.data / "srtm" / "served"))
+        mock_env = {}
+        if any("ADE_MOCK_EARTHDATA" in env for env in profile.values()):
+            mock_env = stack.enter_context(earthdata_mock())
         results = {}
         for name in names:
             env = {k: v.format(data=args.data, srtm_server=server) for k, v in profile.get(name, {}).items()}
+            if env.pop("ADE_MOCK_EARTHDATA", None):
+                env.update(mock_env)
             env.update(extra)
             results[name] = run(name, env, args.timeout, args.save, args.keep)
     failed = [n for n, ok in results.items() if not ok]

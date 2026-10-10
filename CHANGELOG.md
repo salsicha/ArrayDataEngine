@@ -40,6 +40,10 @@ registry release.
   bags, generates synthetic Boson LWIR beacon sequences, and checks the
   Earthdata download with your credentials.
 - `DataSources("DEM", ...)` forwards `base_url` and `allow_insecure_http`.
+- `scripts/datasets/mock_earthdata.py`: a synthetic NASA Earthdata (login
+  redirect, session cookie, pre-signed S3 hand-off, synthetic SRTM tiles)
+  that the tests and the `earthdata-mock` notebook profile use to exercise the
+  authenticated download path offline.
 - `register_with_fixed_pattern()` registers image sequences from sensors with
   fixed-pattern noise (thermal cameras), where plain phase correlation reports
   no motion.
@@ -175,6 +179,10 @@ registry release.
   SQLite `.bag` files, bare `.mcap` files, and `.db3` directories without
   `metadata.yaml` open; a mistyped chunk path raises instead of reading a
   neighbouring bag.
+- SRTM downloads use NASA LP DAAC's cloud archive
+  (`data.lpdaac.earthdatacloud.nasa.gov`); the e4ftl01 Data Pool the default
+  URL pointed at is retired and returned 404 for every tile. `base_url` may
+  be a per-tile template containing `{name}`.
 - Earthdata credentials are sent only over HTTPS to the login or tile host;
   DEM tiles download once, cache writes are atomic, and southern/eastern tile
   names are correct.
