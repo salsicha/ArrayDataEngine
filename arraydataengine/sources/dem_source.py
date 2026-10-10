@@ -73,7 +73,13 @@ class DEMSource(BaseSource):
     Returns:
     """
 
-    DEFAULT_BASE_URL = "https://e4ftl01.cr.usgs.gov//DP109/SRTM/SRTMGL1.003/2000.02.11/"
+    # NASA LP DAAC's cloud archive (the e4ftl01 Data Pool it replaced is retired).
+    # A base URL containing "{name}" is a per-tile template; any other base URL
+    # is a directory holding "<name>.SRTMGL1.hgt.zip" files.
+    DEFAULT_BASE_URL = (
+        "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/SRTMGL1.003/"
+        "{name}.SRTMGL1.hgt/{name}.SRTMGL1.hgt.zip"
+    )
 
     def __init__(
         self,
@@ -212,7 +218,10 @@ class DEMSource(BaseSource):
         return session_context, session
 
     def _tile_url(self, name: str) -> str:
-        url = f"{self.base_url.rstrip('/')}/{name}.SRTMGL1.hgt.zip"
+        if "{name}" in self.base_url:
+            url = self.base_url.replace("{name}", name)
+        else:
+            url = f"{self.base_url.rstrip('/')}/{name}.SRTMGL1.hgt.zip"
         if urlparse(url).scheme.lower() != "https" and not self.allow_insecure_http:
             raise ValueError(
                 f"Refusing to send Earthdata credentials to non-HTTPS DEM URL {url!r}; "

@@ -505,12 +505,14 @@ def test_dem_redirects_only_keep_credentials_for_earthdata_login():
         _rebuild_earthdata_auth(prepared, SimpleNamespace(request=SimpleNamespace(url=original)))
         return "Authorization" in prepared.headers
 
-    data = "https://e4ftl01.cr.usgs.gov/tile.zip"
+    data = "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/SRTMGL1.003/x.zip"
     login = "https://urs.earthdata.nasa.gov/oauth/authorize"
     assert redirect(data, login)
     assert redirect(login, data)
     assert not redirect(data, "https://cdn.thirdparty.example/tile.zip")
     assert not redirect(data, "http://urs.earthdata.nasa.gov/oauth/authorize")
+    # LP DAAC hands the download to a pre-signed S3 URL, which must not get the credentials.
+    assert not redirect(data, "https://lp-prod-protected.s3.us-west-2.amazonaws.com/SRTMGL1.003/x.zip?X-Amz-Signature=s")
 
 
 def test_dem_tile_names_bounds_and_topic_counts():
