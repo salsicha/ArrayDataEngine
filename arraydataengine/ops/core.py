@@ -2077,7 +2077,7 @@ class SourcePipeline:
         """Stream processed messages into a `DataBuffer`.
 
         `backend` follows DataBuffer semantics: None picks memory for
-        `use_db=False` and arrow (or an existing TileDB store) for
+        `use_db=False` and mcap (or the existing store backend) for
         `use_db=True`. `max_points`, `ragged_topics`, and `backend_options`
         are passed to the new `DataBuffer` (for example, `max_points` sizes the
         storage of variable-size point clouds beyond the source's limit or the

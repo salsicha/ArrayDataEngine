@@ -9,7 +9,7 @@ class DataSources:
     """Open a recording, image glob, or DEM region as a message source.
 
     Args:
-        data_path: ROS1 ``.bag``, rosbag2 ``.db3``/``.mcap`` file or bag
+        data_path: ADE NumPy ``.mcap``, ROS1 ``.bag``, rosbag2 ``.db3``/``.mcap`` file or bag
             directory, an image file or glob (``.png``, ``.jpg``, ``.jpeg``,
             ``.tif``, ``.tiff``), or ``"DEM"`` for SRTM tiles within `bounds`.
             Extensions are matched case-insensitively.
@@ -27,6 +27,11 @@ class DataSources:
             other topics are neither decoded nor listed by get_topics().
         color_order: channel order of colour images from an image source,
             ``"rgb"`` (default, like every ROS source) or ``"bgr"``.
+        mcap_decoders: optional mapping from encoding or (encoding, schema name)
+            to ``(schema, channel, record) -> ADE message dict``. Selects the
+            generic MCAP reader for a standalone file; ADE NumPy and supported
+            ROS 2/CDR sensor messages have built-in decoders. Use ``{}`` to
+            explicitly select this reader for a non-ADE MCAP file.
     """
 
 
@@ -43,6 +48,7 @@ class DataSources:
         color_order: str = "rgb",
         base_url: str | None = None,
         allow_insecure_http: bool = False,
+        mcap_decoders=None,
     ):
         """Constructor"""
 
@@ -60,8 +66,18 @@ class DataSources:
         # Image globs such as "*.PNG" match regardless of extension case.
         is_image = extension in _IMAGE_EXTENSIONS or self._is_image_glob(data_path)
         ros_options = {"max_points": max_points, "topics": topics}
+        from .recording import is_ade_mcap
+        from .buffers.mcap_buffer import is_mcap_store, McapStoreSource
 
-        if extension == ".bag" and self._is_sqlite_rosbag(data_path):
+        if mcap_decoders is not None and extension != ".mcap":
+            raise ValueError("mcap_decoders requires a standalone .mcap file")
+        if is_mcap_store(data_path):
+            self.source = McapStoreSource(data_path, **ros_options)
+        elif extension == ".mcap" and (mcap_decoders is not None or is_ade_mcap(data_path)):
+            from .sources.mcap_source import McapSource
+
+            self.source = McapSource(data_path, decoders=mcap_decoders, **ros_options)
+        elif extension == ".bag" and self._is_sqlite_rosbag(data_path):
             from .sources.db3_source import DB3Source
 
             self.source = DB3Source(data_path, **ros_options)

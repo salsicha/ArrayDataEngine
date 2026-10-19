@@ -364,14 +364,14 @@ def test_ingest_fails_when_every_message_of_a_topic_was_skipped(fake, tmp_path, 
     assert "'/os1/points'" in err and "--max-points 1000" in err
 
 
-def test_ingest_stops_before_clouds_beyond_the_default_capacity(fake, tmp_path, capsys):
+def test_arrow_ingest_stops_before_clouds_beyond_the_default_capacity(fake, tmp_path, capsys):
     pytest.importorskip("pyarrow")
     from arraydataengine.sensors.pointcloud2_sensor import DEFAULT_MAX_POINTS
 
     cloud = {"topic": "/cloud", "timestamp": 0.0, "data": np.ones((4, 3)),
              "point_count": DEFAULT_MAX_POINTS + 1}
     fake(FakeSource([cloud]))
-    assert main(["ingest", "bag", "-o", str(tmp_path / "store")]) == 2
+    assert main(["ingest", "bag", "-o", str(tmp_path / "store"), "--backend", "arrow"]) == 2
     err = _one_error_line(capsys.readouterr().err)
     assert f"--max-points {DEFAULT_MAX_POINTS + 1}" in err
 

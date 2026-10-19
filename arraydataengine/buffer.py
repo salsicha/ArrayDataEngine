@@ -21,12 +21,13 @@ class DataBuffer:
     Returns:
     """
 
-    BACKENDS = ("memory", "arrow", "tiledb")
+    BACKENDS = ("memory", "mcap", "arrow", "tiledb")
     BACKEND_OPTIONS = {
         "memory": frozenset(),
+        "mcap": frozenset({"compression", "chunk_size", "segment_bytes", "memory_budget_bytes"}),
         "arrow": frozenset({
             "flush_bytes", "row_group_bytes", "compression", "batch_readahead", "fragment_readahead",
-            "use_threads", "row_overhead_bytes",
+            "use_threads", "row_overhead_bytes", "memory_budget_bytes",
         }),
         "tiledb": frozenset({"flush_bytes", "consolidate_max_bytes", "row_overhead_bytes"}),
     }
@@ -35,7 +36,7 @@ class DataBuffer:
         self,
         data_source: DataSources,
         buffer_depth=1,
-        data_uri="/tmp/tiledb/my_group/",
+        data_uri="/tmp/arraydataengine/my_group/",
         topics=None,
         axis="",
         use_db=False,
@@ -50,17 +51,19 @@ class DataBuffer:
         `backend` selects the storage engine:
 
         - ``"memory"``: rolling in-memory NumPy ring buffer (no persistence).
-        - ``"arrow"``: persistent Apache Arrow / Parquet fragments at
-          `data_uri` — the default for new persistent stores.
+        - ``"mcap"``: append-only MCAP segments, the default for new stores.
+        - ``"arrow"``: persistent Apache Arrow / Parquet analysis fragments at `data_uri`.
         - ``"tiledb"``: persistent TileDB dense arrays at `data_uri`
           (supports in-place `__setitem__` writes, unlike arrow).
 
         When `backend` is omitted, `use_db=False` means ``"memory"`` and
-        `use_db=True` picks ``"arrow"`` — unless `data_uri` already holds a
-        TileDB store, which keeps opening as ``"tiledb"`` for compatibility.
+        `use_db=True` picks ``"mcap"``. Existing Arrow and TileDB stores
+        retain their backend. In-memory workflows remain NumPy-only.
 
         `backend_options` is passed through to the backend constructor. The
-        arrow backend accepts `flush_bytes`, `row_overhead_bytes`,
+        mcap backend accepts `compression`, `chunk_size`, `segment_bytes`,
+        and `memory_budget_bytes`. The arrow backend accepts a shared
+        `memory_budget_bytes`, `flush_bytes`, `row_overhead_bytes`,
         `row_group_bytes`, `compression`, `batch_readahead`,
         `fragment_readahead`, and `use_threads` (see
         `arraydataengine.buffers.arrow_buffer` for defaults); the tiledb
@@ -70,14 +73,15 @@ class DataBuffer:
         `topics` limits buffering to those topics (plus `axis`); by default
         every topic the source lists is buffered.
 
-        Variable-size topics (point clouds): a topic whose first message has
+        For memory, Arrow, and TileDB, variable-size topics (point clouds): a topic whose first message has
         a `point_count` key, or that is listed in `ragged_topics` (a mapping
         `{topic: capacity}` or a list of topics), stores each message's rows
         zero-padded to the topic's capacity together with its real row count.
         Reads then include a `lengths` array (structured `get_buffer()` arrays
         a `length` field). The capacity is `ragged_topics[topic]`, else
         `max_points`, else the source's `max_points`, else
-        `DEFAULT_MAX_POINTS`; a message with more rows raises ValueError.
+        `DEFAULT_MAX_POINTS`; a message with more rows raises ValueError. MCAP instead retains native
+        shapes and pads only eager reads when necessary.
         """
         if buffer_depth < 1:
             raise ValueError("buffer_depth must be at least 1")
@@ -136,10 +140,19 @@ class DataBuffer:
         if backend is not None:
             if backend not in cls.BACKENDS:
                 raise ValueError(f"backend must be one of {cls.BACKENDS}, got {backend!r}")
+            from .buffers.mcap_buffer import is_mcap_store
+            if backend not in ("memory", "mcap") and is_mcap_store(data_uri):
+                raise ValueError(f"{data_uri} holds an MCAP store; open it with backend='mcap' (or no backend)")
+            if backend == "mcap" and (holds_arrow_store(data_uri) or cls._is_tiledb_store(data_uri)):
+                raise ValueError(f"{data_uri} holds a different store; omit backend to detect its format")
             return backend
         if not use_db:
             return "memory"
-        return "tiledb" if cls._is_tiledb_store(data_uri) else "arrow"
+        if cls._is_tiledb_store(data_uri):
+            return "tiledb"
+        if holds_arrow_store(data_uri):
+            return "arrow"
+        return "mcap"
 
     @staticmethod
     def _is_tiledb_store(data_uri) -> bool:
@@ -260,6 +273,14 @@ class DataBuffer:
             self.buffer_impl = NumpyBuffer(
                 self.data_source, self.buffer_depth, self._axis, self.topics, **self._ragged_options()
             )
+        elif self.backend == "mcap":
+            from .buffers.mcap_buffer import McapBuffer
+
+            self.buffer_impl = McapBuffer(
+                self.data_source, self._init_source, self.group_uri, self._axis, self.topics,
+                **self._ragged_options(), **self._backend_options,
+            )
+            self.topics = self.buffer_impl.topics
         elif self.backend == "arrow":
             from .buffers.arrow_buffer import ArrowBuffer
 

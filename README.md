@@ -9,7 +9,7 @@
 [![tests](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml/badge.svg)](https://github.com/salsicha/ArrayDataEngine/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to Apache Arrow/Parquet (the default) or TileDB.
+Array Data Engine is a Python package for turning heterogeneous sensor and array data into a consistent NumPy-first stream. It can read image sequences, ROS bag files, ROS 2 `.db3` recordings or split rosbag2 directories, and DEM tiles, then keep recent context in memory or persist complete streams to MCAP (the default), Apache Arrow/Parquet, or TileDB.
 
 The project is aimed at robotics and perception workflows where algorithms need synchronized windows of image, point cloud, navigation, odometry, IMU, and terrain-like array data.
 
@@ -23,7 +23,7 @@ The project is aimed at robotics and perception workflows where algorithms need 
 - TUM and KITTI trajectory export (compatible with `evo` and SLAM evaluation tooling).
 - Cached ROS topic metadata, so repeated topic and count lookups do not reopen the same bag.
 - Rolling in-memory buffers for recent context windows.
-- Persistent storage for larger-than-memory datasets: Apache Arrow/Parquet fragments (default — directly queryable from Polars/DuckDB/pandas) or TileDB dense arrays, both with timestamp/frame/spatial metadata and query pushdown.
+- Persistent storage for larger-than-memory datasets: MCAP segments (default), Apache Arrow/Parquet analysis fragments, or TileDB dense arrays. Parquet and TileDB support metadata query pushdown.
 - Lazy dataset-level selection by topic, time, message index, frame id, geographic bounds, and spatial bounds.
 - Lazy optional imports so lightweight workflows do not need the full ROS, DEM, or visualization stack.
 - Notebook examples for demos, iterators, terrain, INS, MOT, and TileDB workflows.
@@ -52,11 +52,12 @@ For editable local development:
 python -m pip install -e .
 ```
 
-The base install keeps NumPy-only workflows lightweight. Install feature extras for the source adapters and storage backends you use:
+The base install includes NumPy and MCAP. Install feature extras for the source adapters and storage backends you use:
 
 | Extra | Adds |
 | --- | --- |
-| `arrow` | Default persistent Arrow/Parquet storage |
+| `arrow` | Parquet analysis caches and explicit Arrow storage |
+| `mcap` | Compatibility extra; MCAP is included in the base install |
 | `tiledb` | Alternative TileDB persistent storage |
 | `image` | Image sequence loading and image-processing dependencies |
 | `ros` | `rosbags` reader for ROS 1 bags, MCAP, and split rosbag2 directories |
@@ -86,7 +87,7 @@ ade info my_bag.db3 --messages 500   # topics, counts, duration, rates, jitter
 ade topics my_bag.db3
 ade export my_bag.db3 -t /points -o points.npz   # or -o exports/ for exports/points.npz
 ade viewer my_bag.db3 -t /points -o viewer.html --stride 5
-ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (arrow by default, --backend tiledb)
+ade ingest my_bag.db3 -o /data/stores/my_bag/  # persist every topic (mcap by default, --backend arrow for analysis)
 ```
 
 `ade viewer` and `ade demo` write self-contained HTML files that render in any
@@ -95,7 +96,7 @@ browser with no extra dependencies. Exported `.npz` files load back with
 Standalone SQLite recordings (`.db3`, or a single SQLite `.bag`) are read with
 the built-in decoder and need no extras; ROS 1 bags, MCAP files, and split
 rosbag2 directories require the `ros` extra. `ade ingest` also requires the
-extra for its storage backend: new stores default to `arrow`, while an existing
+extra for its storage backend: new stores default to `mcap`, while an existing
 output store is reopened with the backend it was written with. A `--backend`
 that doesn't match an existing store, and any non-empty directory that isn't
 a store, are refused.
@@ -167,7 +168,177 @@ for topic in ros2_source.get_topics():
     print(topic, ros2_source.get_count(topic))
 ```
 
-For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the chunk files. Passing one `.db3` chunk that `metadata.yaml` lists still reads the whole recording; a standalone SQLite file is read on its own. A directory of `.db3` files without `metadata.yaml` is read chunk by chunk in natural filename order. Reading bare `.mcap` files requires the `ros` extra.
+For split ROS 2 bags, pass the directory that contains `metadata.yaml` and the chunk files. Passing one `.db3` chunk that `metadata.yaml` lists still reads the whole recording; a standalone SQLite file is read on its own. A directory of `.db3` files without `metadata.yaml` is read chunk by chunk in natural filename order. Reading ROS `.mcap` files uses the `ros` extra; ADE recordings use the `mcap` extra described below.
+
+## Live recording to MCAP
+
+Install `pip install "arraydataengine[mcap]"` to record ADE message dictionaries
+as they arrive. Supply a generator from your device, ROS subscription queue, or
+other capture code; ADE does not open live devices or subscribe to ROS itself.
+Here is an example using the synthetic source:
+
+```python
+from arraydataengine import DataSources, McapRecorder
+from arraydataengine.sources.synthetic_source import SyntheticSource
+
+with McapRecorder("session.mcap") as recorder:
+    recorder.record(SyntheticSource(duration=2.0).get_message())
+
+# For live capture, call recorder.write(message) for each incoming message:
+# {"topic": "/imu", "timestamp": seconds, "name": "Imu", "data": numpy_array}
+# recorder.flush()              # write the current chunk; keep recording
+# recorder.flush(durable=True)  # also fsync the file
+
+source = DataSources("session.mcap")
+for message in source.get_message():
+    process(message)  # yields one message at a time in recorded file order
+```
+
+`record(iterable)` consumes the iterable synchronously and returns the number
+of messages written when it ends. An unbounded generator records until it is
+stopped; a context manager finalizes the file on normal exit or a Python
+exception (including Ctrl-C). `write(message)` calls are serialized, allowing
+callbacks to share one recorder. Capture queues and backpressure belong to the
+caller. Existing files are refused unless `overwrite=True`; appending to an
+existing MCAP is not supported.
+
+MCAP stores topic channels, timestamps, indexes, and compressed chunks. The
+recorder defaults to Zstd and a 1 MiB chunk target; `compression="lz4"` or
+`"none"` and `chunk_size=...` are also supported. A message can exceed the chunk
+target. Pending data is flushed on close or explicit `flush()`; each `write()`
+is not immediately durable. The writer also retains chunk indexes until close,
+so index memory grows with recording length. Abrupt process termination can
+leave an unfinished file; automatic crash recovery is not provided.
+
+The ADE `arraydataengine/numpy/v1` profile supports heterogeneous channels.
+`write(message)` stores its payload as a pickle-free NumPy array, preserving
+dtype and shape without padding variable-size scans.
+Other fields (such as `name`, `frame_id`, `encoding`, and `point_count`) use JSON;
+NumPy metadata arrays/scalars become lists/scalars. Object arrays and metadata
+that cannot be encoded as JSON are rejected. `timestamp` is non-negative
+seconds; optional integer `timestamp_ns` and `publish_time_ns` preserve exact
+MCAP nanosecond timestamps, and `sequence` is an optional uint32 counter.
+
+Use `write_encoded` to keep original serialized messages alongside NumPy
+channels. For example, in a ROS callback with serialized CDR bytes and the
+message's full ROS definition (including dependencies):
+
+```python
+recorder.write_encoded(
+    "/imu", cdr_bytes,
+    timestamp_ns=log_time_ns,
+    message_encoding="cdr",
+    schema_name="sensor_msgs/msg/Imu",
+    schema_encoding="ros2msg",
+    schema_data=full_ros_definition.encode("utf-8"),
+)
+```
+
+CDR means Common Data Representation, the binary serialization used for ROS 2
+messages. The generator selects a decoder per channel and schema: ADE NumPy
+and the project's supported ROS 2/CDR sensor types work automatically, even in
+one file. Install `arraydataengine[mcap,ros]` for schema-based ROS decoding,
+plus `image` for image types that need OpenCV. Arbitrary custom ROS types still
+need an ADE array conversion. ROS/Foxglove tools need a decoder for the
+`ade-numpy-v1` channels; mixed ADE recordings are not standard ROS-only bags.
+
+For additional encodings or custom types, pass
+`DataSources(path, mcap_decoders={encoding: decoder})` or use
+`{(encoding, schema_name): decoder}` for a schema-specific override. Each
+decoder receives MCAP `(schema, channel, record)` objects and returns a
+dictionary containing `data` and optional metadata. The reader fills missing
+`topic`, `name`, timestamps, and sequence information. Unknown encodings raise
+an error; select supported topics with `topics=` or supply a decoder. Passing
+`mcap_decoders={}` selects the generic reader for an external MCAP; ordinary
+ROS MCAP files retain the existing `ros` reader by default.
+
+**No Parquet conversion is required.** Pass a completed recording to `DataSources`,
+`DataBuffer`, or `source_pipeline` for playback and processing. Playback uses a
+lazy generator without sorting or loading the whole recording, runs at the
+consumer's pace, and does not tail a growing file or reproduce wall-clock timing.
+MCAP is also the default persistent `DataBuffer` backend. Existing Arrow and
+TileDB stores are detected automatically; `use_db=False` still selects memory.
+
+## Parquet analysis and trajectory loop closure
+
+New persistent `DataBuffer(..., use_db=True)` stores and `ade ingest` default
+to MCAP. A store is a directory of finalized MCAP segments and an atomic
+`mcap_store.json` manifest. Interrupted, uncommitted segments are ignored on
+resume; keep the same source ordering when replaying. One process may append
+at a time. Reads flush the current segment before streaming. Eager reads such
+as `get_buffer()` materialize their selection; use `buffer.iter_topic_chunks(topic, chunk_size=64)`
+for payload batches bounded by the MCAP memory budget. Topic pipelines may
+regroup those rows up to their requested chunk size. Sensor capture and backpressure remain the
+caller's responsibility. Native ingestion records the decoded ADE messages;
+use `McapRecorder.write_encoded()` to retain original ROS wire payloads.
+
+MCAP backend options include `chunk_size` (1 MiB), `segment_bytes` (64 MiB),
+`compression` (`zstd`, `lz4`, `none`), and `memory_budget_bytes` (64 MiB).
+The budget limits read batches and rejects oversized individual messages; it
+is not a total process RSS limit. Arrow's `memory_budget_bytes` (64 MiB) limits
+staging across **all** topics, flushing the largest topic when needed.
+
+Use a derived Parquet cache for selective analysis. It separates changes in
+array shape, dtype, topic, and source schema into partitions, without padding
+ragged scans. Exact log/publish nanoseconds, sequence, original record ordinal,
+and per-topic ordinal are stored alongside a pickle-free NumPy message envelope.
+Trajectory topics additionally expose XYZ and quaternion scalar columns for
+filtering; other array payloads remain binary envelopes, not flattened SQL columns.
+
+```python
+from arraydataengine import mcap_to_parquet, parquet_to_mcap
+
+cache = mcap_to_parquet(
+    "session.mcap", "analysis/",
+    topics=["/pose", "/points"],
+    trajectory_topics={"/pose": "pose"},  # "odometry" for Odometry arrays
+    memory_budget_bytes=64 * 1024**2,
+    row_group_bytes=8 * 1024**2,
+    fidelity="copy",
+)
+parquet_to_mcap(cache, "restored.mcap")
+```
+
+Install `arraydataengine[arrow]` for these operations. `fidelity="reference"`
+(the default) retains SHA-256-checked references to the original files;
+`fidelity="copy"` also archives the originals inside the cache. Restoration
+copies the originals byte-for-byte, including raw CDR, schemas, attachments,
+metadata, and message order—even channels omitted from analysis. It does not
+apply edits made to derived Parquet columns. Reference restoration requires
+unchanged source files. Cache reuse verifies hashes and conversion options;
+changed sources/options require a fresh destination. New caches are published
+only after successful conversion. For very large recordings, hash verification
+adds a sequential I/O pass. Finalize recording before conversion.
+
+Loop closure on a recording automatically uses this Parquet path:
+
+```python
+from arraydataengine.ops import iter_recording_loop_closures
+
+for closure in iter_recording_loop_closures(
+    "session.mcap",
+    trajectory_topic="/pose",
+    points_topic="/points",
+    trajectory_kind="pose",
+    radius=3.0,
+    min_separation=60,
+    time_tolerance=0.05,
+    voxel_size=0.25,
+    cache_dir="loop-analysis/",
+):
+    process(closure)
+```
+
+Candidate queries read only pose metadata; ICP loads the current scan and one
+candidate scan. Clouds are matched by nearest timestamp within the explicit
+`tolerance` (`time_tolerance` above); missing matches raise an error. No entire
+cloud sequence or trajectory spatial index is held in memory. Predicate scans
+can still be expensive on long, poorly clustered trajectories. The budget
+controls conversion staging, not ICP working memory. Omitting `cache_dir` uses
+a temporary cache cleaned up when the iterator is exhausted or closed.
+`verify_recording_loop_closures()` collects the results into arrays; use the
+iterator when results themselves may exceed memory. Existing NumPy-based
+`verify_loop_closures()` remains available for in-memory inputs.
 
 ## Rolling Buffers
 
@@ -520,7 +691,7 @@ collated = collate_samples([{"points": augmented_points}, {"points": augmented_p
 torch_dataset = to_torch_dataset(iter_ml_windows(buffer.dataset(["images"]), size=2), iterable=True)
 ```
 
-Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist through the default Arrow/Parquet backend or the TileDB backend. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row. Checkpoints only advance past rows that were actually delivered. A cancelled `collect()` attaches the rows gathered so far as `PipelineCancelled.partial`, so `partial` plus a resumed `collect()` equals a full run. When resuming a persistent store, the store's per-topic counts are authoritative: after a hard crash, rows the checkpoint claimed but never flushed are replayed from the source, and rows already stored are never appended twice.
+Use `source_pipeline()` when you want operations to run while messages stream from a `DataSources` object, before full topics are loaded. The same pipeline can write to an in-memory `DataBuffer` or persist through the default MCAP backend or explicitly selected Arrow/Parquet and TileDB backends. Long-running source and topic pipelines accept progress callbacks, cancellation tokens, and mutable checkpoint dictionaries that can be saved and reused to resume from the last processed row. Checkpoints only advance past rows that were actually delivered. A cancelled `collect()` attaches the rows gathered so far as `PipelineCancelled.partial`, so `partial` plus a resumed `collect()` equals a full run. When resuming a persistent store, the store's per-topic counts are authoritative: after a hard crash, rows the checkpoint claimed but never flushed are replayed from the source, and rows already stored are never appended twice.
 
 ```python
 import json
@@ -565,18 +736,19 @@ persistent_buffer = pipeline.to_buffer(
 )
 ```
 
-Persistent output uses Arrow/Parquet by default. Pass `backend="tiledb"` to `to_buffer()`, or use the `persist_to_tiledb()` convenience method, when TileDB is preferred. Persistent source pipelines require `source.get_count(topic)`; TileDB uses that count to size its dense destination arrays, while both backends record the actual filtered message count in store metadata.
+Persistent output uses MCAP by default. Select `backend="arrow"` for Parquet analysis stores. Pass `backend="tiledb"` to `to_buffer()`, or use the `persist_to_tiledb()` convenience method, when TileDB is preferred. Persistent source pipelines require `source.get_count(topic)`; TileDB uses that count to size its dense destination arrays, while all persistent backends record the actual filtered message count in store metadata.
 
 Initial operation coverage includes source-level streaming pipelines, progress reporting, cancellation, resumable checkpoints, topic selection, map/filter/reduce/window helpers, nearest-time alignment, SE(3) transforms, frame graphs, camera projection helpers, camera intrinsics/distortion/rectification utilities, mask and bounds cropping, point cloud downsampling/sampling/KNN-radius-hybrid search/normals/covariance descriptors/distance stats/outlier filters/clustering/connected components/plane and ground segmentation/ICP registration/Open3D adapters, image/depth sequence transforms, morphology, gradients, pyramids, local image statistics, frame-to-frame optical flow, image alignment, motion-compensated rolling windows, valid-depth masks, depth backprojection, depth normals, RGB-D fusion, navsat ENU/NED conversion, quaternion/Euler conversion, gravity compensation, bias correction, trajectory resampling/smoothing/differentiation/integration/dead reckoning/covariance propagation/quality masks, trajectory speed, ML-ready iterators/NumPy/PyTorch adapters/splits/augmentations/collation, and DEM/raster helpers for terrain gradients, normals, roughness, traversability, local patches, point clouds, and meshes.
 
 ## Persistent Storage
 
-Set `use_db=True` to persist messages to disk. This is intended for full-source ingest and larger-than-memory datasets. Two storage engines are available via the `backend` parameter:
+Set `use_db=True` to persist messages to disk. This is intended for full-source ingest and larger-than-memory datasets. Three storage engines are available via the `backend` parameter:
 
-- **`"arrow"`** (the default for new stores): Apache Arrow / Parquet fragment files. Fast, compressed, dependency-light (`pip install "arraydataengine[arrow]"`), and every persisted topic is directly readable by Polars, DuckDB, pandas, and anything else that speaks Parquet.
+- **`"mcap"`** (the default for new stores): append-only MCAP segments with an atomic manifest, resumable ingestion, original message metadata, and variable array shapes.
+- **`"arrow"`** (explicit analysis storage): Apache Arrow / Parquet fragment files. Fast, compressed, dependency-light (`pip install "arraydataengine[arrow]"`), and every persisted topic is directly readable by Polars, DuckDB, pandas, and anything else that speaks Parquet.
 - **`"tiledb"`**: TileDB dense arrays (`pip install "arraydataengine[tiledb]"`). Supports in-place cell updates (`buffer[i] = ...`), which the immutable Arrow fragments do not.
 
-When `backend` is omitted and `use_db=True`, new stores use Arrow; a `data_uri` that already holds a TileDB store keeps opening with TileDB, so existing datasets are unaffected.
+When `backend` is omitted and `use_db=True`, new stores use MCAP; existing Arrow and TileDB stores retain their backend.
 
 ```python
 from arraydataengine.buffer import DataBuffer
@@ -589,17 +761,17 @@ with DataBuffer(
     data_source=source,
     data_uri="/data/stores/my_dataset/",
     axis=axis,
-    use_db=True,          # backend="arrow" is the default for new stores
+    use_db=True,          # backend="mcap" is the default for new stores
 ) as buffer:
     buffer.load_data_db(axis)
     print(buffer.get_group_uri())
 ```
 
-Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed; `close_completed()` does the same without leaving the context. Topics that are still incomplete stay open, so a later run resumes them. Each topic has one payload dtype and trailing shape in every backend. Safe widening casts (for example `int32` into an `int64` topic) are applied; anything else raises `ValueError` rather than being silently broadcast or cast. Point-cloud topics, and any topic listed in `DataBuffer(ragged_topics={topic: capacity})`, may vary in their first dimension. They are stored zero-padded to a capacity, set by `DataBuffer(max_points=...)` or the source's `max_points` and defaulting to 30000 rows, with each message's real length. Reads return `lengths` next to the padded `data`, `buf[i]` returns the trimmed row, and `topic(...).rows()` returns trimmed rows. `DataBuffer(topics=[...])` limits which topics are buffered, the in-memory ring grows as messages arrive, and `get_buffer()` returns only filled rows in time order. `get_size()` is the number of stored rows on every backend. Both persistent backends stage rows in memory and write them in batches, and reads include staged rows without flushing them. Call `close()` (or use the context manager) so the last batch is written; after a crash, a resumed ingest replays only the rows that were never flushed.
+Using `DataBuffer` as a context manager closes the store cleanly and marks completed topics as closed; `close_completed()` does the same without leaving the context. Topics that are still incomplete stay open, so a later run resumes them. Memory, Arrow, and TileDB topics each have one payload dtype and trailing shape; MCAP permits changes in both. Safe widening casts (for example `int32` into an `int64` topic) are applied; anything else raises `ValueError` rather than being silently broadcast or cast. Point-cloud topics, and any topic listed in `DataBuffer(ragged_topics={topic: capacity})`, may vary in their first dimension. On memory, Arrow, and TileDB they are stored zero-padded to a capacity, set by `DataBuffer(max_points=...)` or the source's `max_points` and defaulting to 30000 rows, with each message's real length. Reads return `lengths` next to the padded `data`, `buf[i]` returns the trimmed row, and `topic(...).rows()` returns trimmed rows. `DataBuffer(topics=[...])` limits which topics are buffered, the in-memory ring grows as messages arrive, and `get_buffer()` returns only filled rows in time order. `get_size()` is the number of stored rows on every backend. Arrow and TileDB stage rows in memory and reads include staged rows without flushing them. MCAP finalizes its active segment before reading; it preserves native array shapes and pads only eager multi-message results when necessary. Call `close()` (or use the context manager) so the last batch is written; after a crash, a resumed ingest replays only the rows that were never flushed.
 
-New stores use escaped topic directory names so topics such as `/a/b` and `/a_b` remain distinct. Existing stores retain their original directories when reopened. Query results expose each topic's location as `source_uri`.
+Arrow and TileDB stores use escaped topic directory names so topics such as `/a/b` and `/a_b` remain distinct. Existing stores retain their original directories when reopened. Query results expose each topic's location as `source_uri`.
 
-Both backends keep timestamps, message names, frame ids, and per-message spatial bounds alongside the data. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads. Streaming reads and staged writes keep memory bounded regardless of dataset size.
+Arrow and TileDB keep timestamps, message names, frame ids, and per-message spatial bounds alongside the data. Time, index, frame-id, and spatial-bounds constraints from lazy topic or dataset queries are pushed down before data chunks are read, so pipelines avoid loading unselected message payloads. MCAP reads sequentially and evaluates these filters after decoding each message. Streaming payload batches avoid loading complete topics; eager APIs still materialize their selection.
 
 The Arrow backend exposes its tuning knobs through `backend_options` (reasonable defaults shown):
 
@@ -612,6 +784,7 @@ buffer = DataBuffer(
     backend="arrow",
     backend_options={
         "flush_bytes": 32 * 1024 * 1024,      # staged bytes per topic before a fragment is written
+        "memory_budget_bytes": 64 * 1024 * 1024,  # shared staging limit across all topics
         "row_group_bytes": 16 * 1024 * 1024,  # target Parquet row-group size (random-access granularity)
         "compression": "zstd",                # any Parquet codec: zstd, snappy, lz4, none...
         "batch_readahead": 1,                 # scanner prefetch depth; raise for throughput,
@@ -758,7 +931,7 @@ The TileDB rows above predate the batched, compressed TileDB writer; see [Storag
 
 Identical workload — 1,500 lidar-sized point clouds of shape (30000, 3) float64, 1.08 GB of data — through each persistent backend, reads in a fresh process. Measured on 2026-09-27 with Python 3.12.3 on Linux x86_64 (Intel i9-13900H, NVMe), NumPy 2.3.2, pyarrow 22.0.0, tiledb 0.36.1; best of two runs:
 
-| Operation | TileDB | Arrow (default) |
+| Operation | TileDB | Arrow |
 | --- | ---: | ---: |
 | Ingest (excluding data generation) | 6.5 s | 7.1 s |
 | On-disk footprint | 1,031 MB | 923 MB |
@@ -767,7 +940,7 @@ Identical workload — 1,500 lidar-sized point clouds of shape (30000, 3) float6
 | Single-message fetch | 6 ms | 33 ms |
 | Peak RSS, ingest / reads | 246 MB / 360 MB | 269 MB / 565 MB |
 
-Both backends stage writes (32 MB per topic by default) and stream with bounded memory on larger-than-memory datasets. Arrow scans use the default `batch_readahead`/`fragment_readahead` of 1 (raising readahead trades memory for throughput). This workload is nearly incompressible; real sensor streams compress further under both backends' Zstd codecs. Arrow remains the default because its Parquet fragments are directly queryable from Polars, DuckDB, and pandas.
+The benchmark compares TileDB and Arrow, which stage writes with a 32 MiB per-topic flush target. Arrow now also enforces a 64 MiB shared staging budget. Arrow scans use the default `batch_readahead`/`fragment_readahead` of 1 (raising readahead trades memory for throughput). This workload is nearly incompressible; real sensor streams compress further under both backends' Zstd codecs. MCAP is now the default recording backend; Arrow remains available for Parquet analysis with Polars, DuckDB, and pandas. MCAP was not part of this benchmark.
 
 ## Development
 

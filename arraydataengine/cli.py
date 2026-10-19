@@ -802,6 +802,9 @@ def _store_kind(path: Path) -> str:
         return "missing"
     if not path.is_dir():
         return "file"
+    from .buffers.mcap_buffer import is_mcap_store
+    if is_mcap_store(path):
+        return "mcap"
     entries = _store_entries(path)
     if not entries:
         return "empty"
@@ -957,7 +960,7 @@ def _cmd_ingest(args) -> int:
             f"output {out} is a non-empty directory that is not an ArrayDataEngine store; "
             "choose a new or empty directory"
         )
-    if args.backend is not None and kind in ("arrow", "tiledb") and kind != args.backend:
+    if args.backend is not None and kind in ("mcap", "arrow", "tiledb") and kind != args.backend:
         raise CLIError(
             f"output {out} already holds an existing {kind} store; pass --backend {kind} to "
             "resume it or choose another directory"
@@ -972,11 +975,11 @@ def _cmd_ingest(args) -> int:
     fingerprint = _source_fingerprint(args.path, source, args.max_points)
     # A directory without data (new, empty, or holding only a fingerprint
     # left by a run that stopped before writing) is (re)recorded.
-    recorded = _read_fingerprint(out) if kind in ("arrow", "tiledb") else None
+    recorded = _read_fingerprint(out) if kind in ("mcap", "arrow", "tiledb") else None
     record = recorded is None
     if recorded is not None:
         problem = _fingerprint_problem(recorded, fingerprint)
-    elif kind in ("arrow", "tiledb"):
+    elif kind in ("mcap", "arrow", "tiledb"):
         # A store from before fingerprints: adopt it only when its contents
         # are consistent with this recording.
         problem = _counts_problem(_store_counts(out, kind), fingerprint)
@@ -989,8 +992,8 @@ def _cmd_ingest(args) -> int:
             "--force to append to it anyway"
         )
 
-    backend = kind if kind in ("arrow", "tiledb") else (args.backend or "arrow")
-    capacity = DEFAULT_MAX_POINTS if args.max_points is None else None
+    backend = kind if kind in ("mcap", "arrow", "tiledb") else (args.backend or "mcap")
+    capacity = DEFAULT_MAX_POINTS if args.max_points is None and backend != "mcap" else None
     counting = _CountingSource(source, capacity=capacity)
     try:
         with DataBuffer(
@@ -1183,8 +1186,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("path")
     p_ingest.add_argument("-o", "--out", required=True,
                           help="store directory (new, empty, or an existing store)")
-    p_ingest.add_argument("--backend", choices=("arrow", "tiledb"), default=None,
-                          help="storage engine for a new store (default: arrow); an existing "
+    p_ingest.add_argument("--backend", choices=("mcap", "arrow", "tiledb"), default=None,
+                          help="storage engine for a new store (default: mcap); an existing "
                           "store keeps its detected backend")
     p_ingest.add_argument("--force", action="store_true",
                           help="append to an existing store even when it was written from a "

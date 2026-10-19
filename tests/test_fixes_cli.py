@@ -348,15 +348,15 @@ def test_ingest_reopens_an_existing_tiledb_store(tmp_path, capsys):
     assert "already holds an existing tiledb store" in capsys.readouterr().err
 
 
-def test_ingest_new_store_defaults_to_arrow(tmp_path, capsys):
-    pytest.importorskip("pyarrow")
+def test_ingest_new_store_defaults_to_mcap(tmp_path, capsys):
+    pytest.importorskip("mcap")
     bag = _write_bag(tmp_path / "bag.db3")
     out = tmp_path / "store"
     assert main(["ingest", str(bag), "-o", str(out)]) == 0
-    assert "(arrow)" in capsys.readouterr().out
-    assert list(out.rglob("manifest.json"))
+    assert "(mcap)" in capsys.readouterr().out
+    assert (out / "mcap_store.json").exists()
     assert main(["ingest", str(bag), "-o", str(out), "--backend", "tiledb"]) == 2
-    assert "already holds an existing arrow store" in capsys.readouterr().err
+    assert "already holds an existing mcap store" in capsys.readouterr().err
 
 
 # --- viewer -------------------------------------------------------------------------

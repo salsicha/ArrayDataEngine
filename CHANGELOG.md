@@ -13,6 +13,17 @@ registry release.
 
 ### Added
 
+- MCAP is the default for new persistent buffers and CLI ingests; existing
+  Arrow/TileDB stores keep their backend. MCAP stores use resumable segments.
+- Shared Parquet staging budgets, schema-partitioned analysis caches with
+  reference/copy fidelity policies, and byte-exact original MCAP restoration.
+- Recording loop closure automatically queries Parquet pose columns and loads
+  candidate point-cloud pairs with explicit timestamp alignment tolerance.
+
+- `McapRecorder` for incremental recording of NumPy messages and original
+  encoded payloads, explicit chunk flushing and optional fsync; the `mcap`
+  extra and lazy mixed ADE NumPy / ROS 2 CDR playback through `DataSources`,
+  with per-encoding/schema decoder hooks for additional formats.
 - Variable-size topics: point clouds (and topics listed in
   `DataBuffer(ragged_topics=...)`) are stored padded to a capacity
   (`DataBuffer(max_points=...)`, default 30000 rows) with each message's real

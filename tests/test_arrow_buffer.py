@@ -80,14 +80,15 @@ class SpatialFrameSource:
             }
 
 
-def test_use_db_defaults_to_arrow_for_new_stores(tmp_path):
+def test_use_db_defaults_to_mcap_for_new_stores(tmp_path):
     buf = DataBuffer(
         StreamSource(), data_uri=str(tmp_path / "grp") + "/", axis="sensor_topic",
         use_db=True, preload=0,
     )
     try:
-        assert buf.backend == "arrow"
-        assert isinstance(buf.buffer_impl, ArrowBuffer)
+        assert buf.backend == "mcap"
+        from arraydataengine.buffers.mcap_buffer import McapBuffer
+        assert isinstance(buf.buffer_impl, McapBuffer)
     finally:
         buf.close()
 
@@ -113,7 +114,7 @@ def test_existing_tiledb_store_is_sniffed(tmp_path):
 def test_arrow_reopens_without_original_source(tmp_path):
     group_uri = str(tmp_path / "arrow_grp") + "/"
     with DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     ) as buf:
         buf.load_data_db("sensor_topic")
 
@@ -144,14 +145,14 @@ def test_arrow_reopens_without_original_source(tmp_path):
 def test_arrow_resumes_partial_ingest(tmp_path):
     group_uri = str(tmp_path / "resume_grp") + "/"
     first = DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     )
     first.roll_buffer("sensor_topic")
     first.roll_buffer("sensor_topic")
     first.close(closed=False)
 
     resumed = DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     )
     try:
         assert resumed.buffer_impl.counters["sensor_topic"] == 2
@@ -169,7 +170,7 @@ def test_arrow_resumes_partial_ingest(tmp_path):
 def test_arrow_multitopic_persistence_and_closed_flags(tmp_path):
     group_uri = str(tmp_path / "multi_grp") + "/"
     with DataBuffer(
-        MultiTopicSource(), data_uri=group_uri, axis="/camera/image", use_db=True, preload=0
+        MultiTopicSource(), data_uri=group_uri, axis="/camera/image", use_db=True, backend="arrow", preload=0
     ) as buf:
         buf.load_data_db("/camera/image")
 
@@ -188,7 +189,7 @@ def test_arrow_multitopic_persistence_and_closed_flags(tmp_path):
 def test_arrow_frame_id_and_spatial_pushdown(tmp_path):
     group_uri = str(tmp_path / "frame_grp") + "/"
     with DataBuffer(
-        SpatialFrameSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        SpatialFrameSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     ) as buf:
         buf.load_data_db("sensor_topic")
 
@@ -204,7 +205,7 @@ def test_arrow_frame_id_and_spatial_pushdown(tmp_path):
 def test_arrow_readonly_reopen_does_not_write(tmp_path):
     group_uri = str(tmp_path / "ro_grp") + "/"
     first = DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     )
     first.roll_buffer("sensor_topic")
     first.roll_buffer("sensor_topic")
@@ -224,7 +225,7 @@ def test_arrow_readonly_reopen_does_not_write(tmp_path):
 def test_arrow_reopen_append_persists(tmp_path):
     group_uri = str(tmp_path / "append_grp") + "/"
     first = DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     )
     first.roll_buffer("sensor_topic")
     first.roll_buffer("sensor_topic")
@@ -248,7 +249,7 @@ def test_arrow_reopen_append_persists(tmp_path):
 def test_arrow_setitem_rejected(tmp_path):
     group_uri = str(tmp_path / "imm_grp") + "/"
     with DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     ) as buf:
         buf.load_data_db("sensor_topic")
         with pytest.raises(NotImplementedError, match="tiledb"):
@@ -258,7 +259,7 @@ def test_arrow_setitem_rejected(tmp_path):
 def test_arrow_rejects_shape_changes(tmp_path):
     group_uri = str(tmp_path / "shape_grp") + "/"
     with DataBuffer(
-        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, preload=0
+        StreamSource(), data_uri=group_uri, axis="sensor_topic", use_db=True, backend="arrow", preload=0
     ) as buf:
         buf.roll_buffer("sensor_topic")
         with pytest.raises(ValueError, match="fixed shape"):
@@ -299,13 +300,13 @@ def test_backend_options_rejected_for_other_backends(tmp_path):
         )
 
 
-def test_source_pipeline_to_buffer_defaults_to_arrow(tmp_path):
+def test_source_pipeline_to_buffer_defaults_to_mcap(tmp_path):
     from arraydataengine.ops import source_pipeline
 
     group_uri = str(tmp_path / "pipe_grp") + "/"
     buf = source_pipeline(StreamSource()).to_buffer(data_uri=group_uri, use_db=True)
     try:
-        assert buf.backend == "arrow"
+        assert buf.backend == "mcap"
         assert buf.get_size() == 5
     finally:
         buf.close()

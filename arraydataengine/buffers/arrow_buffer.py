@@ -25,6 +25,10 @@ which keeps single-message random access cheap for large payloads.
 
 Tuning knobs (all exposed through ``DataBuffer(backend_options=...)``):
 
+- ``memory_budget_bytes`` (default 64 MiB): shared staging budget across all
+  topics. Flush the largest staged topic before exceeding it; oversized rows
+  are rejected. Decoder, Arrow conversion and compressor memory are additional.
+
 - ``flush_bytes`` (default 32 MB): staged bytes per topic before a fragment
   is written. Larger values mean fewer fragments and faster scans at the cost
   of ingest memory.
@@ -283,6 +287,7 @@ class ArrowBuffer:
         fragment_readahead: int = 1,
         use_threads: bool = False,
         row_overhead_bytes: int = DEFAULT_ROW_OVERHEAD_BYTES,
+        memory_budget_bytes: int = 64 * 1024 * 1024,
         ragged_topics=None,
         max_points: int | None = None,
     ):
@@ -294,7 +299,10 @@ class ArrowBuffer:
         self._axis = axis
         self.topics = [] if topics is None else list(topics)
 
-        self.flush_bytes = int(flush_bytes)
+        self.memory_budget_bytes = int(memory_budget_bytes)
+        if self.memory_budget_bytes <= 0:
+            raise ValueError("memory_budget_bytes must be positive")
+        self.flush_bytes = min(int(flush_bytes), self.memory_budget_bytes)
         self.row_overhead_bytes = int(row_overhead_bytes)
         self.row_group_bytes = int(row_group_bytes)
         self.compression = None if str(compression).lower() == "none" else compression
@@ -591,6 +599,10 @@ class ArrowBuffer:
         frame_id = encode_frame_id(msg.get("frame_id"))
         valid, mins, maxs = spatial_bounds_for_data(rows)
 
+        message_bytes = (rows.nbytes if length is None else int(np.prod(shape)) * np.dtype(dtype).itemsize) + self.row_overhead_bytes
+        if message_bytes > self.memory_budget_bytes:
+            raise ValueError("message exceeds memory_budget_bytes; increase the budget")
+
         # An explicit append is a write intent (mirrors the TileDB backend).
         if self.read_only:
             self._check_writable_location()
@@ -603,6 +615,9 @@ class ArrowBuffer:
         self.names[topic] = name
         self._record_frame_id(msg)
 
+        while sum(stage["bytes"] for stage in self._staged.values()) + message_bytes > self.memory_budget_bytes:
+            largest = max(self._staged, key=lambda key: self._staged[key]["bytes"])
+            self._flush_topic(largest)
         staged = self._staged.get(topic)
         if staged is None:
             staged = self._staged[topic] = _new_stage()

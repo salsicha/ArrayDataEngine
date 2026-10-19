@@ -12,6 +12,7 @@ transforms3d
 tensorboard
 jupyterlab
 pyarrow
+mcap>=1.5.0
 pyyaml
 pydantic
 adlfs

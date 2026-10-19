@@ -43,14 +43,14 @@ jobs:
           python -m pip install --upgrade pip
           # Install through the declared extras so a broken extra fails CI;
           # matplotlib and pillow are only needed by the tests.
-          python -m pip install -e ".[dev,arrow,tiledb,image,ros,dem]" matplotlib pillow
+          python -m pip install -e ".[dev,arrow,tiledb,image,ros,dem,mcap]" matplotlib pillow
       - name: Validate release metadata
         run: python scripts/check_release.py
       - name: Run tests
         run: python -m pytest -q --strict-config --strict-markers tests/
 
   base-install:
-    name: NumPy-only install
+    name: Base install (NumPy and MCAP)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

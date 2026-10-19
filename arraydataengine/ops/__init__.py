@@ -485,3 +485,6 @@ __all__ = [
     "write_kitti_trajectory",
     "write_tum_trajectory",
 ]
+
+from .recording import iter_recording_loop_closures, verify_recording_loop_closures
+__all__ += ["iter_recording_loop_closures", "verify_recording_loop_closures"]
