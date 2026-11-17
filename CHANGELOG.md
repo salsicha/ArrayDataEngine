@@ -13,6 +13,11 @@ registry release.
 
 ### Added
 
+- 16-bit thermal imagery: `thermal_agc()` (robust percentile stretch or plateau
+  histogram equalization), `colorize_thermal()`, and radiometric
+  `radiometric_to_temperature()` / `temperature_to_radiometric()` (FLIR
+  TLinear); multi-page TIFF stacks yield one message per page; the image
+  `VisTool` scales frames deeper than 8 bits by percentiles and takes `cmap`.
 - MCAP is the default for new persistent buffers and CLI ingests; existing
   Arrow/TileDB stores keep their backend. MCAP stores use resumable segments.
 - Shared Parquet staging budgets, schema-partitioned analysis caches with

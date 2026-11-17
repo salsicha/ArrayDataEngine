@@ -210,6 +210,12 @@ from .summary import (
     describe_topic,
     format_describe,
 )
+from .thermal import (
+    colorize_thermal,
+    radiometric_to_temperature,
+    temperature_to_radiometric,
+    thermal_agc,
+)
 from .trajectory_io import (
     read_tum_trajectory,
     to_tum_trajectory,
@@ -258,6 +264,10 @@ __all__ = [
     "align_image",
     "align_images",
     "register_with_fixed_pattern",
+    "thermal_agc",
+    "radiometric_to_temperature",
+    "temperature_to_radiometric",
+    "colorize_thermal",
     "align_nearest",
     "align_topic",
     "angular_velocity_from_quaternions",

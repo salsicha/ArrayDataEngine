@@ -19,15 +19,22 @@ class VisTool:
     """
     Generate a video for visualization
     """
-    def __init__(self, embed=True, vis_height=None, output_path=None):
+    def __init__(self, embed=True, vis_height=None, output_path=None, cmap=None):
         """
         vis_height is the resolution of output frame.
         output_path is where the embedded animation GIF is saved; by default
         it goes to a temporary file that is removed after display.
+        cmap is the colormap for single-channel frames (Matplotlib's default
+        when None; "gray" or "inferno" suit thermal imagery). Single-channel
+        frames deeper than 8 bits (16-bit thermal counts, floats) are scaled
+        between their 1st and 99th percentiles, so a few hot or dead pixels do
+        not flatten the scene; an animation keeps its first frame's scaling.
         """
 
         self.show_animation = self.get_show_animation(embed)
         self.output_path = output_path
+        self.cmap = cmap
+        self._animation_limits = None
 
         self._vis_height = vis_height
         # by default, 50 colors
@@ -82,10 +89,33 @@ class VisTool:
             return self._show_animation_native
 
 
+    @staticmethod
+    def _display_limits(frame):
+        """Percentile display limits for single-channel frames deeper than 8 bits."""
+        arr = np.asarray(frame)
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        if arr.ndim != 2 or arr.dtype == np.uint8 or arr.dtype == bool or arr.dtype.kind not in "iuf":
+            return {}
+        finite = arr[np.isfinite(arr)] if arr.dtype.kind == "f" else arr.ravel()
+        if finite.size == 0:
+            return {}
+        vmin, vmax = np.percentile(finite, [1.0, 99.0])
+        return {"vmin": float(vmin), "vmax": float(vmax)} if vmax > vmin else {}
+
+
+    def _imshow_options(self, frame, limits=None):
+        options = dict(self._display_limits(frame) if limits is None else limits)
+        if self.cmap is not None and np.asarray(frame).ndim == 2:
+            options["cmap"] = self.cmap
+        return options
+
+
     def append_img(self, frame):
         if len(self.images) == 0:
-            self.ax.imshow(frame)
-        im = self.ax.imshow(frame, animated=self.animated)
+            self._animation_limits = self._display_limits(frame)
+            self.ax.imshow(frame, **self._imshow_options(frame, self._animation_limits))
+        im = self.ax.imshow(frame, animated=self.animated, **self._imshow_options(frame, self._animation_limits))
         self.images.append([im])
 
 
@@ -106,11 +136,11 @@ class VisTool:
                 )
             return self.show_animation()
         if isinstance(image, np.ndarray):
-            plt.imshow(image, interpolation='nearest')
+            plt.imshow(image, interpolation='nearest', **self._imshow_options(image))
             plt.show()
         elif isinstance(image, (str, os.PathLike)):
-            img = PILImage.open(image)
-            plt.imshow(img, interpolation='nearest')
+            img = np.asarray(PILImage.open(image))  # keeps 16-bit TIFF/PNG depth
+            plt.imshow(img, interpolation='nearest', **self._imshow_options(img))
             plt.show()
         else:
             raise TypeError(

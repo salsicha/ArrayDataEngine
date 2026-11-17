@@ -119,7 +119,7 @@ as one-line errors (exit status 2; Ctrl-C exits with 130). Pass `--debug`
 
 | Input | Adapter | Topic(s) | Notes |
 | --- | --- | --- | --- |
-| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob (a literal path containing `[` or `*` also works). Colour images are RGB; pass `color_order="bgr"` for OpenCV's order. |
+| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob at their native bit depth (16-bit thermal frames stay `uint16`); each page of a multi-page TIFF stack is one message (`name` is `<file>#<page>`) (a literal path containing `[` or `*` also works). Colour images are RGB; pass `color_order="bgr"` for OpenCV's order. |
 | `.bag` | `BagSource` | Bag topics | ROS1 bags with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. SQLite rosbag2 files named `.bag` are routed to `DB3Source`. |
 | `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. Bags without embedded message definitions (Humble and older) are supported. rosbridge/foxglove JSON payloads are decoded for PoseStamped, NavSatFix, PointCloud2, CompressedImage, and DepthAnything calibration messages; the serialization format recorded in the `.db3` takes precedence over `metadata.yaml`. `compressed_depth_image_transport` (`compressedDepth`) images are decoded too. |
 | `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles over HTTPS using Earthdata credentials. |
@@ -437,6 +437,19 @@ depth_calibration, metric_depth = calibrate_depth_metric_scale(relative_depth, l
 ```
 
 Image registration uses phase correlation. On sensors with fixed-pattern noise, such as thermal cameras with column/row/pixel offsets, the pattern stays put while the scene moves, and plain `align_images` then reports no motion. `register_with_fixed_pattern(frames, max_shift=..., frozen=...)` estimates and removes the pattern while it registers. It returns integer shifts, the corrected registered frames, and the pattern. It needs a few tens of frames in which the scene moves across the sensor.
+
+Thermal (LWIR) cameras deliver 14/16-bit counts, and those stay `uint16` through every source (image files, multi-page TIFF stacks, and ROS `mono16`/`16UC1`/`16SC1` images or 16-bit PNG `CompressedImage`s, including `compressedDepth`) and every storage backend. A scene usually spans a narrow band of that range, so full-range conversions such as `convert_image_dtype(frame, np.uint8)` crush it to a few grey levels. Use automatic gain control for display instead:
+
+```python
+from arraydataengine.ops import colorize_thermal, radiometric_to_temperature, thermal_agc
+
+display = thermal_agc(frames)                     # robust 1-99 percentile stretch -> uint8
+display = thermal_agc(frames, method="plateau")   # plateau histogram equalization, as thermal cameras use
+false_colour = colorize_thermal(frames, cmap="inferno")          # (N, H, W, 3) uint8
+celsius = radiometric_to_temperature(frames, scale=0.01)         # FLIR TLinear: kelvin = counts * 0.01
+```
+
+One mapping is shared across a sequence (`per_frame=True` stretches each frame alone), so playback does not flicker. `radiometric_to_temperature` and `temperature_to_radiometric` convert radiometric ("TLinear") counts; FLIR's radiometric Boson and Lepton cameras use `scale=0.01` (or `0.1` at low resolution). The image `VisTool` (and `Visualizer("image")`) scales 16-bit frames between their 1st and 99th percentiles, so a few hot or dead pixels do not flatten the view, and takes a `cmap` such as `"gray"` or `"inferno"`.
 
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 

@@ -9,6 +9,7 @@ import os
 import re
 
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+_TIFF_EXTENSIONS = (".tif", ".tiff")
 
 _COLOR_ORDERS = ("rgb", "bgr")
 
@@ -19,6 +20,42 @@ def _natural_key(path: str):
     return [int(part) if part.isdecimal() else part for part in re.split(r"(\d+)", path)]
 
 
+def _tiff_page_count(path: str) -> int:
+    """Pages in a (possibly multi-page) TIFF; 1 when it cannot be told."""
+
+    try:
+        return max(1, int(cv2.imcount(path)))
+    except (cv2.error, AttributeError):
+        pass
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return max(1, int(getattr(image, "n_frames", 1)))
+    except Exception:
+        return 1
+
+
+def _read_tiff_page(path: str, page: int):
+    """One page of a multi-page TIFF at its native depth, in OpenCV channel order."""
+
+    try:
+        ok, mats = cv2.imreadmulti(path, page, 1, flags=cv2.IMREAD_UNCHANGED)
+        if ok and mats:
+            return mats[0]
+    except (cv2.error, TypeError):  # OpenCV without the ranged overload
+        pass
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as image:
+        image.seek(page)
+        data = np.array(image)
+    if data.ndim == 3 and data.shape[-1] in (3, 4):  # PIL is RGB(A); match cv2's BGR(A)
+        data = data[..., [2, 1, 0, *range(3, data.shape[-1])]]
+    return data
+
+
 class ImgSource(BaseSource):
     """Image files matching a path or glob, yielded on the synthetic "images" topic.
 
@@ -27,6 +64,10 @@ class ImgSource(BaseSource):
     ``encoding`` key describing the array (``rgb8``, ``mono8``, ``mono16``, ...).
     A path whose glob matches nothing is tried as a literal file name, so
     names with glob metacharacters such as ``frame[1].png`` work.
+
+    Images keep their native bit depth (16-bit thermal frames stay ``uint16``
+    with encoding ``mono16``). A multi-page TIFF stack yields one message per
+    page, named ``<file>#<page>`` (pages count from 0).
     """
 
 
@@ -55,13 +96,18 @@ class ImgSource(BaseSource):
         images.sort(key=_natural_key)
 
         self.images = images
+        # (file, page) per message; page is None for a single-image file.
+        self.frames = []
+        for path in images:
+            pages = _tiff_page_count(path) if os.path.splitext(path)[1].lower() in _TIFF_EXTENSIONS else 1
+            self.frames.extend([(path, None)] if pages == 1 else [(path, page) for page in range(pages)])
 
 
     def get_count(self, axis=None):
         # Only the synthetic "images" topic exists; other topics have no messages.
         if axis is not None and str(axis).lower() != "images":
             return 0
-        return len(self.images)
+        return len(self.frames)
 
 
     def get_duration(self):
@@ -78,7 +124,7 @@ class ImgSource(BaseSource):
 
 
     def data_exists(self):
-        return len(self.images) > 0
+        return len(self.frames) > 0
 
 
     def messages(self, source=None):
@@ -87,24 +133,24 @@ class ImgSource(BaseSource):
         - "data": numpy array (colour images in `color_order`)
         - "timestamp"
         - "topic": "images" for an img source
-        - "name": file name
+        - "name": file name (``<file>#<page>`` for a page of a multi-page TIFF)
         - "encoding": layout of "data", e.g. "rgb8" or "mono16"
         '''
 
         from ..sensors.image_sensor import array_encoding, bgr_to_rgb
 
-        for count, img in enumerate(self.images):
+        for count, (img, page) in enumerate(self.frames):
             # Yield: numpy array of data, timestamp, msg topic, filename
             # "images" topic is fake, but is needed in the buffer
 
-            data = cv2.imread(img, cv2.IMREAD_UNCHANGED)
+            data = cv2.imread(img, cv2.IMREAD_UNCHANGED) if page is None else _read_tiff_page(img, page)
             if data is None:
-                raise ValueError(f"Unable to read image: {img}")
+                raise ValueError(f"Unable to read image: {img}" + ("" if page is None else f" page {page}"))
             if self.color_order == "rgb":
                 data = bgr_to_rgb(data)
 
             yield {"data": data, \
                     "timestamp": count * self.period, \
                     "topic": "images", \
-                    "name": os.path.basename(img), \
+                    "name": os.path.basename(img) if page is None else f"{os.path.basename(img)}#{page}", \
                     "encoding": array_encoding(data, self.color_order)}
