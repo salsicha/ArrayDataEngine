@@ -18,6 +18,8 @@ registry release.
   `radiometric_to_temperature()` / `temperature_to_radiometric()` (FLIR
   TLinear); multi-page TIFF stacks yield one message per page; the image
   `VisTool` scales frames deeper than 8 bits by percentiles and takes `cmap`.
+  The LWIR notebooks (`tiff`, `pulsed_encoded_beacons`, `demo`) map raw
+  counts for display with `thermal_agc` / `colorize_thermal`.
 - MCAP is the default for new persistent buffers and CLI ingests; existing
   Arrow/TileDB stores keep their backend. MCAP stores use resumable segments.
 - Shared Parquet staging budgets, schema-partitioned analysis caches with
