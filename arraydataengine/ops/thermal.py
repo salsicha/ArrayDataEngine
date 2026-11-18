@@ -4,8 +4,9 @@ Thermal cameras deliver 14/16-bit counts whose scene content usually spans a
 narrow band of the full range (a room at ~22000 +/- 50 counts), with the odd
 very hot or cold pixel. Full-range conversions such as
 ``convert_image_dtype(frame, np.uint8)`` crush such a scene to a couple of grey
-levels, so display needs automatic gain control (AGC); radiometric cameras
-also encode temperature directly ("TLinear").
+levels, so display needs automatic gain control (AGC); radiometric cores
+also encode temperature directly ("TLinear"). FLIR radiometric JPEGs and FFF
+files carry radiance counts instead; see `arraydataengine.ops.flir`.
 """
 
 from __future__ import annotations
@@ -129,27 +130,49 @@ def thermal_agc(
     return out[0] if single else out
 
 
+def _temperature_unit(unit) -> str:
+    unit = str(unit).lower()
+    if unit not in _TEMPERATURE_UNITS:
+        raise ValueError(f"unit must be one of {_TEMPERATURE_UNITS}, got {unit!r}")
+    return unit
+
+
+def _from_kelvin(kelvin, unit: str):
+    """Kelvin to `unit` (already validated)."""
+    if unit == "kelvin":
+        return kelvin
+    celsius = kelvin - 273.15
+    return celsius if unit == "celsius" else celsius * 9.0 / 5.0 + 32.0
+
+
+def _to_kelvin(values, unit: str):
+    """`unit` (already validated) to kelvin, as float64."""
+    values = np.asarray(values, dtype=np.float64)
+    if unit == "fahrenheit":
+        values = (values - 32.0) * 5.0 / 9.0
+    return values if unit == "kelvin" else values + 273.15
+
+
 def radiometric_to_temperature(counts, scale: float = 0.01, offset: float = 0.0, unit: str = "celsius") -> np.ndarray:
     """Convert radiometric ("TLinear") counts to temperature.
 
-    Radiometric thermal cameras output counts linear in temperature:
+    Radiometric thermal cores output counts linear in temperature:
     ``kelvin = counts * scale + offset``. FLIR's radiometric Boson and Lepton
     cameras use ``scale=0.01`` (high-resolution TLinear, centikelvin) or
     ``scale=0.1`` (low resolution) with ``offset=0``; other cameras document
     their own scale and offset.
 
+    This linear model is wrong for FLIR radiometric JPEGs (R-JPEG) and FFF
+    files: their raw counts follow the sensor's radiance, and need the
+    Planck, emissivity and atmosphere conversion of `flir_raw_to_temperature`
+    (`read_flir_radiometric(path).temperature()`).
+
     Returns float64 temperatures in `unit` (``"celsius"``, ``"kelvin"``, or
     ``"fahrenheit"``).
     """
 
-    unit = str(unit).lower()
-    if unit not in _TEMPERATURE_UNITS:
-        raise ValueError(f"unit must be one of {_TEMPERATURE_UNITS}, got {unit!r}")
-    kelvin = np.asarray(counts, dtype=np.float64) * float(scale) + float(offset)
-    if unit == "kelvin":
-        return kelvin
-    celsius = kelvin - 273.15
-    return celsius if unit == "celsius" else celsius * 9.0 / 5.0 + 32.0
+    unit = _temperature_unit(unit)
+    return _from_kelvin(np.asarray(counts, dtype=np.float64) * float(scale) + float(offset), unit)
 
 
 def temperature_to_radiometric(
@@ -157,15 +180,10 @@ def temperature_to_radiometric(
 ) -> np.ndarray:
     """Inverse of `radiometric_to_temperature`: temperatures to (rounded, clipped) counts."""
 
-    unit = str(unit).lower()
-    if unit not in _TEMPERATURE_UNITS:
-        raise ValueError(f"unit must be one of {_TEMPERATURE_UNITS}, got {unit!r}")
+    unit = _temperature_unit(unit)
     if scale == 0:
         raise ValueError("scale must be non-zero")
-    values = np.asarray(temperature, dtype=np.float64)
-    if unit == "fahrenheit":
-        values = (values - 32.0) * 5.0 / 9.0
-    kelvin = values if unit == "kelvin" else values + 273.15
+    kelvin = _to_kelvin(temperature, unit)
     counts = np.rint((kelvin - float(offset)) / float(scale))
     dtype = np.dtype(dtype)
     if dtype.kind in "iu":

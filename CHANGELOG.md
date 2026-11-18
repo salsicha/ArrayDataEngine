@@ -20,6 +20,15 @@ registry release.
   `VisTool` scales frames deeper than 8 bits by percentiles and takes `cmap`.
   The LWIR notebooks (`tiff`, `pulsed_encoded_beacons`, `demo`) map raw
   counts for display with `thermal_agc` / `colorize_thermal`.
+- FLIR radiometric JPEGs (R-JPEG) and `.fff` files: `read_flir_radiometric()`
+  returns the raw counts with the file's `FlirCalibration` (Planck constants,
+  emissivity, reflected temperature, object distance, atmosphere, IR window),
+  and `flir_raw_to_temperature()` / `flir_temperature_to_raw()` apply the
+  Planck, emissivity and atmospheric model (the linear TLinear model of
+  `radiometric_to_temperature` does not apply to these files).
+  `DataSources(..., flir="raw" | "celsius" | "kelvin" | "fahrenheit")` reads
+  R-JPEG sequences with each file's calibration in the message's `"flir"`
+  metadata; `scripts/datasets/make_flir_rjpeg.py` writes synthetic R-JPEGs.
 - MCAP is the default for new persistent buffers and CLI ingests; existing
   Arrow/TileDB stores keep their backend. MCAP stores use resumable segments.
 - Shared Parquet staging budgets, schema-partitioned analysis caches with

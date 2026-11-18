@@ -12,6 +12,7 @@ _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 _TIFF_EXTENSIONS = (".tif", ".tiff")
 
 _COLOR_ORDERS = ("rgb", "bgr")
+_FLIR_MODES = ("raw", "celsius", "kelvin", "fahrenheit")
 
 
 def _natural_key(path: str):
@@ -68,10 +69,18 @@ class ImgSource(BaseSource):
     Images keep their native bit depth (16-bit thermal frames stay ``uint16``
     with encoding ``mono16``). A multi-page TIFF stack yields one message per
     page, named ``<file>#<page>`` (pages count from 0).
+
+    `flir` reads FLIR radiometric JPEGs (R-JPEG) for their thermal data
+    instead of the palette image: ``"raw"`` yields the sensor counts
+    (``uint16``, ``mono16``); ``"celsius"``, ``"kelvin"`` or ``"fahrenheit"``
+    yield the object temperature (``float32``, ``32FC1``) computed with each
+    file's own Planck constants and measurement parameters. Each message then
+    also carries ``"flir"``: that calibration and camera information
+    (`arraydataengine.ops.FlirCalibration.from_dict` reads it back).
     """
 
 
-    def __init__(self, data_path, period, file_type, color_order: str = "rgb"):
+    def __init__(self, data_path, period, file_type, color_order: str = "rgb", flir: str | None = None):
         """Constructor
 
         """
@@ -81,11 +90,16 @@ class ImgSource(BaseSource):
         color_order = str(color_order).lower()
         if color_order not in _COLOR_ORDERS:
             raise ValueError(f"color_order must be one of {_COLOR_ORDERS}, got {color_order!r}")
+        if flir is not None:
+            flir = str(flir).lower()
+            if flir not in _FLIR_MODES:
+                raise ValueError(f"flir must be one of {_FLIR_MODES} or None, got {flir!r}")
 
         self.period = period
         self.data_path = data_path
         self.file_type = file_type
         self.color_order = color_order
+        self.flir = flir
 
         images = glob(data_path)
         if any(char in os.path.basename(data_path) for char in "*?["):
@@ -135,7 +149,12 @@ class ImgSource(BaseSource):
         - "topic": "images" for an img source
         - "name": file name (``<file>#<page>`` for a page of a multi-page TIFF)
         - "encoding": layout of "data", e.g. "rgb8" or "mono16"
+        - "flir": calibration and camera information (FLIR radiometric mode only)
         '''
+
+        if self.flir is not None:
+            yield from self._flir_messages()
+            return
 
         from ..sensors.image_sensor import array_encoding, bgr_to_rgb
 
@@ -154,3 +173,22 @@ class ImgSource(BaseSource):
                     "topic": "images", \
                     "name": os.path.basename(img) if page is None else f"{os.path.basename(img)}#{page}", \
                     "encoding": array_encoding(data, self.color_order)}
+
+
+    def _flir_messages(self):
+        import numpy as np
+
+        from ..ops.flir import read_flir_radiometric
+
+        for count, (img, _) in enumerate(self.frames):
+            image = read_flir_radiometric(img)
+            if self.flir == "raw":
+                data, encoding = image.raw, "mono16"
+            else:
+                data, encoding = image.temperature(unit=self.flir).astype(np.float32), "32FC1"
+            yield {"data": data,
+                   "timestamp": count * self.period,
+                   "topic": "images",
+                   "name": os.path.basename(img),
+                   "encoding": encoding,
+                   "flir": image.metadata()}

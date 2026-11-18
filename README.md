@@ -119,7 +119,7 @@ as one-line errors (exit status 2; Ctrl-C exits with 130). Pass `--debug`
 
 | Input | Adapter | Topic(s) | Notes |
 | --- | --- | --- | --- |
-| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob at their native bit depth (16-bit thermal frames stay `uint16`); each page of a multi-page TIFF stack is one message (`name` is `<file>#<page>`) (a literal path containing `[` or `*` also works). Colour images are RGB; pass `color_order="bgr"` for OpenCV's order. |
+| `*.png`, `*.jpg`, `*.jpeg`, `*.tif`, `*.tiff` (any case) | `ImgSource` | `images` | Reads naturally-sorted image paths from a glob at their native bit depth (16-bit thermal frames stay `uint16`); each page of a multi-page TIFF stack is one message (`name` is `<file>#<page>`) (a literal path containing `[` or `*` also works). With `flir="raw"` or `flir="celsius"` (or `"kelvin"`/`"fahrenheit"`), FLIR radiometric JPEGs yield their sensor counts or temperatures instead of the palette image. Colour images are RGB; pass `color_order="bgr"` for OpenCV's order. |
 | `.bag` | `BagSource` | Bag topics | ROS1 bags with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. SQLite rosbag2 files named `.bag` are routed to `DB3Source`. |
 | `.db3`/`.mcap` file or rosbag2 directory | `DB3Source` | Bag topics | Single and split ROS 2 bags (sqlite or MCAP storage) with image, compressed image, point cloud, IMU, odometry, navsat, pose, and DepthAnything calibration messages. Bags without embedded message definitions (Humble and older) are supported. rosbridge/foxglove JSON payloads are decoded for PoseStamped, NavSatFix, PointCloud2, CompressedImage, and DepthAnything calibration messages; the serialization format recorded in the `.db3` takes precedence over `metadata.yaml`. `compressed_depth_image_transport` (`compressedDepth`) images are decoded too. |
 | `"DEM"` | `DEMSource` | `images` | Downloads SRTM HGT tiles over HTTPS using Earthdata credentials. |
@@ -450,6 +450,24 @@ celsius = radiometric_to_temperature(frames, scale=0.01)         # FLIR TLinear:
 ```
 
 One mapping is shared across a sequence (`per_frame=True` stretches each frame alone), so playback does not flicker. `radiometric_to_temperature` and `temperature_to_radiometric` convert radiometric ("TLinear") counts; FLIR's radiometric Boson and Lepton cameras use `scale=0.01` (or `0.1` at low resolution). The image `VisTool` (and `Visualizer("image")`) scales 16-bit frames between their 1st and 99th percentiles, so a few hot or dead pixels do not flatten the view, and takes a `cmap` such as `"gray"` or `"inferno"`.
+
+FLIR radiometric JPEGs (R-JPEG, from FLIR handheld and fixed cameras, the Vue Pro R and Duo Pro R, and the FLIR-built DJI Zenmuse XT/XT2) and `.fff` files are different: their raw counts follow the radiance reaching the sensor, not the temperature, so the TLinear model above would be wrong for them. Converting them to temperature takes the camera's Planck constants (R1, R2, B, F, O), the emissivity of the object, the reflected apparent temperature, and the atmosphere (distance, air temperature, humidity) and IR window between the object and the camera. The file stores all of these, and `read_flir_radiometric` reads them together with the raw image:
+
+```python
+from arraydataengine import DataSources
+from arraydataengine.ops import FlirCalibration, flir_raw_to_temperature, read_flir_radiometric
+
+image = read_flir_radiometric("IR_0042.jpg")      # also .fff files, bytes or file objects
+image.raw                                         # (H, W) uint16 sensor counts
+celsius = image.temperature()                     # Planck + emissivity + atmosphere, from the file's parameters
+celsius = image.temperature(emissivity=0.95, reflected_temperature_c=18.0, object_distance=3.0)  # re-analyse
+calibration = image.calibration.replace(relative_humidity=0.8)  # FlirCalibration (temperatures in °C)
+kelvin = flir_raw_to_temperature(image.raw, calibration, unit="kelvin")
+
+frames = DataSources("flight/*.jpg", flir="celsius")  # float32 temperatures per file; "raw" for the counts
+```
+
+The conversion follows the model that FLIR's software uses, as documented by ExifTool and the Thermimage R package. It removes the radiance reflected by the object, emitted by the air on both sides of the window, and emitted by the window, then inverts the Planck curve. `flir_temperature_to_raw` is the inverse, for simulation. With `flir=`, each image message also carries `"flir"`: the file's calibration and camera information as JSON-compatible metadata, which `FlirCalibration.from_dict` reads back and recordings keep. `scripts/datasets/make_flir_rjpeg.py` writes synthetic R-JPEGs with ground-truth temperature maps. DJI's own radiometric JPEGs (H20T, M30T, Mavic Enterprise) use another format that needs DJI's Thermal SDK, and are rejected with a message that says so.
 
 Point-cloud downsampling includes voxel-grid averaging, every-k uniform sampling, seeded random sampling by count or ratio, and farthest-point sampling.
 

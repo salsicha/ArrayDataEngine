@@ -210,6 +210,14 @@ from .summary import (
     describe_topic,
     format_describe,
 )
+from .flir import (
+    FlirCalibration,
+    FlirRadiometricImage,
+    flir_raw_to_temperature,
+    flir_temperature_to_raw,
+    is_flir_radiometric,
+    read_flir_radiometric,
+)
 from .thermal import (
     colorize_thermal,
     radiometric_to_temperature,
@@ -268,6 +276,12 @@ __all__ = [
     "radiometric_to_temperature",
     "temperature_to_radiometric",
     "colorize_thermal",
+    "FlirCalibration",
+    "FlirRadiometricImage",
+    "flir_raw_to_temperature",
+    "flir_temperature_to_raw",
+    "is_flir_radiometric",
+    "read_flir_radiometric",
     "align_nearest",
     "align_topic",
     "angular_velocity_from_quaternions",

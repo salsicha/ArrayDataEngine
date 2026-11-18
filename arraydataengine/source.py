@@ -27,6 +27,11 @@ class DataSources:
             other topics are neither decoded nor listed by get_topics().
         color_order: channel order of colour images from an image source,
             ``"rgb"`` (default, like every ROS source) or ``"bgr"``.
+        flir: read FLIR radiometric JPEGs (R-JPEG) for their thermal data:
+            ``"raw"`` sensor counts (``uint16``), or the temperature in
+            ``"celsius"``, ``"kelvin"`` or ``"fahrenheit"`` (``float32``)
+            from each file's Planck constants, emissivity and atmosphere
+            parameters. ``None`` (default) decodes the JPEG's palette image.
         mcap_decoders: optional mapping from encoding or (encoding, schema name)
             to ``(schema, channel, record) -> ADE message dict``. Selects the
             generic MCAP reader for a standalone file; ADE NumPy and supported
@@ -49,6 +54,7 @@ class DataSources:
         base_url: str | None = None,
         allow_insecure_http: bool = False,
         mcap_decoders=None,
+        flir: str | None = None,
     ):
         """Constructor"""
 
@@ -71,6 +77,8 @@ class DataSources:
 
         if mcap_decoders is not None and extension != ".mcap":
             raise ValueError("mcap_decoders requires a standalone .mcap file")
+        if flir is not None and not is_image:
+            raise ValueError("flir= applies to image files (FLIR radiometric JPEGs)")
         if is_mcap_store(data_path):
             self.source = McapStoreSource(data_path, **ros_options)
         elif extension == ".mcap" and (mcap_decoders is not None or is_ade_mcap(data_path)):
@@ -92,7 +100,7 @@ class DataSources:
         elif is_image:
             from .sources.img_source import ImgSource
 
-            self.source = ImgSource(data_path, period, self.file_type, color_order=color_order)
+            self.source = ImgSource(data_path, period, self.file_type, color_order=color_order, flir=flir)
         elif data_path == "DEM":
             from .sources.dem_source import DEMSource
 
